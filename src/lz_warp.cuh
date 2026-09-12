@@ -19,6 +19,7 @@
 namespace gzp {
 
 constexpr int kMinMatch = 4;
+constexpr int kProbe = 32; // per-lane match-length cap before cooperative extension
 constexpr int kHashBits = 11;
 constexpr int kHashSize = 1 << kHashBits; // u32 buckets holding two u16 positions
 constexpr int kWarpsPerBlock = 4;
@@ -79,12 +80,34 @@ __device__ __forceinline__ bool emit_seq(const uint8_t* in, uint8_t* out, uint32
   return true;
 }
 
+// Extends a match at p (backward distance off) that already covers `len`
+// bytes, 32 bytes per step, until the first mismatch or the chunk end.
+__device__ __forceinline__ uint32_t warp_extend(const uint8_t* in, uint32_t p, uint32_t off, uint32_t n,
+                                                uint32_t len) {
+  int lane = threadIdx.x & 31;
+  uint32_t max_len = n - p;
+  while (len < max_len) {
+    uint32_t k = len + lane;
+    bool mism = k >= max_len || in[p + k] != in[p - off + k];
+    unsigned m = __ballot_sync(kFullMask, mism);
+    if (m) return len + (__ffs(m) - 1);
+    len += 32;
+  }
+  return len;
+}
+
 // Encodes in[0..n) into out, writing at most cap bytes. htab is this
 // warp's kHashSize-entry shared-memory table. Returns false if the output
 // would exceed cap (caller stores the chunk raw instead).
 //
-// Match finding currently runs serially on lane 0 while the other lanes
-// wait at the broadcast; the token emission is warp-cooperative.
+// The warp walks the chunk in 32-byte windows. Every lane hashes its own
+// position, probes the two candidates in its bucket (capped at kProbe
+// bytes so per-lane work is bounded), and the window's matches are then
+// selected warp-uniformly with a one-position lazy lookahead; matches
+// that hit the probe cap are extended cooperatively. Candidates only ever
+// come from earlier windows because insertion happens after every lane
+// has read; a repeat that starts and recurs inside the same 32 bytes is
+// picked up from the next window on.
 __device__ inline bool lz_encode_warp(const uint8_t* in, uint32_t n, uint8_t* out, uint32_t cap,
                                       uint32_t* out_len, uint32_t* htab) {
   int lane = threadIdx.x & 31;
@@ -93,49 +116,59 @@ __device__ inline bool lz_encode_warp(const uint8_t* in, uint32_t n, uint8_t* ou
 
   uint32_t op = 0;
   uint32_t lit_start = 0;
-  uint32_t pos = 0; // lane 0 only
-  for (;;) {
-    uint32_t cmd = 0, m_pos = 0, m_off = 0, m_len = 0;
-    if (lane == 0) {
-      while (pos + kMinMatch <= n) {
-        uint32_t h = hash4(load4(in + pos));
-        uint32_t b = htab[h];
-        uint32_t best = 0, best_off = 0;
-        for (int w = 0; w < 2; ++w) {
-          uint32_t cand = (b >> (16 * w)) & 0xFFFF;
-          if (cand != kEmptyPos && cand < pos) {
-            uint32_t l = match_len(in, cand, pos, n - pos);
-            if (l > best) {
-              best = l;
-              best_off = pos - cand;
-            }
+  uint32_t pos = 0;
+  while (pos + kMinMatch <= n) {
+    uint32_t p = pos + lane;
+    bool valid = p + kMinMatch <= n;
+    uint32_t h = 0, b = 0xFFFFFFFFu;
+    uint32_t best_len = 0, best_off = 0;
+    if (valid) {
+      h = hash4(load4(in + p));
+      b = htab[h];
+      uint32_t max_len = min((uint32_t)kProbe, n - p);
+      for (int w = 0; w < 2; ++w) {
+        uint32_t cand = (b >> (16 * w)) & 0xFFFF;
+        if (cand != kEmptyPos && cand < p) {
+          uint32_t l = match_len(in, cand, p, max_len);
+          if (l > best_len) {
+            best_len = l;
+            best_off = p - cand;
           }
         }
-        htab[h] = (b << 16) | pos;
-        if (best >= (uint32_t)kMinMatch) {
-          cmd = 1;
-          m_pos = pos;
-          m_off = best_off;
-          m_len = best;
-          pos += best;
-          break;
-        }
-        ++pos;
       }
-      if (cmd == 0) cmd = 2;
     }
-    cmd = __shfl_sync(kFullMask, cmd, 0);
-    m_pos = __shfl_sync(kFullMask, m_pos, 0);
-    m_off = __shfl_sync(kFullMask, m_off, 0);
-    m_len = __shfl_sync(kFullMask, m_len, 0);
-    if (cmd == 1) {
-      if (!emit_seq(in, out, cap, op, lit_start, m_pos - lit_start, m_off, m_len)) return false;
-      lit_start = m_pos + m_len;
-    } else {
-      if (lit_start < n && !emit_seq(in, out, cap, op, lit_start, n - lit_start, 0, 0)) return false;
-      break;
+    __syncwarp(); // all reads of htab precede any insert
+
+    // One insert per distinct bucket per window: the highest valid lane
+    // (the most recent position) wins, deterministically.
+    unsigned valid_mask = __ballot_sync(kFullMask, valid);
+    unsigned peers = __match_any_sync(kFullMask, h) & valid_mask;
+    if (valid && lane == 31 - __clz(peers)) htab[h] = (b << 16) | p;
+
+    unsigned mask = __ballot_sync(kFullMask, best_len >= (uint32_t)kMinMatch);
+    uint32_t cur = 0;
+    while (cur < 32) {
+      unsigned m = mask & (~0u << cur);
+      if (!m) break;
+      uint32_t j = __ffs(m) - 1;
+      uint32_t lj = __shfl_sync(kFullMask, best_len, j);
+      uint32_t lj1 = __shfl_sync(kFullMask, best_len, min(j + 1, 31u));
+      // Lazy match: if the next position has a clearly longer match, emit
+      // this byte as a literal and take that one instead.
+      if (j < 31 && ((mask >> (j + 1)) & 1) && lj1 > lj + 1) {
+        ++j;
+        lj = lj1;
+      }
+      uint32_t off = __shfl_sync(kFullMask, best_off, j);
+      uint32_t len = lj;
+      if (len == (uint32_t)kProbe) len = warp_extend(in, pos + j, off, n, len);
+      if (!emit_seq(in, out, cap, op, lit_start, pos + j - lit_start, off, len)) return false;
+      lit_start = pos + j + len;
+      cur = j + len;
     }
+    pos += cur > 32 ? cur : 32;
   }
+  if (lit_start < n && !emit_seq(in, out, cap, op, lit_start, n - lit_start, 0, 0)) return false;
   *out_len = op;
   return true;
 }
