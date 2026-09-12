@@ -213,6 +213,7 @@ void decompress(const std::string& in_path, const std::string& out_path) {
     for (uint32_t c = 0; c < n; ++c) {
       const ChunkEntry& e = entries[chunk_idx + c];
       if (e.compressed_size > in_slot_stride) die("corrupt chunk table: compressed_size too large");
+      if (e.original_size > chunk_size) die("corrupt chunk table: original_size too large");
       std::fseek(in, payload_start + (long)e.offset, SEEK_SET);
       size_t got = std::fread(h_in.data() + (size_t)c * in_slot_stride, 1, e.compressed_size, in);
       if (got != e.compressed_size) die("short read on compressed payload");

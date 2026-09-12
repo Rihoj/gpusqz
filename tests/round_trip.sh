@@ -8,7 +8,7 @@ GZP="${1:-./build/gzp}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-CHUNK=8192
+CHUNK="${CHUNK:-8192}"
 fail=0
 
 make_case() {
@@ -42,7 +42,8 @@ run_case() {
 
 run_case "empty" "$(make_case empty 0 empty)"
 run_case "one_byte" "$(make_case one_byte 1 random)"
-run_case "sub_chunk" "$(make_case sub_chunk $((CHUNK - 100)) text)"
+SUB_CHUNK_SIZE=$((CHUNK > 100 ? CHUNK - 100 : (CHUNK > 1 ? CHUNK / 2 : 1)))
+run_case "sub_chunk" "$(make_case sub_chunk "$SUB_CHUNK_SIZE" text)"
 run_case "exact_one_chunk" "$(make_case exact_one_chunk "$CHUNK" text)"
 run_case "exact_multi_chunk" "$(make_case exact_multi_chunk $((CHUNK * 5)) text)"
 run_case "off_by_one_over" "$(make_case off_by_one_over $((CHUNK + 1)) text)"

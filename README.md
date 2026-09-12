@@ -13,7 +13,15 @@ cross-chunk references. This means:
 
 - Throughput scales with the number of chunks, not with clever
   cross-thread cooperation. A small file has too few chunks to fill the
-  GPU; a large file fills it easily.
+  GPU. In the current implementation even a large file doesn't fully
+  fill it either: each thread's LZSS hash table is a 512-entry
+  `uint32_t` array (2KB of per-thread local memory, confirmed via
+  `nvcc -Xptxas -v`), and the batch-size cap in `pick_batch_chunks`
+  (256MiB of device buffers) limits any single launch to roughly 15,000
+  threads — well under the ~55-70k threads needed to saturate this GPU's
+  36 SMs. That cap is the main reason measured throughput (~160MB/s) is
+  in CPU-`gzip` territory rather than far above it; raising it (and
+  re-measuring) is the natural next step, not attempted here.
 - The compression window is the chunk itself (8KB), which caps the ratio
   compared to CPU compressors like `gzip` (32KB window) or `xz` (much
   larger). This is the main ratio-vs-parallelism tradeoff in the design —
@@ -89,7 +97,10 @@ bash tests/round_trip.sh ./build/gzp
 
 Covers empty input, 1 byte, sub-chunk, exact chunk multiples, off-by-one,
 all-zeros, random (incompressible) data, and mixed text, all round-tripped
-and byte-compared. Set `EXTRA_FILE=<path>` to also test a real file.
+and byte-compared. Set `EXTRA_FILE=<path>` to also test a real file, and
+`CHUNK=<n>` to test a non-default chunk size (verified at both extremes:
+`CHUNK=64` and `CHUNK=65536`, the latter exactly saturating the 2-byte
+match-offset field).
 
 ## Benchmarking
 
