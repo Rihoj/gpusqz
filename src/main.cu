@@ -182,8 +182,8 @@ uint64_t file_size(FILE* f) {
 struct CompressSet {
   PinBuf<uint8_t> h_in, h_out;
   PinBuf<uint32_t> h_in_lens, h_sizes, h_offsets;
-  DevBuf<uint8_t> d_in, d_slots, d_packed, d_temp;
-  DevBuf<uint32_t> d_in_lens, d_sizes, d_offsets;
+  DevBuf<uint8_t> d_in, d_slots, d_packed, d_temp, d_scratch;
+  DevBuf<uint32_t> d_in_lens, d_start, d_sizes, d_offsets;
   StreamEvents ev;
   uint32_t n = 0, first = 0;
   bool in_flight = false, d2h_enqueued = false;
@@ -192,13 +192,14 @@ struct CompressSet {
     return h_in.alloc((size_t)batch * chunk_size) && h_out.alloc((size_t)batch * slot_stride) &&
            h_in_lens.alloc(batch) && h_sizes.alloc(batch) && h_offsets.alloc(batch + 1) &&
            d_in.alloc((size_t)batch * chunk_size) && d_slots.alloc((size_t)batch * slot_stride) &&
-           d_packed.alloc((size_t)batch * slot_stride) && d_temp.alloc(temp_bytes) && d_in_lens.alloc(batch) &&
-           d_sizes.alloc(batch) && d_offsets.alloc(batch + 1);
+           d_packed.alloc((size_t)batch * slot_stride) && d_temp.alloc(temp_bytes) &&
+           d_scratch.alloc((size_t)batch * scratch_bytes(chunk_size)) && d_in_lens.alloc(batch) &&
+           d_start.alloc(batch) && d_sizes.alloc(batch) && d_offsets.alloc(batch + 1);
   }
   void release() {
     h_in.release(); h_out.release(); h_in_lens.release(); h_sizes.release(); h_offsets.release();
-    d_in.release(); d_slots.release(); d_packed.release(); d_temp.release();
-    d_in_lens.release(); d_sizes.release(); d_offsets.release();
+    d_in.release(); d_slots.release(); d_packed.release(); d_temp.release(); d_scratch.release();
+    d_in_lens.release(); d_start.release(); d_sizes.release(); d_offsets.release();
   }
 };
 
@@ -207,6 +208,7 @@ struct Compressor {
   FILE* out;
   uint32_t chunk_size, chunk_count, slot_stride;
   uint64_t total_size;
+  Mode mode;
   size_t temp_bytes;
   std::vector<ChunkEntry> entries;
   std::vector<CompressSet> sets;
@@ -215,7 +217,8 @@ struct Compressor {
   uint32_t next_chunk = 0;
 
   void allocate() {
-    size_t dev_per_chunk = (size_t)chunk_size + 2 * (size_t)slot_stride + 3 * sizeof(uint32_t);
+    size_t dev_per_chunk =
+        (size_t)chunk_size + 2 * (size_t)slot_stride + scratch_bytes(chunk_size) + 4 * sizeof(uint32_t);
     plan = plan_batches(chunk_count, dev_per_chunk);
     sets.resize(plan.sets);
     for (auto& s : sets) s.ev.create();
@@ -299,9 +302,10 @@ struct Compressor {
     g_stats.h2d_bytes += (uint64_t)n * chunk_size;
 
     check_cuda(cudaEventRecord(s.ev.k0, st), "cudaEventRecord");
-    launch_compress(s.d_in.p, chunk_size, n, s.d_in_lens.p, s.d_slots.p, slot_stride, s.d_sizes.p, st);
+    launch_compress(s.d_in.p, chunk_size, n, s.d_in_lens.p, s.d_slots.p, slot_stride, s.d_start.p, s.d_sizes.p,
+                    s.d_scratch.p, mode, st);
     check_cuda(cudaGetLastError(), "compress_kernel launch");
-    check_cuda(launch_compact(s.d_slots.p, slot_stride, s.d_sizes.p, n, s.d_offsets.p, s.d_packed.p,
+    check_cuda(launch_compact(s.d_slots.p, slot_stride, s.d_start.p, s.d_sizes.p, n, s.d_offsets.p, s.d_packed.p,
                               s.d_temp.p, temp_bytes, st),
                "compaction");
     check_cuda(cudaEventRecord(s.ev.k1, st), "cudaEventRecord");
@@ -333,7 +337,7 @@ struct Compressor {
   }
 };
 
-void compress(const std::string& in_path, const std::string& out_path, uint32_t chunk_size) {
+void compress(const std::string& in_path, const std::string& out_path, uint32_t chunk_size, Mode mode) {
   FILE* in = std::fopen(in_path.c_str(), "rb");
   if (!in) die("cannot open input: " + in_path);
   std::setvbuf(in, nullptr, _IOFBF, kStdioBuf);
@@ -361,6 +365,7 @@ void compress(const std::string& in_path, const std::string& out_path, uint32_t 
     cz.chunk_count = chunk_count;
     cz.slot_stride = worst_case_size(chunk_size);
     cz.total_size = total_size;
+    cz.mode = mode;
     cz.entries.swap(entries);
 
     double t = now_s();
@@ -387,7 +392,7 @@ void compress(const std::string& in_path, const std::string& out_path, uint32_t 
 struct DecompressSet {
   PinBuf<uint8_t> h_in, h_out;
   PinBuf<uint32_t> h_in_offsets, h_in_lens, h_out_lens, h_err;
-  DevBuf<uint8_t> d_in, d_out;
+  DevBuf<uint8_t> d_in, d_out, d_scratch;
   DevBuf<uint32_t> d_in_offsets, d_in_lens, d_out_lens, d_err;
   StreamEvents ev;
   uint32_t n = 0, first = 0;
@@ -397,12 +402,13 @@ struct DecompressSet {
     return h_in.alloc((size_t)batch * slot_stride) && h_out.alloc((size_t)batch * chunk_size) &&
            h_in_offsets.alloc(batch) && h_in_lens.alloc(batch) && h_out_lens.alloc(batch) && h_err.alloc(1) &&
            d_in.alloc((size_t)batch * slot_stride) && d_out.alloc((size_t)batch * chunk_size) &&
-           d_in_offsets.alloc(batch) && d_in_lens.alloc(batch) && d_out_lens.alloc(batch) && d_err.alloc(1);
+           d_scratch.alloc((size_t)batch * scratch_bytes(chunk_size)) && d_in_offsets.alloc(batch) &&
+           d_in_lens.alloc(batch) && d_out_lens.alloc(batch) && d_err.alloc(1);
   }
   void release() {
     h_in.release(); h_out.release(); h_in_offsets.release(); h_in_lens.release(); h_out_lens.release();
-    h_err.release(); d_in.release(); d_out.release(); d_in_offsets.release(); d_in_lens.release();
-    d_out_lens.release(); d_err.release();
+    h_err.release(); d_in.release(); d_out.release(); d_scratch.release(); d_in_offsets.release();
+    d_in_lens.release(); d_out_lens.release(); d_err.release();
   }
 };
 
@@ -418,7 +424,8 @@ struct Decompressor {
   uint32_t next_chunk = 0;
 
   void allocate() {
-    size_t dev_per_chunk = (size_t)header.chunk_size + (size_t)slot_stride + 3 * sizeof(uint32_t);
+    size_t dev_per_chunk =
+        (size_t)header.chunk_size + (size_t)slot_stride + scratch_bytes(header.chunk_size) + 3 * sizeof(uint32_t);
     plan = plan_batches(header.chunk_count, dev_per_chunk);
     sets.resize(plan.sets);
     for (auto& s : sets) s.ev.create();
@@ -512,7 +519,7 @@ struct Decompressor {
     check_cuda(cudaMemsetAsync(s.d_err.p, 0, sizeof(uint32_t), st), "clear error flag");
     check_cuda(cudaEventRecord(s.ev.k0, st), "cudaEventRecord");
     launch_decompress(s.d_in.p, s.d_in_offsets.p, n, s.d_in_lens.p, s.d_out.p, header.chunk_size,
-                       s.d_out_lens.p, s.d_err.p, st);
+                       s.d_out_lens.p, s.d_scratch.p, s.d_err.p, st);
     check_cuda(cudaGetLastError(), "decompress_kernel launch");
     check_cuda(cudaEventRecord(s.ev.k1, st), "cudaEventRecord");
 
@@ -582,8 +589,8 @@ void decompress(const std::string& in_path, const std::string& out_path) {
 void usage() {
   std::fprintf(stderr,
                "usage:\n"
-               "  gzp c <input> <output> [chunk_size]   compress\n"
-               "  gzp d <input> <output>                decompress\n");
+               "  gzp c <input> <output> [chunk_size] [--mode lz|lzrans]   compress (default lzrans)\n"
+               "  gzp d <input> <output>                                   decompress\n");
   std::exit(1);
 }
 
@@ -598,9 +605,20 @@ int main(int argc, char** argv) {
   auto t0 = std::chrono::steady_clock::now();
   if (mode == "c") {
     uint32_t chunk_size = kDefaultChunkSize;
-    if (argc >= 5) chunk_size = (uint32_t)std::strtoul(argv[4], nullptr, 10);
+    Mode codec = Mode::LzRans;
+    for (int i = 4; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--mode" && i + 1 < argc) {
+        std::string m = argv[++i];
+        if (m == "lz") codec = Mode::Lz;
+        else if (m == "lzrans") codec = Mode::LzRans;
+        else die("unknown mode: " + m);
+      } else {
+        chunk_size = (uint32_t)std::strtoul(a.c_str(), nullptr, 10);
+      }
+    }
     if (chunk_size == 0 || chunk_size > kMaxChunkSize) die("chunk_size must be in (0, 65536]");
-    compress(in_path, out_path, chunk_size);
+    compress(in_path, out_path, chunk_size, codec);
   } else if (mode == "d") {
     decompress(in_path, out_path);
   } else {

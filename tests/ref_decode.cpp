@@ -11,6 +11,7 @@
 #include <string>
 
 #include "format.h"
+#include "rans_codes.h"
 
 using namespace gzp;
 
@@ -19,6 +20,128 @@ namespace {
 [[noreturn]] void fail(const std::string& msg) {
   std::fprintf(stderr, "gzp_refdec: %s\n", msg.c_str());
   std::exit(1);
+}
+
+uint32_t load_u32(const uint8_t* p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+struct Seq {
+  uint32_t lit_len, ml, off;
+};
+
+// Serial emulation of the GPU's 32-lane interleaved rANS decoder. The GPU
+// runs each sub-step for all lanes at once and lets the lanes that need a
+// word take one in lane order, so visiting lanes 0..31 within each
+// sub-step, reading a word whenever that lane needs one, consumes the
+// stream identically.
+struct RansDecoder {
+  const uint8_t* p;
+  size_t len, rp;
+  uint32_t x[32];
+  uint16_t freq[kQuantBytes], cum[kQuantBytes];
+  std::vector<uint8_t> sym;
+  bool bad = false;
+
+  static constexpr int kLit = 0, kLl = kLitSyms, kMl = kLitSyms + kSmallSyms, kOff = kLitSyms + 2 * kSmallSyms;
+
+  RansDecoder(const uint8_t* payload, size_t n) : p(payload), len(n), rp(kRansHeaderBytes), sym(kProbScale, 0) {
+    const uint8_t* q = p + 8;
+    normalize_table(q + kLit, kLitSyms, freq + kLit, cum + kLit);
+    for (int base : {kLl, kMl, kOff}) normalize_table(q + base, kSmallSyms, freq + base, cum + base);
+    for (int s = 0; s < kLitSyms; ++s) {
+      for (uint32_t k = 0; k < freq[kLit + s]; ++k) sym[cum[kLit + s] + k] = (uint8_t)s;
+    }
+    for (int l = 0; l < 32; ++l) x[l] = load_u32(p + 8 + kQuantBytes + 4 * l);
+  }
+
+  void renorm(int l) {
+    if (x[l] < kRansL) {
+      if (rp + 2 > len) {
+        bad = true;
+        return;
+      }
+      x[l] = (x[l] << 16) | ((uint32_t)p[rp] | ((uint32_t)p[rp + 1] << 8));
+      rp += 2;
+    }
+  }
+  uint32_t get(int l, int base, int k) {
+    uint32_t slot = x[l] & (kProbScale - 1);
+    uint32_t s;
+    if (base == kLit) {
+      s = sym[slot];
+    } else {
+      s = 0;
+      for (int i = 0; i < k; ++i) {
+        if (cum[base + i] <= slot) s = i;
+      }
+    }
+    if (freq[base + s] == 0) bad = true;
+    x[l] = freq[base + s] * (x[l] >> kProbBits) + slot - cum[base + s];
+    renorm(l);
+    return s;
+  }
+  uint32_t bits(int l, uint32_t nb) {
+    if (nb == 0) return 0;
+    uint32_t b = x[l] & ((1u << nb) - 1);
+    x[l] >>= nb;
+    renorm(l);
+    return b;
+  }
+};
+
+bool decode_lzrans(const uint8_t* in, size_t in_len, uint8_t* out, size_t orig, uint32_t chunk_size) {
+  if (in_len < (size_t)kRansHeaderBytes) return false;
+  uint32_t n_seq = load_u32(in), n_lit = load_u32(in + 4);
+  if (n_seq > chunk_size / 4 + 1 || n_lit > chunk_size) return false;
+  RansDecoder d(in, in_len);
+  std::vector<Seq> seqs(n_seq);
+  std::vector<uint8_t> lits(n_lit);
+  uint32_t llc[32], mlc[32], oc[32], llb[32], mlb[32], ob[32], ml[32];
+
+  for (uint32_t g = 0; g < (n_seq + 31) / 32; ++g) {
+    auto active = [&](int l) { return g * 32 + l < n_seq; };
+    for (int l = 0; l < 32; ++l) if (active(l)) llc[l] = d.get(l, RansDecoder::kLl, kSmallSyms);
+    for (int l = 0; l < 32; ++l) if (active(l)) llb[l] = d.bits(l, len_nb(llc[l]));
+    for (int l = 0; l < 32; ++l) if (active(l)) mlc[l] = d.get(l, RansDecoder::kMl, kSmallSyms);
+    for (int l = 0; l < 32; ++l) if (active(l)) mlb[l] = d.bits(l, len_nb(mlc[l]));
+    for (int l = 0; l < 32; ++l) {
+      if (!active(l)) continue;
+      uint32_t v = len_value(mlc[l], mlb[l]);
+      ml[l] = v ? v + 3 : 0;
+    }
+    for (int l = 0; l < 32; ++l) if (active(l) && ml[l]) oc[l] = d.get(l, RansDecoder::kOff, kSmallSyms);
+    for (int l = 0; l < 32; ++l) if (active(l) && ml[l]) ob[l] = d.bits(l, oc[l]);
+    for (int l = 0; l < 32; ++l) {
+      if (!active(l)) continue;
+      uint32_t idx = g * 32 + l;
+      if (ml[l] == 0 && idx != n_seq - 1) return false;
+      if (ml[l] && oc[l] > 15) return false;
+      seqs[idx] = Seq{len_value(llc[l], llb[l]), ml[l], ml[l] ? off_value(oc[l], ob[l]) : 0};
+    }
+    if (d.bad) return false;
+  }
+  for (uint32_t g = 0; g < (n_lit + 31) / 32; ++g) {
+    for (int l = 0; l < 32; ++l) {
+      uint32_t idx = g * 32 + l;
+      if (idx < n_lit) lits[idx] = (uint8_t)d.get(l, RansDecoder::kLit, kLitSyms);
+    }
+  }
+  if (d.bad || d.rp != in_len) return false;
+
+  size_t op = 0, lp = 0;
+  for (const Seq& s : seqs) {
+    if (lp + s.lit_len > n_lit || op + s.lit_len > orig) return false;
+    for (uint32_t k = 0; k < s.lit_len; ++k) out[op + k] = lits[lp + k];
+    op += s.lit_len;
+    lp += s.lit_len;
+    if (s.ml) {
+      if (s.off == 0 || s.off > op || op + s.ml > orig) return false;
+      for (uint32_t k = 0; k < s.ml; ++k) out[op + k] = out[op - s.off + k];
+      op += s.ml;
+    }
+  }
+  return op == orig && lp == n_lit;
 }
 
 bool read_ext(const uint8_t* in, size_t in_len, size_t& ip, uint32_t& v) {
@@ -97,6 +220,9 @@ int main(int argc, char** argv) {
         break;
       case ChunkFlag::Lz:
         ok = decode_lz(cbuf.data() + 1, e.compressed_size - 1, obuf.data(), e.original_size);
+        break;
+      case ChunkFlag::LzRans:
+        ok = decode_lzrans(cbuf.data() + 1, e.compressed_size - 1, obuf.data(), e.original_size, h.chunk_size);
         break;
       default:
         break;

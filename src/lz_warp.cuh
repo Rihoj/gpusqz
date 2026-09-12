@@ -26,6 +26,17 @@ constexpr int kWarpsPerBlock = 4;
 constexpr unsigned kFullMask = 0xFFFFFFFFu;
 constexpr uint32_t kEmptyPos = 0xFFFFu;
 
+// One parsed sequence: lit_len literals followed by a match of ml bytes
+// at backward distance off (ml == 0 only for a literals-only tail).
+struct SeqRec {
+  uint32_t lit_len;
+  uint32_t ml;
+  uint32_t off;
+};
+
+// Every match covers at least kMinMatch bytes, plus one optional tail.
+__host__ __device__ inline uint32_t max_sequences(uint32_t chunk_size) { return chunk_size / kMinMatch + 1; }
+
 __device__ __forceinline__ uint32_t load4(const uint8_t* p) {
   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
@@ -96,9 +107,51 @@ __device__ __forceinline__ uint32_t warp_extend(const uint8_t* in, uint32_t p, u
   return len;
 }
 
-// Encodes in[0..n) into out, writing at most cap bytes. htab is this
-// warp's kHashSize-entry shared-memory table. Returns false if the output
-// would exceed cap (caller stores the chunk raw instead).
+// Emits LZ4-style tokens straight into an output buffer.
+struct TokenEmitter {
+  const uint8_t* in;
+  uint8_t* out;
+  uint32_t cap;
+  uint32_t op = 0;
+  __device__ __forceinline__ bool operator()(uint32_t lit_start, uint32_t lit_len, uint32_t off, uint32_t ml) {
+    return emit_seq(in, out, cap, op, lit_start, lit_len, off, ml);
+  }
+};
+
+// Records sequences and copies literals into scratch for a later stage.
+struct SeqEmitter {
+  const uint8_t* in;
+  SeqRec* seqs;
+  uint8_t* lits;
+  uint32_t n_seq = 0;
+  uint32_t n_lit = 0;
+  __device__ __forceinline__ bool operator()(uint32_t lit_start, uint32_t lit_len, uint32_t off, uint32_t ml) {
+    int lane = threadIdx.x & 31;
+    if (lane == 0) seqs[n_seq] = SeqRec{lit_len, ml, off};
+    for (uint32_t k = lane; k < lit_len; k += 32) lits[n_lit + k] = in[lit_start + k];
+    ++n_seq;
+    n_lit += lit_len;
+    return true;
+  }
+};
+
+// Re-emits recorded sequences as tokens (literals re-read from `in`).
+__device__ inline bool tokens_from_seqs(const uint8_t* in, const SeqRec* seqs, uint32_t n_seq, uint8_t* out,
+                                        uint32_t cap, uint32_t* out_len) {
+  uint32_t op = 0, pos = 0;
+  for (uint32_t i = 0; i < n_seq; ++i) {
+    SeqRec r = seqs[i];
+    if (!emit_seq(in, out, cap, op, pos, r.lit_len, r.off, r.ml)) return false;
+    pos += r.lit_len + r.ml;
+  }
+  *out_len = op;
+  return true;
+}
+
+// Parses in[0..n) into sequences, calling emit(lit_start, lit_len, off, ml)
+// for each match (and once more with ml = 0 for any trailing literals).
+// htab is this warp's kHashSize-entry shared-memory table. Returns false
+// as soon as emit does.
 //
 // The warp walks the chunk in 32-byte windows. Every lane hashes its own
 // position, probes the two candidates in its bucket (capped at kProbe
@@ -108,13 +161,12 @@ __device__ __forceinline__ uint32_t warp_extend(const uint8_t* in, uint32_t p, u
 // come from earlier windows because insertion happens after every lane
 // has read; a repeat that starts and recurs inside the same 32 bytes is
 // picked up from the next window on.
-__device__ inline bool lz_encode_warp(const uint8_t* in, uint32_t n, uint8_t* out, uint32_t cap,
-                                      uint32_t* out_len, uint32_t* htab) {
+template <class Emit>
+__device__ inline bool lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* htab, Emit& emit) {
   int lane = threadIdx.x & 31;
   for (int i = lane; i < kHashSize; i += 32) htab[i] = 0xFFFFFFFFu;
   __syncwarp();
 
-  uint32_t op = 0;
   uint32_t lit_start = 0;
   uint32_t pos = 0;
   while (pos + kMinMatch <= n) {
@@ -162,14 +214,13 @@ __device__ inline bool lz_encode_warp(const uint8_t* in, uint32_t n, uint8_t* ou
       uint32_t off = __shfl_sync(kFullMask, best_off, j);
       uint32_t len = lj;
       if (len == (uint32_t)kProbe) len = warp_extend(in, pos + j, off, n, len);
-      if (!emit_seq(in, out, cap, op, lit_start, pos + j - lit_start, off, len)) return false;
+      if (!emit(lit_start, pos + j - lit_start, off, len)) return false;
       lit_start = pos + j + len;
       cur = j + len;
     }
     pos += cur > 32 ? cur : 32;
   }
-  if (lit_start < n && !emit_seq(in, out, cap, op, lit_start, n - lit_start, 0, 0)) return false;
-  *out_len = op;
+  if (lit_start < n && !emit(lit_start, n - lit_start, 0, 0)) return false;
   return true;
 }
 
