@@ -660,12 +660,17 @@ void decompress(const std::string& in_path, const std::string& out_path) {
   // Groups must cover [0, chunk_count) contiguously and in order: a
   // corrupt/adversarial directory here would otherwise let a chunk's
   // group_id land outside chunk_group[] or reference an out-of-range slot.
-  uint64_t covered = 0;
-  for (const TableGroup& g : groups) {
-    if (g.start_chunk != covered || g.chunk_count == 0) die("corrupt table group directory: not contiguous");
-    covered += g.chunk_count;
+  // A file with no groups at all (e.g. compressed with --mode lz, which
+  // never produces an LzRans chunk) is fine as-is: no chunk will ever look
+  // one up.
+  if (!groups.empty()) {
+    uint64_t covered = 0;
+    for (const TableGroup& g : groups) {
+      if (g.start_chunk != covered || g.chunk_count == 0) die("corrupt table group directory: not contiguous");
+      covered += g.chunk_count;
+    }
+    if (covered != header.chunk_count) die("corrupt table group directory: doesn't cover all chunks");
   }
-  if (covered != header.chunk_count) die("corrupt table group directory: doesn't cover all chunks");
 
   long payload_start = ftell(in);
 

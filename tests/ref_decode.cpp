@@ -214,14 +214,16 @@ int main(int argc, char** argv) {
   // this is exactly the directory-coverage logic the file format promises,
   // read straight off disk with no runtime batch size involved at all.
   std::vector<uint32_t> chunk_group(h.chunk_count, 0);
-  uint64_t covered = 0;
-  for (uint32_t g = 0; g < groups.size(); ++g) {
-    const TableGroup& tg = groups[g];
-    if (tg.start_chunk != covered || tg.chunk_count == 0) fail("corrupt table group directory: not contiguous");
-    for (uint32_t c = tg.start_chunk; c < tg.start_chunk + tg.chunk_count; ++c) chunk_group[c] = g;
-    covered += tg.chunk_count;
+  if (!groups.empty()) {
+    uint64_t covered = 0;
+    for (uint32_t g = 0; g < groups.size(); ++g) {
+      const TableGroup& tg = groups[g];
+      if (tg.start_chunk != covered || tg.chunk_count == 0) fail("corrupt table group directory: not contiguous");
+      for (uint32_t c = tg.start_chunk; c < tg.start_chunk + tg.chunk_count; ++c) chunk_group[c] = g;
+      covered += tg.chunk_count;
+    }
+    if (covered != h.chunk_count) fail("corrupt table group directory: doesn't cover all chunks");
   }
-  if (covered != h.chunk_count) fail("corrupt table group directory: doesn't cover all chunks");
 
   long payload_start = std::ftell(in);
 
