@@ -161,7 +161,15 @@ bash bench/run_bench.sh corpus_283mb.txt [chunk_size]
 ```
 
 The script reports wall and kernel MB/s for both gzp modes and compares
-against `gzip -1/-6` and single-threaded `zstd -1/-3` when available.
+against `gzip -1/-6` and single-threaded `zstd -1/-3` when available. It
+runs each codec once by default; on a shared GPU a single wall-clock
+measurement can be dominated by another process's contention rather than
+by gzp itself, so set `REPEAT=<n>` to run each codec n times and report
+the best (highest-throughput) run per column instead:
+
+```
+REPEAT=5 bash bench/run_bench.sh corpus_283mb.txt
+```
 
 ## Known limitations and next steps
 
