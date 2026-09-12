@@ -70,6 +70,35 @@ run_case() {
   rm -f "$comp" "$dec"
 }
 
+# Compresses and decompresses with different GZP_FORCE_BATCH values, so
+# LzRans table groups (fixed at compress time to whatever batch size was
+# used then) never align with the decoder's own batches. This is the one
+# scenario that exercises the per-chunk group_id lookup instead of always
+# hitting the trivial case where a decode batch sits inside one group.
+run_case_mismatched_batch() {
+  local name="$1" f="$2" enc_batch="$3" dec_batch="$4"
+  local comp="$TMP/$name.gzp" dec="$TMP/$name.out"
+  GZP_FORCE_BATCH="$enc_batch" "${PREFIX[@]}" "$GZP" c "$f" "$comp" 2>>"$TMP/log"
+  GZP_FORCE_BATCH="$dec_batch" "${PREFIX[@]}" "$GZP" d "$comp" "$dec" 2>>"$TMP/log"
+  local ref_ok=1
+  if [ -n "$REFDEC" ]; then
+    if ! "$REFDEC" "$comp" "$TMP/$name.ref" 2>>"$TMP/log" || ! cmp -s "$f" "$TMP/$name.ref"; then
+      ref_ok=0
+    fi
+    rm -f "$TMP/$name.ref"
+  fi
+  if [ "$ref_ok" -eq 0 ]; then
+    printf "FAIL %-28s CPU reference decoder mismatch (enc_batch=%s dec_batch=%s)\n" "$name" "$enc_batch" "$dec_batch"
+    fail=1
+  elif cmp -s "$f" "$dec"; then
+    printf "PASS %-28s enc_batch=%-6s dec_batch=%-6s\n" "$name" "$enc_batch" "$dec_batch"
+  else
+    printf "FAIL %-28s round-trip mismatch (enc_batch=%s dec_batch=%s)\n" "$name" "$enc_batch" "$dec_batch"
+    fail=1
+  fi
+  rm -f "$comp" "$dec"
+}
+
 run_suite() {
   local chunk="$1"
   local sub=$((chunk > 100 ? chunk - 100 : (chunk > 1 ? chunk / 2 : 1)))
@@ -96,6 +125,12 @@ if [ "$EXTREMES" -eq 1 ]; then
   done
 else
   run_suite "${CHUNK:-8192}"
+fi
+
+if [ "$EXTREMES" -eq 1 ]; then
+  mismatch_file="$(make_case mismatch_batch_src $((5 * 1024 * 1024)) text)"
+  run_case_mismatched_batch "small_enc_large_dec" "$mismatch_file" 64 4000
+  run_case_mismatched_batch "large_enc_small_dec" "$mismatch_file" 4000 64
 fi
 
 if [ "${BIG:-0}" = "1" ]; then

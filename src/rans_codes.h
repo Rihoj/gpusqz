@@ -22,8 +22,10 @@ constexpr int kLitSyms = 256;
 constexpr int kSmallSyms = 32; // lit_len / match_len / offset alphabets (29, 28, 16 used)
 constexpr int kRansStates = 32;
 constexpr int kQuantBytes = kLitSyms + 3 * kSmallSyms;
-// Payload header after the chunk flag: n_seq, n_lit, quantised tables, states.
-constexpr int kRansHeaderBytes = 8 + kQuantBytes + kRansStates * 4;
+// Payload header after the chunk flag: n_seq, n_lit, states. The quantised
+// tables live once per table group (see format.h's TableGroup), not per
+// chunk, so they are not part of this per-chunk header.
+constexpr int kRansHeaderBytes = 8 + kRansStates * 4;
 
 #ifdef __CUDACC__
 #define GZP_HD __host__ __device__ inline

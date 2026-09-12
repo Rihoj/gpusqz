@@ -45,14 +45,16 @@ struct RansDecoder {
 
   static constexpr int kLit = 0, kLl = kLitSyms, kMl = kLitSyms + kSmallSyms, kOff = kLitSyms + 2 * kSmallSyms;
 
-  RansDecoder(const uint8_t* payload, size_t n) : p(payload), len(n), rp(kRansHeaderBytes), sym(kProbScale, 0) {
-    const uint8_t* q = p + 8;
+  // `q` is this chunk's TableGroup's quantised bytes (shared by every
+  // chunk in the group, not stored in the per-chunk payload anymore).
+  RansDecoder(const uint8_t* payload, size_t n, const uint8_t* q) : p(payload), len(n), rp(kRansHeaderBytes),
+      sym(kProbScale, 0) {
     normalize_table(q + kLit, kLitSyms, freq + kLit, cum + kLit);
     for (int base : {kLl, kMl, kOff}) normalize_table(q + base, kSmallSyms, freq + base, cum + base);
     for (int s = 0; s < kLitSyms; ++s) {
       for (uint32_t k = 0; k < freq[kLit + s]; ++k) sym[cum[kLit + s] + k] = (uint8_t)s;
     }
-    for (int l = 0; l < 32; ++l) x[l] = load_u32(p + 8 + kQuantBytes + 4 * l);
+    for (int l = 0; l < 32; ++l) x[l] = load_u32(p + 8 + 4 * l);
   }
 
   void renorm(int l) {
@@ -90,11 +92,12 @@ struct RansDecoder {
   }
 };
 
-bool decode_lzrans(const uint8_t* in, size_t in_len, uint8_t* out, size_t orig, uint32_t chunk_size) {
+bool decode_lzrans(const uint8_t* in, size_t in_len, uint8_t* out, size_t orig, uint32_t chunk_size,
+                   const uint8_t* group_q) {
   if (in_len < (size_t)kRansHeaderBytes) return false;
   uint32_t n_seq = load_u32(in), n_lit = load_u32(in + 4);
   if (n_seq > chunk_size / kMinMatch + 1 || n_lit > chunk_size) return false;
-  RansDecoder d(in, in_len);
+  RansDecoder d(in, in_len, group_q);
   std::vector<Seq> seqs(n_seq);
   std::vector<uint8_t> lits(n_lit);
   uint32_t llc[32], mlc[32], oc[32], llb[32], mlb[32], ob[32], ml[32];
@@ -201,6 +204,25 @@ int main(int argc, char** argv) {
   if (h.chunk_count && std::fread(entries.data(), sizeof(ChunkEntry), h.chunk_count, in) != h.chunk_count) {
     fail("truncated chunk table");
   }
+
+  std::vector<TableGroup> groups(h.table_group_count);
+  if (h.table_group_count &&
+      std::fread(groups.data(), sizeof(TableGroup), h.table_group_count, in) != h.table_group_count) {
+    fail("truncated table group directory");
+  }
+  // Every chunk's group, found independently of any GPU-side batching:
+  // this is exactly the directory-coverage logic the file format promises,
+  // read straight off disk with no runtime batch size involved at all.
+  std::vector<uint32_t> chunk_group(h.chunk_count, 0);
+  uint64_t covered = 0;
+  for (uint32_t g = 0; g < groups.size(); ++g) {
+    const TableGroup& tg = groups[g];
+    if (tg.start_chunk != covered || tg.chunk_count == 0) fail("corrupt table group directory: not contiguous");
+    for (uint32_t c = tg.start_chunk; c < tg.start_chunk + tg.chunk_count; ++c) chunk_group[c] = g;
+    covered += tg.chunk_count;
+  }
+  if (covered != h.chunk_count) fail("corrupt table group directory: doesn't cover all chunks");
+
   long payload_start = std::ftell(in);
 
   std::vector<uint8_t> cbuf, obuf(h.chunk_size);
@@ -222,7 +244,8 @@ int main(int argc, char** argv) {
         ok = decode_lz(cbuf.data() + 1, e.compressed_size - 1, obuf.data(), e.original_size);
         break;
       case ChunkFlag::LzRans:
-        ok = decode_lzrans(cbuf.data() + 1, e.compressed_size - 1, obuf.data(), e.original_size, h.chunk_size);
+        ok = decode_lzrans(cbuf.data() + 1, e.compressed_size - 1, obuf.data(), e.original_size, h.chunk_size,
+                           groups[chunk_group[c]].q);
         break;
       default:
         break;

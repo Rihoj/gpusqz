@@ -26,13 +26,16 @@ __device__ __forceinline__ void chunk_scratch(uint8_t* scratch, uint32_t c, uint
   lits = base + ((sizeof(SeqRec) * max_sequences(chunk_size) + 15) & ~(size_t)15);
 }
 
+// ---------------------------------------------------------------------------
+// Mode::Lz — single kernel, tokens only, no shared table.
+// ---------------------------------------------------------------------------
+
 // One warp per chunk. Chunk c's input lives at in + c*chunk_size (in_lens[c]
 // valid bytes); its output goes into the fixed slot out + c*out_slot_stride
-// as [flag byte][payload] starting at out_start[c], total size out_sizes[c].
+// as [flag byte][payload], total size out_sizes[c] (out_start[c] is always 0).
 __global__ void GZP_LAUNCH_BOUNDS
-compress_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, const uint32_t* in_lens,
-                uint8_t* out, uint32_t out_slot_stride, uint32_t* out_start, uint32_t* out_sizes,
-                uint8_t* scratch, Mode mode) {
+compress_kernel_lz(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, const uint32_t* in_lens,
+                   uint8_t* out, uint32_t out_slot_stride, uint32_t* out_start, uint32_t* out_sizes) {
   __shared__ uint32_t htab[kWarpsPerBlock][kHashWords];
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   uint32_t c = blockIdx.x * kWarpsPerBlock + warp;
@@ -42,51 +45,121 @@ compress_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, co
   uint32_t in_len = in_lens[c];
   uint8_t* slot = out + (size_t)c * out_slot_stride;
 
-  // Any encoding must not beat raw storage by less than nothing: payloads
-  // are capped at in_len - 1 so flag + payload <= in_len.
+  bool ok = false;
+  uint32_t size = 0;
+  if (in_len > 1) {
+    TokenEmitter em{chunk_in, slot + 1, in_len - 1};
+    ok = lz_parse_warp(chunk_in, in_len, htab[warp], em);
+    if (ok) {
+      size = 1 + em.op;
+      if (lane == 0) slot[0] = (uint8_t)ChunkFlag::Lz;
+    }
+  }
+  if (!ok) {
+    for (uint32_t k = lane; k < in_len; k += 32) slot[1 + k] = chunk_in[k];
+    size = 1 + in_len;
+    if (lane == 0) slot[0] = (uint8_t)ChunkFlag::Raw;
+  }
+  if (lane == 0) {
+    out_start[c] = 0;
+    out_sizes[c] = size;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Mode::LzRans — 3 kernels sharing one table per batch.
+// ---------------------------------------------------------------------------
+
+// One warp per chunk. in_len <= 1 chunks are finalized here directly (Raw)
+// since they never reach the encode kernel. Others are parsed into scratch
+// and contribute to the batch histogram; n_seq[c]/n_lit[c] record how much
+// of scratch is valid so the encode kernel doesn't need to re-parse.
+__global__ void GZP_LAUNCH_BOUNDS
+parse_hist_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, const uint32_t* in_lens,
+                  uint8_t* out, uint32_t out_slot_stride, uint32_t* out_start, uint32_t* out_sizes,
+                  uint8_t* scratch, uint32_t* n_seq_arr, uint32_t* n_lit_arr, uint32_t* batch_cnt) {
+  __shared__ uint32_t htab[kWarpsPerBlock][kHashWords];
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  uint32_t c = blockIdx.x * kWarpsPerBlock + warp;
+  if (c >= chunk_count) return;
+
+  const uint8_t* chunk_in = in + (size_t)c * chunk_size;
+  uint32_t in_len = in_lens[c];
+  uint8_t* slot = out + (size_t)c * out_slot_stride;
+
+  if (in_len <= 1) {
+    for (uint32_t k = lane; k < in_len; k += 32) slot[1 + k] = chunk_in[k];
+    if (lane == 0) {
+      slot[0] = (uint8_t)ChunkFlag::Raw;
+      out_start[c] = 0;
+      out_sizes[c] = 1 + in_len;
+      n_seq_arr[c] = 0;
+      n_lit_arr[c] = 0;
+    }
+    return;
+  }
+
+  SeqRec* seqs;
+  uint8_t* lits;
+  chunk_scratch(scratch, c, chunk_size, seqs, lits);
+  SeqEmitter em{chunk_in, seqs, lits};
+  lz_parse_warp(chunk_in, in_len, htab[warp], em);
+  accumulate_hist(seqs, em.n_seq, lits, em.n_lit, batch_cnt);
+  if (lane == 0) {
+    n_seq_arr[c] = em.n_seq;
+    n_lit_arr[c] = em.n_lit;
+  }
+}
+
+// One block, launched once per batch: quantises+normalises the batch
+// histogram into freq/cum for the encode kernel and q[] for the host to
+// store in this batch's TableGroup.
+__global__ void build_table_kernel(const uint32_t* cnt, uint8_t* q_out, uint16_t* freq, uint16_t* cum) {
+  build_batch_table_warp(cnt, q_out, freq, cum);
+}
+
+// One warp per chunk (skips in_len <= 1 chunks, already finalized). Tries
+// rANS against the batch's shared table, then plain tokens, then raw,
+// keeping whichever is smallest.
+__global__ void GZP_LAUNCH_BOUNDS
+rans_encode_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, const uint32_t* in_lens,
+                   uint8_t* out, uint32_t out_slot_stride, uint32_t* out_start, uint32_t* out_sizes,
+                   uint8_t* scratch, const uint32_t* n_seq_arr, const uint32_t* n_lit_arr, const uint16_t* freq,
+                   const uint16_t* cum) {
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  uint32_t c = blockIdx.x * kWarpsPerBlock + warp;
+  if (c >= chunk_count) return;
+
+  uint32_t in_len = in_lens[c];
+  if (in_len <= 1) return; // already finalized by parse_hist_kernel
+
+  const uint8_t* chunk_in = in + (size_t)c * chunk_size;
+  uint8_t* slot = out + (size_t)c * out_slot_stride;
+  SeqRec* seqs;
+  uint8_t* lits;
+  chunk_scratch(scratch, c, chunk_size, seqs, lits);
+  uint32_t n_seq = n_seq_arr[c], n_lit = n_lit_arr[c];
+
+  uint32_t tok_total = 0;
+  for (uint32_t i = lane; i < n_seq; i += 32) {
+    SeqRec r = seqs[i];
+    tok_total += seq_size(r.lit_len, r.ml);
+  }
+  for (int o = 16; o > 0; o >>= 1) tok_total += __shfl_xor_sync(kFullMask, tok_total, o);
+
   bool ok = false;
   uint32_t start = 0, size = 0;
-  if (in_len > 1) {
-    if (mode == Mode::LzRans) {
-      SeqRec* seqs;
-      uint8_t* lits;
-      chunk_scratch(scratch, c, chunk_size, seqs, lits);
-      SeqEmitter em{chunk_in, seqs, lits};
-      lz_parse_warp(chunk_in, in_len, htab[warp], em);
-      __syncwarp();
-
-      // Plain tokens have no per-chunk table overhead, so on highly
-      // repetitive chunks they beat rANS; size both and keep the smaller.
-      uint32_t tok_total = 0;
-      for (uint32_t i = lane; i < em.n_seq; i += 32) {
-        SeqRec r = seqs[i];
-        tok_total += seq_size(r.lit_len, r.ml);
-      }
-      for (int o = 16; o > 0; o >>= 1) tok_total += __shfl_xor_sync(kFullMask, tok_total, o);
-
-      if (in_len > (uint32_t)kRansHeaderBytes + 1) {
-        // The hash table is free now; reuse it for the coder's tables.
-        RansEncTables& t = *reinterpret_cast<RansEncTables*>(htab[warp]);
-        ok = rans_encode_warp(seqs, em.n_seq, lits, em.n_lit, t, slot, out_slot_stride, in_len, &start, &size);
-        if (ok && 1 + tok_total < size) ok = false;
-      }
-      if (!ok) {
-        uint32_t len = 0;
-        ok = tokens_from_seqs(chunk_in, seqs, em.n_seq, slot + 1, in_len - 1, &len);
-        if (ok) {
-          start = 0;
-          size = 1 + len;
-          if (lane == 0) slot[0] = (uint8_t)ChunkFlag::Lz;
-        }
-      }
-    } else {
-      TokenEmitter em{chunk_in, slot + 1, in_len - 1};
-      ok = lz_parse_warp(chunk_in, in_len, htab[warp], em);
-      if (ok) {
-        start = 0;
-        size = 1 + em.op;
-        if (lane == 0) slot[0] = (uint8_t)ChunkFlag::Lz;
-      }
+  if (in_len > (uint32_t)kRansHeaderBytes + 1) {
+    ok = rans_encode_warp(seqs, n_seq, lits, n_lit, freq, cum, slot, out_slot_stride, in_len, &start, &size);
+    if (ok && 1 + tok_total < size) ok = false;
+  }
+  if (!ok) {
+    uint32_t len = 0;
+    ok = tokens_from_seqs(chunk_in, seqs, n_seq, slot + 1, in_len - 1, &len);
+    if (ok) {
+      start = 0;
+      size = 1 + len;
+      if (lane == 0) slot[0] = (uint8_t)ChunkFlag::Lz;
     }
   }
   if (!ok) {
@@ -101,13 +174,18 @@ compress_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, co
   }
 }
 
+// ---------------------------------------------------------------------------
+// Decompress (both Lz and LzRans chunks may appear in the same file).
+// ---------------------------------------------------------------------------
+
 // One warp per chunk. Chunk c's compressed data lives at in + in_offsets[c]
 // (in_lens[c] bytes, flag first); output goes to out + c*chunk_size,
-// out_lens[c] bytes. Any malformed chunk sets *err.
+// out_lens[c] bytes. LzRans chunks read their table from
+// group_tables[group_id[c]] (already expanded). Any malformed chunk sets *err.
 __global__ void GZP_LAUNCH_BOUNDS
 decompress_kernel(const uint8_t* in, const uint32_t* in_offsets, uint32_t chunk_count, const uint32_t* in_lens,
-                  uint8_t* out, uint32_t chunk_size, const uint32_t* out_lens, uint8_t* scratch, uint32_t* err) {
-  __shared__ RansDecTables tables[kWarpsPerBlock];
+                  uint8_t* out, uint32_t chunk_size, const uint32_t* out_lens, uint8_t* scratch,
+                  const RansGroupTable* group_tables, const uint32_t* group_id, uint32_t* err) {
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   uint32_t c = blockIdx.x * kWarpsPerBlock + warp;
   if (c >= chunk_count) return;
@@ -132,8 +210,9 @@ decompress_kernel(const uint8_t* in, const uint32_t* in_offsets, uint32_t chunk_
       uint8_t* lits;
       chunk_scratch(scratch, c, chunk_size, seqs, lits);
       uint32_t n_seq = 0, n_lit = 0;
-      ok = rans_decode_warp(slot + 1, len - 1, tables[warp], seqs, max_sequences(chunk_size), lits, chunk_size,
-                            &n_seq, &n_lit);
+      const RansGroupTable& gt = group_tables[group_id[c]];
+      ok = rans_decode_warp(slot + 1, len - 1, gt, seqs, max_sequences(chunk_size), lits, chunk_size, &n_seq,
+                            &n_lit);
       if (ok) {
         __syncwarp();
         ok = lz_reconstruct_warp(seqs, n_seq, lits, n_lit, chunk_out, orig);
@@ -143,23 +222,54 @@ decompress_kernel(const uint8_t* in, const uint32_t* in_offsets, uint32_t chunk_
   if (!ok && lane == 0) *err = 1;
 }
 
+__global__ void expand_group_tables_kernel(const uint8_t* q_all, uint32_t group_count, RansGroupTable* out) {
+  uint32_t g = blockIdx.x;
+  if (g >= group_count) return;
+  expand_group_table_warp(q_all + (size_t)g * kQuantBytes, out[g]);
+}
+
+// ---------------------------------------------------------------------------
+// Host-callable launchers
+// ---------------------------------------------------------------------------
+
 void launch_compress(const uint8_t* d_in, uint32_t chunk_size, uint32_t chunk_count,
                       const uint32_t* d_in_lens, uint8_t* d_out, uint32_t out_slot_stride,
-                      uint32_t* d_out_start, uint32_t* d_out_sizes, uint8_t* d_scratch, Mode mode,
-                      cudaStream_t stream) {
+                      uint32_t* d_out_start, uint32_t* d_out_sizes, uint8_t* d_scratch,
+                      const RansBatchBufs& d_rans, Mode mode, cudaStream_t stream) {
   uint32_t blocks = (chunk_count + kWarpsPerBlock - 1) / kWarpsPerBlock;
-  compress_kernel<<<blocks, kBlockThreads, 0, stream>>>(d_in, chunk_size, chunk_count, d_in_lens, d_out,
-                                                         out_slot_stride, d_out_start, d_out_sizes, d_scratch,
-                                                         mode);
+  if (mode == Mode::Lz) {
+    compress_kernel_lz<<<blocks, kBlockThreads, 0, stream>>>(d_in, chunk_size, chunk_count, d_in_lens, d_out,
+                                                              out_slot_stride, d_out_start, d_out_sizes);
+    return;
+  }
+  // Mode::LzRans: parse+histogram everything in the batch, build one
+  // shared table, then encode. Sequential on `stream`, so each stage sees
+  // the previous one's complete output.
+  cudaMemsetAsync(d_rans.cnt, 0, kQuantBytes * sizeof(uint32_t), stream);
+  parse_hist_kernel<<<blocks, kBlockThreads, 0, stream>>>(d_in, chunk_size, chunk_count, d_in_lens, d_out,
+                                                          out_slot_stride, d_out_start, d_out_sizes, d_scratch,
+                                                          d_rans.n_seq, d_rans.n_lit, d_rans.cnt);
+  build_table_kernel<<<1, 32, 0, stream>>>(d_rans.cnt, d_rans.q, d_rans.freq, d_rans.cum);
+  rans_encode_kernel<<<blocks, kBlockThreads, 0, stream>>>(d_in, chunk_size, chunk_count, d_in_lens, d_out,
+                                                           out_slot_stride, d_out_start, d_out_sizes, d_scratch,
+                                                           d_rans.n_seq, d_rans.n_lit, d_rans.freq, d_rans.cum);
 }
 
 void launch_decompress(const uint8_t* d_in, const uint32_t* d_in_offsets, uint32_t chunk_count,
                         const uint32_t* d_in_lens, uint8_t* d_out, uint32_t chunk_size,
-                        const uint32_t* d_out_lens, uint8_t* d_scratch, uint32_t* d_err,
-                        cudaStream_t stream) {
+                        const uint32_t* d_out_lens, uint8_t* d_scratch, const void* d_group_tables,
+                        const uint32_t* d_group_id, uint32_t* d_err, cudaStream_t stream) {
   uint32_t blocks = (chunk_count + kWarpsPerBlock - 1) / kWarpsPerBlock;
-  decompress_kernel<<<blocks, kBlockThreads, 0, stream>>>(d_in, d_in_offsets, chunk_count, d_in_lens, d_out,
-                                                           chunk_size, d_out_lens, d_scratch, d_err);
+  decompress_kernel<<<blocks, kBlockThreads, 0, stream>>>(
+      d_in, d_in_offsets, chunk_count, d_in_lens, d_out, chunk_size, d_out_lens, d_scratch,
+      reinterpret_cast<const RansGroupTable*>(d_group_tables), d_group_id, d_err);
+}
+
+size_t rans_group_table_bytes() { return sizeof(RansGroupTable); }
+
+void launch_expand_group_tables(const uint8_t* d_q, uint32_t group_count, void* d_tables, cudaStream_t stream) {
+  expand_group_tables_kernel<<<group_count, 32, 0, stream>>>(d_q, group_count,
+                                                             reinterpret_cast<RansGroupTable*>(d_tables));
 }
 
 // One warp per chunk; byte copies because slot payloads have arbitrary
