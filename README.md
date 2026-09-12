@@ -10,32 +10,38 @@ drop-in replacement for zstd — but on text it beats single-threaded
 ## Results
 
 283MB of concatenated C headers (`/usr/include`, see *Benchmarking*),
-RTX 5060 Ti under WSL2 while another process was using ~90% of the GPU,
-CPU tools single-threaded. Wall figures are whole-process (file I/O,
-PCIe copies, and for gzp ~0.15–0.3s of CUDA context creation); the
-kernel columns are GPU time only.
+RTX 5060 Ti under WSL2, GPU otherwise idle, CPU tools single-threaded,
+best of 5 runs (`REPEAT=5`) per column. Wall figures are whole-process
+(file I/O, PCIe copies, and for gzp ~0.15–0.3s of CUDA context
+creation); the kernel columns are GPU time only.
 
 | codec | compress MB/s (wall) | kernel MB/s | decompress MB/s (wall) | kernel MB/s | ratio |
 |---|---|---|---|---|---|
-| **gzp** (lzrans, 64KB) | **498** | 1500 | **614** | 1040 | **0.281** |
-| gzp (lz only, 64KB) | 514 | 1370 | 499 | 1670 | 0.379 |
-| gzip -1 | 74 | – | 233 | – | 0.284 |
-| gzip -6 | 55 | – | 275 | – | 0.231 |
-| zstd -1 (1 thread) | 480 | – | 1082 | – | 0.252 |
-| zstd -3 (1 thread) | 348 | – | 1219 | – | 0.225 |
+| **gzp** (lzrans, 64KB) | **583** | 1598 | **629** | 3759 | **0.272** |
+| gzp (lz only, 64KB) | 556 | 1594 | 643 | 5498 | 0.370 |
+| gzip -1 | 149 | – | 262 | – | 0.284 |
+| gzip -6 | 59 | – | 293 | – | 0.231 |
+| zstd -1 (1 thread) | 513 | – | 1400 | – | 0.252 |
+| zstd -3 (1 thread) | 390 | – | 1301 | – | 0.225 |
 
-(The committed default is slightly better than this table — a later
-change to the match finder brought the 64KB ratio to 0.278.)
+gzp beats `gzip -1` on both ratio and speed, and beats `zstd -1`'s ratio
+and compress speed (zstd's hand-tuned decoder is still faster to
+decode). Earlier measurements taken while another process held ~90% of
+the GPU showed much lower and noisier numbers purely from contention —
+`REPEAT=<n>` (see *Benchmarking*) exists because of exactly that.
 
 Chunk size trades ratio for per-chunk latency; 64KB is the default and
-the maximum the 16-bit match offsets allow:
+the maximum the 16-bit match offsets allow. With the GPU idle, smaller
+chunks turn out to decode substantially faster too (more, smaller units
+of parallel work), so this is a real ratio-vs-speed dial, not just a
+ratio-vs-latency one:
 
 | chunk | mode | ratio | compress kernel MB/s | decompress kernel MB/s |
 |---|---|---|---|---|
-| 16KB | lzrans | 0.318 | 2200 | 1790 |
-| 32KB | lzrans | 0.292 | 1800 | 1870 |
-| 64KB | lzrans | 0.278 | 1300 | 960 |
-| 64KB | lz | 0.375 | 1540 | 1510 |
+| 16KB | lzrans | 0.297 | 2372 | 8106 |
+| 32KB | lzrans | 0.281 | 2073 | 6644 |
+| 64KB | lzrans | 0.272 | 1585 | 3741 |
+| 64KB | lz | 0.370 | 1541 | 5286 |
 
 ## How it works
 
@@ -50,10 +56,12 @@ be decoded on its own, and a corrupt chunk cannot damage another.
 ### LZ parse (`src/lz_warp.cuh`)
 
 The warp walks a chunk in 32-byte windows. Every lane hashes the 4 bytes
-at its own position, reads a 2-way bucket from a per-warp shared-memory
-hash table (2048 buckets, two 16-bit positions each, 8KB per warp) and
-compares against both candidates, capped at 32 bytes so per-lane work is
-bounded. One deterministic lane per bucket then inserts its position;
+at its own position, reads a 4-way bucket from a per-warp shared-memory
+hash table (1024 buckets, four 16-bit positions each, packed two per u32
+word — 8KB per warp total, same footprint as an earlier 2-way/2048-bucket
+design that measured worse) and compares against all four candidates,
+capped at 32 bytes so per-lane work is bounded. One deterministic lane
+per bucket then inserts its position, evicting the oldest of the four;
 lanes that found nothing re-probe once more so repeats shorter than a
 window apart are caught immediately. The window's matches are selected
 warp-uniformly from a ballot mask with a one-position lazy lookahead
@@ -70,8 +78,13 @@ the entropy stage.
 Literals, literal-run lengths, match lengths and offsets are coded with
 rANS. Length and offset alphabets are zstd-style log2 buckets with raw
 extra bits (written straight into the rANS state, so there is no side
-stream). Each chunk carries its own quantised frequency tables (352
-bytes) which both sides expand with identical integer math.
+stream). The frequency table is **shared by every chunk compressed in
+the same host batch** (a "table group" — see *Container format*) rather
+than stored per chunk: compression runs as three kernels per batch —
+parse every chunk into scratch while atomically accumulating one shared
+histogram, quantise+normalise it once, then encode every chunk against
+that shared table. This removes the ~352-byte/chunk table overhead an
+earlier per-chunk-table design paid.
 
 The GPU-specific part is the interleaving: 32 rANS states, one per lane,
 share **one** stream of 16-bit words. All lanes step in lockstep; the
@@ -84,17 +97,23 @@ runs in reverse and writes backward from the end of its output slot; the
 decoder reads forward.
 
 Each chunk keeps whichever is smaller of the rANS payload and the plain
-token stream (highly repetitive chunks are better off without the table
-header), and falls back to raw storage if neither beats the input.
+token stream (highly repetitive chunks are better off without any table
+at all), and falls back to raw storage if neither beats the input.
 
 ### Decoding
 
 Token decoding is warp-cooperative: 32 lanes copy each literal run and
 each match, with overlapping matches handled by indexing `k mod offset`
 into already-written history so no serial path is needed. rANS decoding
-runs the same 32-lane lockstep as the encoder into scratch, then the
-same reconstruction loop rebuilds the chunk. Malformed input sets an
-error flag that the host turns into an error rather than garbage output.
+runs the same 32-lane lockstep as the encoder into scratch (looking up
+its symbols in a coarse 128-entry index per alphabet plus a short linear
+scan, rather than a binary search), then the same reconstruction loop
+rebuilds the chunk. Because the table is shared per batch, decompression
+expands every table group's frequencies once up front (into a global
+buffer looked up by a per-chunk group id) instead of rebuilding one per
+chunk — which also means the decode kernel needs no shared memory for
+tables at all anymore. Malformed input sets an error flag that the host
+turns into an error rather than garbage output.
 
 ### Host pipeline (`src/main.cu`)
 
@@ -110,12 +129,23 @@ allocation retries with a halved batch on failure.
 ### Container format (`src/format.h`)
 
 ```
-FileHeader   { magic, version=2, chunk_size, original_size, chunk_count }
-ChunkEntry[] { offset, compressed_size, original_size }   -- one per chunk
-payload      -- each chunk: [flag: Raw | Lz | LzRans] [data]
+FileHeader    { magic, version=3, chunk_size, original_size, chunk_count, table_group_count }
+ChunkEntry[]  { offset, compressed_size, original_size }         -- one per chunk
+TableGroup[]  { start_chunk, chunk_count, q[352] }               -- one per compression batch (LzRans only)
+payload       -- each chunk: [flag: Raw | Lz | LzRans] [data]
 ```
 
-Worst case is the original size plus one byte per chunk plus the table.
+`TableGroup` entries cover `[0, chunk_count)` contiguously and in
+order; chunk *c*'s rANS table (if it used one) is whichever group's
+range contains *c* — always exactly one host compression batch's worth
+of chunks, decided at compress time and independent of whatever batch
+size decompression later happens to choose. `--mode lz` files (no
+chunk can ever be `LzRans`) have zero table groups.
+
+Worst case is the original size plus one byte per chunk plus one table
+per batch (~360 bytes), so a file compressed in very few batches (a
+small input, or one forced small with `GZP_FORCE_BATCH`) pays that
+overhead even when nothing in it uses rANS.
 
 ## Building
 
@@ -130,21 +160,39 @@ cmake --build build -j
 (`CMAKE_CUDA_ARCHITECTURES=native` is not used because under WSL it
 silently fell back to sm_52 instead of detecting the GPU.)
 
+`GZP_MIN_BLOCKS_PER_SM=<n>` (a CMake cache var, not a runtime flag) sets
+`__launch_bounds__`'s `minBlocksPerSM` hint on both kernels, for A/B
+occupancy testing — see the comment above it in `CMakeLists.txt` for
+why a bare `--maxrregcount` can't do this (both kernels already carry
+an explicit `__launch_bounds__`, which takes precedence) and why it's
+unlikely to change occupancy today (both kernels are shared-memory-
+bound, not register-bound, at their current sizes).
+
 ## Usage
 
 ```
 ./build/gzp c <input> <output> [chunk_size] [--mode lz|lzrans]   # compress (default 65536, lzrans)
 ./build/gzp d <input> <output>                                   # decompress
 GZP_VERBOSE=1 ./build/gzp ...                                    # per-stage timing
+GZP_FORCE_BATCH=<n> ./build/gzp ...                              # force chunks/batch (testing only)
 ```
 
 ## Testing
 
 ```
-bash tests/round_trip.sh                 # default chunk size
-bash tests/round_trip.sh --extremes      # chunk sizes 1, 16, 4K, 8K, 32K, 65535, 65536
-BIG=1 bash tests/round_trip.sh           # + 300MB random and 300MB text (multi-batch)
+bash tests/round_trip.sh                 # default chunk size, both modes
+bash tests/round_trip.sh --extremes      # chunk sizes 1, 16, 4K, 8K, 32K, 65535, 65536, both modes,
+                                          # plus GZP_FORCE_BATCH mismatch cases (see below)
+BIG=1 bash tests/round_trip.sh           # + 300MB random and 300MB text (multi-batch), both modes
 ```
+
+`GZP_FORCE_BATCH` exists because a `TableGroup`'s boundaries are fixed
+at compress time to whatever batch size compression used, but
+decompression picks its own batch size independently (different free
+VRAM, a different machine) — so decompression's per-chunk group-id
+lookup must work no matter how the two are misaligned. The extremes
+suite compresses and decompresses with deliberately different forced
+batch sizes (both directions) to exercise exactly that.
 
 Every case is round-tripped on the GPU *and* decoded by
 `tests/ref_decode.cpp`, a CPU decoder that shares no code with the GPU
@@ -177,11 +225,14 @@ REPEAT=5 bash bench/run_bench.sh corpus_283mb.txt
   on this WSL2 machine; on a 94MB file that is half the wall time. It
   amortises on larger inputs and is outside gzp's control.
 - **Ratio vs zstd.** gzp's rANS codes literals with an order-0 model and
-  its parser is a single-pass hash match finder; zstd -1 is ~10% smaller
-  on this corpus. Per-batch (rather than per-chunk) rANS tables would
-  recover roughly 1%, repeat-offset codes and a better parser more.
-- **Decode speed.** rANS decode runs ~1 GB/s at 64KB chunks, about half
-  of the token-only path; the per-symbol shared-memory lookups and
-  binary searches over the small alphabets are the cost.
+  its parser is a single-pass hash match finder; zstd -1 is still ~8%
+  smaller on this corpus even after moving to one shared table per batch
+  (a per-chunk table cost ~1-2% more). Repeat-offset codes and a better
+  parser (hash chains, optimal parsing) would close more of the gap.
+- **Decode speed still trails the token-only path** (3.7 GB/s vs 5.3 GB/s
+  kernel at 64KB) despite the coarse-LUT decode and per-batch tables
+  (which removed the earlier per-chunk table-rebuild cost entirely) —
+  the remaining gap is the extra work rANS decode itself does per
+  symbol versus a token stream's direct byte copies.
 - **No multi-GPU, no streaming API** — it's a file-in, file-out CLI.
 - Match offsets are 16-bit, which caps chunks at 64KB.
