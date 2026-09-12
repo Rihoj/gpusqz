@@ -8,14 +8,16 @@ constexpr uint32_t kMagic = 0x50475A47; // "GZGP" little-endian
 constexpr uint32_t kVersion = 2;
 
 // One warp compresses one chunk, and ~400-500 warps are resident on this
-// GPU at once, so batches of a couple thousand chunks fill it regardless
-// of chunk size; larger chunks then mostly buy compression ratio (longer
-// history for matches) at the cost of per-chunk latency.
-constexpr uint32_t kDefaultChunkSize = 32768;
+// GPU at once, so batches of a few hundred chunks fill it regardless of
+// chunk size; larger chunks then mostly buy compression ratio (longer
+// history for matches, and the per-chunk rANS table header amortised
+// over more data). 64KB is the most the u16 match offsets allow.
+constexpr uint32_t kDefaultChunkSize = 65536;
 constexpr uint32_t kMaxChunkSize = 65536; // match offsets are u16
 
 // Shortest match the LZ stage emits. Baked into both payload formats:
 // token match codes and rANS match-length codes are relative to it.
+// (3 was measured to be ~3% worse and slower than 4 on text.)
 constexpr int kMinMatch = 4;
 
 // Bytes reserved per chunk in the fixed-slot output layout. Encoders give

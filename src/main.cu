@@ -32,7 +32,7 @@ constexpr int kMaxSets = 3;
 // cost on WSL2, so this is deliberately modest; three streams in flight
 // still keep the GPU busy.
 constexpr uint32_t kTargetBatches = 8;
-constexpr size_t kMinBatchBytes = 16u << 20;
+constexpr size_t kMinBatchBytes = 32u << 20;
 constexpr size_t kStdioBuf = 4u << 20;
 
 void die(const std::string& msg) {

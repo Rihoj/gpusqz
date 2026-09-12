@@ -109,7 +109,7 @@ __device__ inline bool rans_encode_warp(const SeqRec* seqs, uint32_t n_seq, cons
     uint32_t c, nb, b;
     len_code(r.lit_len, c, nb, b);
     atomicAdd(&t.cnt[kLlBase + c], 1u);
-    len_code(r.ml ? r.ml - (kMinMatch - 1) : 0, c, nb, b);
+    len_code(r.ml ? (uint32_t)r.ml - (kMinMatch - 1) : 0, c, nb, b);
     atomicAdd(&t.cnt[kMlBase + c], 1u);
     if (r.ml) {
       off_code(r.off, c, nb, b);
@@ -146,11 +146,12 @@ __device__ inline bool rans_encode_warp(const SeqRec* seqs, uint32_t n_seq, cons
     bool act = idx < n_seq;
     SeqRec r{0, 0, 0};
     if (act) r = seqs[idx];
+    uint32_t ml = r.ml, off = r.off;
     uint32_t llc, llnb, llb, mlc, mlnb, mlb, oc = 0, onb = 0, ob = 0;
     len_code(r.lit_len, llc, llnb, llb);
-    len_code(r.ml ? r.ml - (kMinMatch - 1) : 0, mlc, mlnb, mlb);
-    bool has_off = act && r.ml != 0;
-    if (has_off) off_code(r.off, oc, onb, ob);
+    len_code(ml ? ml - (kMinMatch - 1) : 0, mlc, mlnb, mlb);
+    bool has_off = act && ml != 0;
+    if (has_off) off_code(off, oc, onb, ob);
 
     if (!rans_enc_bits(x, has_off, onb, ob, wp, wlimit)) return false;
     if (!rans_enc_put(x, has_off, t.freq[kOffBase + oc], t.cum[kOffBase + oc], wp, wlimit)) return false;
@@ -284,7 +285,8 @@ __device__ inline bool rans_decode_warp(const uint8_t* payload, uint32_t len, Ra
 
     if (act) {
       if (ml == 0 && idx != n_seq - 1) bad = true;
-      seqs[idx] = SeqRec{len_value(llc, llb), ml, has_off ? off_value(oc, ob) : 0};
+      if (ml > 0xFFFF) bad = true;
+      seqs[idx] = SeqRec{len_value(llc, llb), (uint16_t)ml, (uint16_t)(has_off ? off_value(oc, ob) : 0)};
     }
     if (__any_sync(kFullMask, bad)) return false;
   }
@@ -317,17 +319,18 @@ __device__ inline bool lz_reconstruct_warp(const SeqRec* seqs, uint32_t n_seq, c
     for (uint32_t k = lane; k < r.lit_len; k += 32) out[op + k] = lits[lp + k];
     op += r.lit_len;
     lp += r.lit_len;
-    if (r.ml) {
-      if (r.off == 0 || r.off > op || op + r.ml > orig) return false;
+    uint32_t ml = r.ml, off = r.off;
+    if (ml) {
+      if (off == 0 || off > op || op + ml > orig) return false;
       __syncwarp();
-      const uint8_t* src = out + op - r.off;
-      if (r.off >= r.ml) {
-        for (uint32_t k = lane; k < r.ml; k += 32) out[op + k] = src[k];
+      const uint8_t* src = out + op - off;
+      if (off >= ml) {
+        for (uint32_t k = lane; k < ml; k += 32) out[op + k] = src[k];
       } else {
-        for (uint32_t k = lane; k < r.ml; k += 32) out[op + k] = src[k % r.off];
+        for (uint32_t k = lane; k < ml; k += 32) out[op + k] = src[k % off];
       }
       __syncwarp();
-      op += r.ml;
+      op += ml;
     }
   }
   return op == orig && lp == n_lit;

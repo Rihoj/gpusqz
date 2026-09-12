@@ -17,6 +17,7 @@
 #include <cstdint>
 
 #include "format.h"
+#include "kernels.h"
 
 namespace gzp {
 
@@ -29,15 +30,15 @@ constexpr unsigned kFullMask = 0xFFFFFFFFu;
 constexpr uint32_t kEmptyPos = 0xFFFFu;
 
 // One parsed sequence: lit_len literals followed by a match of ml bytes
-// at backward distance off (ml == 0 only for a literals-only tail).
+// at backward distance off (ml == 0 only for a literals-only tail). A
+// match can never span a whole 64KB chunk (the first window is always
+// literals), so ml fits in 16 bits; lit_len can be the whole chunk.
 struct SeqRec {
   uint32_t lit_len;
-  uint32_t ml;
-  uint32_t off;
+  uint16_t ml;
+  uint16_t off;
 };
-
-// Every match covers at least kMinMatch bytes, plus one optional tail.
-__host__ __device__ inline uint32_t max_sequences(uint32_t chunk_size) { return chunk_size / kMinMatch + 1; }
+static_assert(sizeof(SeqRec) == 8, "scratch_bytes() assumes 8-byte sequence records");
 
 __device__ __forceinline__ uint32_t load4(const uint8_t* p) {
   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -132,7 +133,7 @@ struct SeqEmitter {
   uint32_t n_lit = 0;
   __device__ __forceinline__ bool operator()(uint32_t lit_start, uint32_t lit_len, uint32_t off, uint32_t ml) {
     int lane = threadIdx.x & 31;
-    if (lane == 0) seqs[n_seq] = SeqRec{lit_len, ml, off};
+    if (lane == 0) seqs[n_seq] = SeqRec{lit_len, (uint16_t)ml, (uint16_t)off};
     for (uint32_t k = lane; k < lit_len; k += 32) lits[n_lit + k] = in[lit_start + k];
     ++n_seq;
     n_lit += lit_len;

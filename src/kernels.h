@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
+#include "format.h"
+
 namespace gzp {
 
 enum class Mode : uint32_t {
@@ -10,10 +12,14 @@ enum class Mode : uint32_t {
   LzRans = 1, // LZ parse + rANS entropy coding (falls back to Lz, then Raw)
 };
 
-// Per-chunk device scratch used by the LzRans paths (parsed sequences and
-// literals), 16-byte aligned sections.
+// Every match covers at least kMinMatch bytes, plus one optional tail.
+__host__ __device__ inline uint32_t max_sequences(uint32_t chunk_size) { return chunk_size / kMinMatch + 1; }
+
+// Per-chunk device scratch used by the LzRans paths: an 8-byte record per
+// sequence followed by the literals, each section 16-byte aligned. Must
+// agree with chunk_scratch() in kernels.cu.
 __host__ __device__ inline size_t scratch_bytes(uint32_t chunk_size) {
-  size_t seqs = ((size_t)12 * (chunk_size / 4 + 1) + 15) & ~(size_t)15;
+  size_t seqs = ((size_t)8 * max_sequences(chunk_size) + 15) & ~(size_t)15;
   size_t lits = ((size_t)chunk_size + 15) & ~(size_t)15;
   return seqs + lits;
 }
