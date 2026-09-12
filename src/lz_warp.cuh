@@ -23,8 +23,14 @@ namespace gzp {
 
 static_assert(kMinMatch == 3 || kMinMatch == 4, "hashing supports 3- or 4-byte minimum matches");
 constexpr int kProbe = 32; // per-lane match-length cap before cooperative extension
-constexpr int kHashBits = 11;
-constexpr int kHashSize = 1 << kHashBits; // u32 buckets holding two u16 positions
+// 4-way set-associative hash table: half as many buckets as the earlier
+// 2-way design, each holding twice the candidates, for the same total
+// shared memory (kHashWords u32 words = kHashSize buckets * 2 words/bucket,
+// 2 candidates/word). Measured to compress better than 2048 buckets x
+// 2-way at the same smem cost, without changing occupancy.
+constexpr int kHashBits = 10;
+constexpr int kHashSize = 1 << kHashBits; // number of buckets
+constexpr int kHashWords = kHashSize * 2; // u32 words backing the table
 constexpr int kWarpsPerBlock = 4;
 constexpr unsigned kFullMask = 0xFFFFFFFFu;
 constexpr uint32_t kEmptyPos = 0xFFFFu;
@@ -53,6 +59,24 @@ __device__ __forceinline__ uint32_t match_len(const uint8_t* in, uint32_t a, uin
   uint32_t l = 0;
   while (l < max_len && in[a + l] == in[b + l]) ++l;
   return l;
+}
+
+// Checks all 4 candidates packed into one bucket's two words (2 candidates
+// per word, low half = more recently inserted) and keeps the longest match.
+__device__ __forceinline__ void probe_bucket(const uint8_t* in, uint32_t p, uint32_t w0, uint32_t w1,
+                                             uint32_t max_len, uint32_t& best_len, uint32_t& best_off) {
+  uint32_t cands[4] = {w0 & 0xFFFFu, w0 >> 16, w1 & 0xFFFFu, w1 >> 16};
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    uint32_t cand = cands[i];
+    if (cand != kEmptyPos && cand < p) {
+      uint32_t l = match_len(in, cand, p, max_len);
+      if (l > best_len) {
+        best_len = l;
+        best_off = p - cand;
+      }
+    }
+  }
 }
 
 __device__ __forceinline__ uint32_t ext_bytes(uint32_t v) { return v >= 15 ? 1 + (v - 15) / 255 : 0; }
@@ -156,11 +180,11 @@ __device__ inline bool tokens_from_seqs(const uint8_t* in, const SeqRec* seqs, u
 
 // Parses in[0..n) into sequences, calling emit(lit_start, lit_len, off, ml)
 // for each match (and once more with ml = 0 for any trailing literals).
-// htab is this warp's kHashSize-entry shared-memory table. Returns false
-// as soon as emit does.
+// htab is this warp's kHashWords-word shared-memory table (kHashSize
+// 4-way buckets). Returns false as soon as emit does.
 //
 // The warp walks the chunk in 32-byte windows. Every lane hashes its own
-// position, probes the two candidates in its bucket (capped at kProbe
+// position, probes the four candidates in its bucket (capped at kProbe
 // bytes so per-lane work is bounded), and the window's matches are then
 // selected warp-uniformly with a one-position lazy lookahead; matches
 // that hit the probe cap are extended cooperatively. Candidates only ever
@@ -170,7 +194,7 @@ __device__ inline bool tokens_from_seqs(const uint8_t* in, const SeqRec* seqs, u
 template <class Emit>
 __device__ inline bool lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* htab, Emit& emit) {
   int lane = threadIdx.x & 31;
-  for (int i = lane; i < kHashSize; i += 32) htab[i] = 0xFFFFFFFFu;
+  for (int i = lane; i < kHashWords; i += 32) htab[i] = 0xFFFFFFFFu;
   __syncwarp();
 
   uint32_t lit_start = 0;
@@ -178,47 +202,34 @@ __device__ inline bool lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* ht
   while (pos + kMinMatch <= n) {
     uint32_t p = pos + lane;
     bool valid = p + kMinMatch <= n;
-    uint32_t h = 0, b = 0xFFFFFFFFu;
+    uint32_t h = 0, w0 = 0xFFFFFFFFu, w1 = 0xFFFFFFFFu;
     uint32_t best_len = 0, best_off = 0;
     if (valid) {
       h = hash_at(in + p);
-      b = htab[h];
+      w0 = htab[2 * h];
+      w1 = htab[2 * h + 1];
       uint32_t max_len = min((uint32_t)kProbe, n - p);
-      for (int w = 0; w < 2; ++w) {
-        uint32_t cand = (b >> (16 * w)) & 0xFFFF;
-        if (cand != kEmptyPos && cand < p) {
-          uint32_t l = match_len(in, cand, p, max_len);
-          if (l > best_len) {
-            best_len = l;
-            best_off = p - cand;
-          }
-        }
-      }
+      probe_bucket(in, p, w0, w1, max_len, best_len, best_off);
     }
     __syncwarp(); // all reads of htab precede any insert
 
     // One insert per distinct bucket per window, by the lowest valid lane,
     // deterministically. Inserting the earliest position lets the later
     // lanes of this same window find it in the second probe below, so
-    // repeats shorter than a window apart are caught immediately.
+    // repeats shorter than a window apart are caught immediately. The new
+    // position becomes the most-recent candidate; the oldest of the 4 is
+    // dropped.
     unsigned valid_mask = __ballot_sync(kFullMask, valid);
     unsigned peers = __match_any_sync(kFullMask, h) & valid_mask;
-    if (valid && lane == __ffs(peers) - 1) htab[h] = (b << 16) | p;
+    if (valid && lane == __ffs(peers) - 1) {
+      htab[2 * h] = (w0 << 16) | p;
+      htab[2 * h + 1] = (w1 << 16) | (w0 >> 16);
+    }
     __syncwarp();
 
     if (valid && best_len < (uint32_t)kMinMatch) {
-      uint32_t b2 = htab[h];
       uint32_t max_len = min((uint32_t)kProbe, n - p);
-      for (int w = 0; w < 2; ++w) {
-        uint32_t cand = (b2 >> (16 * w)) & 0xFFFF;
-        if (cand != kEmptyPos && cand < p) {
-          uint32_t l = match_len(in, cand, p, max_len);
-          if (l > best_len) {
-            best_len = l;
-            best_off = p - cand;
-          }
-        }
-      }
+      probe_bucket(in, p, htab[2 * h], htab[2 * h + 1], max_len, best_len, best_off);
     }
 
     unsigned mask = __ballot_sync(kFullMask, best_len >= (uint32_t)kMinMatch);

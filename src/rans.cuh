@@ -34,7 +34,7 @@ struct RansEncTables {
   uint16_t freq[kQuantBytes];
   uint16_t cum[kQuantBytes];
 };
-static_assert(sizeof(RansEncTables) <= kHashSize * sizeof(uint32_t), "encoder tables must fit the hash table region");
+static_assert(sizeof(RansEncTables) <= kHashWords * sizeof(uint32_t), "encoder tables must fit the hash table region");
 
 // Coarse index for the 32-symbol alphabets: lut[i] is the largest symbol s
 // with cum[s] <= i * (kProbScale >> kSmallLutBits), i.e. a lower bound on

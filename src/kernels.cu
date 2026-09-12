@@ -33,7 +33,7 @@ __global__ void GZP_LAUNCH_BOUNDS
 compress_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, const uint32_t* in_lens,
                 uint8_t* out, uint32_t out_slot_stride, uint32_t* out_start, uint32_t* out_sizes,
                 uint8_t* scratch, Mode mode) {
-  __shared__ uint32_t htab[kWarpsPerBlock][kHashSize];
+  __shared__ uint32_t htab[kWarpsPerBlock][kHashWords];
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   uint32_t c = blockIdx.x * kWarpsPerBlock + warp;
   if (c >= chunk_count) return;
