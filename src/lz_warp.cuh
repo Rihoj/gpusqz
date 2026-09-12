@@ -197,11 +197,29 @@ __device__ inline bool lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* ht
     }
     __syncwarp(); // all reads of htab precede any insert
 
-    // One insert per distinct bucket per window: the highest valid lane
-    // (the most recent position) wins, deterministically.
+    // One insert per distinct bucket per window, by the lowest valid lane,
+    // deterministically. Inserting the earliest position lets the later
+    // lanes of this same window find it in the second probe below, so
+    // repeats shorter than a window apart are caught immediately.
     unsigned valid_mask = __ballot_sync(kFullMask, valid);
     unsigned peers = __match_any_sync(kFullMask, h) & valid_mask;
-    if (valid && lane == 31 - __clz(peers)) htab[h] = (b << 16) | p;
+    if (valid && lane == __ffs(peers) - 1) htab[h] = (b << 16) | p;
+    __syncwarp();
+
+    if (valid && best_len < (uint32_t)kMinMatch) {
+      uint32_t b2 = htab[h];
+      uint32_t max_len = min((uint32_t)kProbe, n - p);
+      for (int w = 0; w < 2; ++w) {
+        uint32_t cand = (b2 >> (16 * w)) & 0xFFFF;
+        if (cand != kEmptyPos && cand < p) {
+          uint32_t l = match_len(in, cand, p, max_len);
+          if (l > best_len) {
+            best_len = l;
+            best_off = p - cand;
+          }
+        }
+      }
+    }
 
     unsigned mask = __ballot_sync(kFullMask, best_len >= (uint32_t)kMinMatch);
     uint32_t cur = 0;

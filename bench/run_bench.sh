@@ -1,41 +1,68 @@
 #!/usr/bin/env bash
-# Compares gzp (GPU) against gzip -1/-6 (CPU) on a given file. Timings are
-# wall-clock for the whole compress/decompress call, including file I/O and
-# host<->device transfers, not just kernel time.
+# Compares gzp (GPU) against CPU compressors on one file.
+#
+#   bench/run_bench.sh <file> [chunk_size]
+#
+# Wall times cover the whole process (file I/O, host<->device copies and,
+# for gzp, ~0.15-0.3s of CUDA context creation on WSL2), so they favour
+# large inputs. The "kernel" column is GPU time only, from cudaEvents, and
+# is what the codec itself sustains once the fixed costs are paid. CPU
+# tools run single-threaded.
 set -euo pipefail
 
 GZP="${GZP:-./build/gzp}"
-FILE="${1:?usage: run_bench.sh <file>}"
+FILE="${1:?usage: run_bench.sh <file> [chunk_size]}"
+CHUNK="${2:-}"
 SIZE=$(stat -c%s "$FILE")
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 echo "Input: $FILE ($SIZE bytes)"
-echo
+printf "%-22s %10s %10s %10s %10s %8s\n" "codec" "comp MB/s" "kern MB/s" "dec MB/s" "kern MB/s" "ratio"
 
-echo "--- gzp (GPU, LZSS, 8KB chunks) ---"
-t0=$(date +%s.%N)
-"$GZP" c "$FILE" "$TMP/out.gzp" >/dev/null
-t1=$(date +%s.%N)
-"$GZP" d "$TMP/out.gzp" "$TMP/out.dec" >/dev/null
-t2=$(date +%s.%N)
-cmp -s "$FILE" "$TMP/out.dec" || { echo "ROUND-TRIP MISMATCH"; exit 1; }
-csize=$(stat -c%s "$TMP/out.gzp")
-awk -v s="$SIZE" -v c="$csize" -v ct="$(echo "$t1 - $t0" | bc)" -v dt="$(echo "$t2 - $t1" | bc)" \
-  'BEGIN{printf "compress: %.3fs (%.1f MB/s)  decompress: %.3fs (%.1f MB/s)  ratio: %.4f  size: %d\n", \
-         ct, s/1e6/ct, dt, s/1e6/dt, c/s, c}'
-echo
+mbps() { awk -v b="$1" -v s="$2" 'BEGIN { if (s > 0) printf "%.0f", b / 1e6 / s; else printf "-" }'; }
+kern() { grep -E "^\s*kernel" "$1" | awk '{gsub(/\(/, "", $3); printf "%.0f", $3}'; }
 
-for lvl in 1 6; do
-  echo "--- gzip -$lvl (CPU, single-threaded) ---"
+run_gzp() {
+  local label="$1"; shift
+  local t0 t1 t2 csize
   t0=$(date +%s.%N)
-  gzip -$lvl -c "$FILE" > "$TMP/out.gz"
+  GZP_VERBOSE=1 "$GZP" c "$FILE" "$TMP/out.gzp" ${CHUNK:+$CHUNK} "$@" 2>"$TMP/c.log"
   t1=$(date +%s.%N)
-  gunzip -c "$TMP/out.gz" > "$TMP/out.gz.dec"
+  GZP_VERBOSE=1 "$GZP" d "$TMP/out.gzp" "$TMP/out.dec" 2>"$TMP/d.log"
   t2=$(date +%s.%N)
-  cmp -s "$FILE" "$TMP/out.gz.dec" || { echo "ROUND-TRIP MISMATCH"; exit 1; }
-  csize=$(stat -c%s "$TMP/out.gz")
-  awk -v s="$SIZE" -v c="$csize" -v ct="$(echo "$t1 - $t0" | bc)" -v dt="$(echo "$t2 - $t1" | bc)" \
-    'BEGIN{printf "compress: %.3fs (%.1f MB/s)  decompress: %.3fs (%.1f MB/s)  ratio: %.4f  size: %d\n", \
-           ct, s/1e6/ct, dt, s/1e6/dt, c/s, c}'
-done
+  cmp -s "$FILE" "$TMP/out.dec" || { echo "ROUND-TRIP MISMATCH ($label)"; exit 1; }
+  csize=$(stat -c%s "$TMP/out.gzp")
+  printf "%-22s %10s %10s %10s %10s %8.4f\n" "$label" \
+    "$(mbps "$SIZE" "$(echo "$t1 - $t0" | bc)")" "$(kern "$TMP/c.log")" \
+    "$(mbps "$SIZE" "$(echo "$t2 - $t1" | bc)")" "$(kern "$TMP/d.log")" \
+    "$(echo "scale=4; $csize / $SIZE" | bc)"
+}
+
+run_cpu() {
+  local label="$1" comp="$2" decomp="$3"
+  local t0 t1 t2 csize
+  t0=$(date +%s.%N)
+  eval "$comp" < "$FILE" > "$TMP/out.cpu"
+  t1=$(date +%s.%N)
+  eval "$decomp" < "$TMP/out.cpu" > "$TMP/out.dec"
+  t2=$(date +%s.%N)
+  cmp -s "$FILE" "$TMP/out.dec" || { echo "ROUND-TRIP MISMATCH ($label)"; exit 1; }
+  csize=$(stat -c%s "$TMP/out.cpu")
+  printf "%-22s %10s %10s %10s %10s %8.4f\n" "$label" \
+    "$(mbps "$SIZE" "$(echo "$t1 - $t0" | bc)")" "-" \
+    "$(mbps "$SIZE" "$(echo "$t2 - $t1" | bc)")" "-" \
+    "$(echo "scale=4; $csize / $SIZE" | bc)"
+}
+
+run_gzp "gzp (GPU, lzrans)"
+run_gzp "gzp (GPU, lz)" --mode lz
+run_cpu "gzip -1" "gzip -1 -c" "gzip -d -c"
+run_cpu "gzip -6" "gzip -6 -c" "gzip -d -c"
+if command -v zstd >/dev/null; then
+  run_cpu "zstd -1 (1 thread)" "zstd -1 -T1 -q -c" "zstd -d -q -c"
+  run_cpu "zstd -3 (1 thread)" "zstd -3 -T1 -q -c" "zstd -d -q -c"
+fi
+if command -v lz4 >/dev/null; then
+  run_cpu "lz4 -1" "lz4 -1 -q -c" "lz4 -d -q -c"
+fi
