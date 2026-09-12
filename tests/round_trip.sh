@@ -18,6 +18,9 @@ if [ "${1:-}" = "--extremes" ]; then
   shift
 fi
 GZP="${1:-./build/gzp}"
+# Independent CPU decoder (built alongside gzp); skipped if absent.
+REFDEC="${REFDEC:-$(dirname "$GZP")/gzp_refdec}"
+[ -x "$REFDEC" ] || REFDEC=""
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -44,7 +47,17 @@ run_case() {
   local comp="$TMP/$name.gzp" dec="$TMP/$name.out"
   "${PREFIX[@]}" "$GZP" c "$f" "$comp" "$chunk" 2>>"$TMP/log"
   "${PREFIX[@]}" "$GZP" d "$comp" "$dec" 2>>"$TMP/log"
-  if cmp -s "$f" "$dec"; then
+  local ref_ok=1
+  if [ -n "$REFDEC" ]; then
+    if ! "$REFDEC" "$comp" "$TMP/$name.ref" 2>>"$TMP/log" || ! cmp -s "$f" "$TMP/$name.ref"; then
+      ref_ok=0
+    fi
+    rm -f "$TMP/$name.ref"
+  fi
+  if [ "$ref_ok" -eq 0 ]; then
+    printf "FAIL chunk=%-6d %-20s CPU reference decoder mismatch\n" "$chunk" "$name"
+    fail=1
+  elif cmp -s "$f" "$dec"; then
     local in_sz comp_sz
     in_sz=$(stat -c%s "$f")
     comp_sz=$(stat -c%s "$comp")

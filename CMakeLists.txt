@@ -29,3 +29,8 @@ target_compile_options(gzp PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
   $<$<COMPILE_LANGUAGE:CXX>:-O3>
 )
+
+# CPU reference decoder used by tests/round_trip.sh.
+add_executable(gzp_refdec tests/ref_decode.cpp)
+target_include_directories(gzp_refdec PRIVATE src)
+target_compile_options(gzp_refdec PRIVATE -O2 -Wall -Wextra)

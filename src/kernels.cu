@@ -1,75 +1,90 @@
 #include "kernels.h"
-#include "lzss_kernels.cuh"
+#include "lz_warp.cuh"
 #include "format.h"
 
 #include <cub/device/device_scan.cuh>
 
 namespace gzp {
 
-// Fixed-slot layout: chunk c's input lives at in + c*chunk_size (chunk_size
-// bytes, last chunk zero-tail padded by the host); chunk c's output slot is
-// out + c*out_slot_stride (out_slot_stride = worst_case_size(chunk_size)).
-// out_sizes[c] receives the actual bytes written (including the 1-byte flag).
-__global__ void compress_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count,
-                                 const uint32_t* in_lens, uint8_t* out, uint32_t out_slot_stride,
-                                 uint32_t* out_sizes) {
-  uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+constexpr int kBlockThreads = kWarpsPerBlock * 32;
+
+// One warp per chunk. Chunk c's input lives at in + c*chunk_size (in_lens[c]
+// valid bytes); its output goes to the fixed slot out + c*out_slot_stride
+// as [flag byte][payload], with the total size in out_sizes[c].
+__global__ void __launch_bounds__(kBlockThreads)
+compress_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, const uint32_t* in_lens,
+                uint8_t* out, uint32_t out_slot_stride, uint32_t* out_sizes) {
+  __shared__ uint32_t htab[kWarpsPerBlock][kHashSize];
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  uint32_t c = blockIdx.x * kWarpsPerBlock + warp;
   if (c >= chunk_count) return;
 
   const uint8_t* chunk_in = in + (size_t)c * chunk_size;
   uint32_t in_len = in_lens[c];
   uint8_t* slot = out + (size_t)c * out_slot_stride;
 
-  // Encode into the slot starting at offset 1, reserving byte 0 for the
-  // container flag (Raw/Lzss), decided after we see the encoded size.
-  uint32_t enc_size = lzss_encode_chunk(chunk_in, in_len, slot + 1);
-  if (enc_size < in_len) {
-    slot[0] = (uint8_t)ChunkFlag::Lzss;
-    out_sizes[c] = 1 + enc_size;
+  // Only worth encoding if the result (flag + payload) is no larger than
+  // the raw alternative, so cap the payload at in_len - 1.
+  uint32_t enc_len = 0;
+  bool ok = in_len > 1 && lz_encode_warp(chunk_in, in_len, slot + 1, in_len - 1, &enc_len, htab[warp]);
+  if (ok) {
+    if (lane == 0) {
+      slot[0] = (uint8_t)ChunkFlag::Lz;
+      out_sizes[c] = 1 + enc_len;
+    }
   } else {
-    slot[0] = (uint8_t)ChunkFlag::Raw;
-    for (uint32_t k = 0; k < in_len; ++k) slot[1 + k] = chunk_in[k];
-    out_sizes[c] = 1 + in_len;
+    for (uint32_t k = lane; k < in_len; k += 32) slot[1 + k] = chunk_in[k];
+    if (lane == 0) {
+      slot[0] = (uint8_t)ChunkFlag::Raw;
+      out_sizes[c] = 1 + in_len;
+    }
   }
 }
 
-// Chunk c's compressed data (flag byte + payload) lives at in + in_offsets[c],
-// with in_lens[c] valid bytes; chunk c's decompressed output lives at
-// out + c*chunk_size, with out_lens[c] valid bytes.
-__global__ void decompress_kernel(const uint8_t* in, const uint32_t* in_offsets, uint32_t chunk_count,
-                                   const uint32_t* in_lens, uint8_t* out, uint32_t chunk_size,
-                                   const uint32_t* out_lens) {
-  uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+// One warp per chunk. Chunk c's compressed data lives at in + in_offsets[c]
+// (in_lens[c] bytes, flag first); output goes to out + c*chunk_size,
+// out_lens[c] bytes. Any malformed chunk sets *err.
+__global__ void __launch_bounds__(kBlockThreads)
+decompress_kernel(const uint8_t* in, const uint32_t* in_offsets, uint32_t chunk_count, const uint32_t* in_lens,
+                  uint8_t* out, uint32_t chunk_size, const uint32_t* out_lens, uint32_t* err) {
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  uint32_t c = blockIdx.x * kWarpsPerBlock + warp;
   if (c >= chunk_count) return;
 
   const uint8_t* slot = in + in_offsets[c];
-  uint32_t payload_len = in_lens[c] - 1;
+  uint32_t len = in_lens[c];
   uint8_t* chunk_out = out + (size_t)c * chunk_size;
-  uint32_t original_size = out_lens[c];
+  uint32_t orig = out_lens[c];
 
-  if ((ChunkFlag)slot[0] == ChunkFlag::Raw) {
-    for (uint32_t k = 0; k < original_size; ++k) chunk_out[k] = slot[1 + k];
-  } else {
-    lzss_decode_chunk(slot + 1, payload_len, chunk_out, original_size);
+  bool ok = false;
+  if (len >= 1) {
+    ChunkFlag flag = (ChunkFlag)slot[0];
+    if (flag == ChunkFlag::Raw) {
+      ok = len == 1 + orig;
+      if (ok) {
+        for (uint32_t k = lane; k < orig; k += 32) chunk_out[k] = slot[1 + k];
+      }
+    } else if (flag == ChunkFlag::Lz) {
+      ok = lz_decode_warp(slot + 1, len - 1, chunk_out, orig);
+    }
   }
+  if (!ok && lane == 0) *err = 1;
 }
 
 void launch_compress(const uint8_t* d_in, uint32_t chunk_size, uint32_t chunk_count,
                       const uint32_t* d_in_lens, uint8_t* d_out, uint32_t out_slot_stride,
                       uint32_t* d_out_sizes, cudaStream_t stream) {
-  constexpr int kThreads = 128;
-  uint32_t blocks = (chunk_count + kThreads - 1) / kThreads;
-  compress_kernel<<<blocks, kThreads, 0, stream>>>(d_in, chunk_size, chunk_count, d_in_lens, d_out,
-                                                     out_slot_stride, d_out_sizes);
+  uint32_t blocks = (chunk_count + kWarpsPerBlock - 1) / kWarpsPerBlock;
+  compress_kernel<<<blocks, kBlockThreads, 0, stream>>>(d_in, chunk_size, chunk_count, d_in_lens, d_out,
+                                                         out_slot_stride, d_out_sizes);
 }
 
 void launch_decompress(const uint8_t* d_in, const uint32_t* d_in_offsets, uint32_t chunk_count,
                         const uint32_t* d_in_lens, uint8_t* d_out, uint32_t chunk_size,
-                        const uint32_t* d_out_lens, cudaStream_t stream) {
-  constexpr int kThreads = 128;
-  uint32_t blocks = (chunk_count + kThreads - 1) / kThreads;
-  decompress_kernel<<<blocks, kThreads, 0, stream>>>(d_in, d_in_offsets, chunk_count, d_in_lens,
-                                                       d_out, chunk_size, d_out_lens);
+                        const uint32_t* d_out_lens, uint32_t* d_err, cudaStream_t stream) {
+  uint32_t blocks = (chunk_count + kWarpsPerBlock - 1) / kWarpsPerBlock;
+  decompress_kernel<<<blocks, kBlockThreads, 0, stream>>>(d_in, d_in_offsets, chunk_count, d_in_lens, d_out,
+                                                           chunk_size, d_out_lens, d_err);
 }
 
 // One warp per chunk; byte copies because slot payloads have arbitrary

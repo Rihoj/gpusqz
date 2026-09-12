@@ -5,26 +5,26 @@
 namespace gzp {
 
 constexpr uint32_t kMagic = 0x50475A47; // "GZGP" little-endian
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;
 
-// Default chunk size: small enough that a modest input file produces enough
-// chunks to fill an SM-heavy GPU with one thread per chunk (see README), and
-// small enough that an 8KB LZSS window covers the whole chunk.
-constexpr uint32_t kDefaultChunkSize = 8192;
+// One warp compresses one chunk, and ~400-500 warps are resident on this
+// GPU at once, so batches of a couple thousand chunks fill it regardless
+// of chunk size; larger chunks then mostly buy compression ratio (longer
+// history for matches) at the cost of per-chunk latency.
+constexpr uint32_t kDefaultChunkSize = 32768;
+constexpr uint32_t kMaxChunkSize = 65536; // match offsets are u16
 
-// Worst case a chunk can expand to. The LZSS encoder writes speculatively
-// into this buffer before deciding Raw vs Lzss (see kernels.cu), so this
-// must bound the LZSS *encoder's own* worst case, not just the final
-// raw-fallback size: an all-literals chunk emits 1 flag byte per 8 items
-// plus the items themselves, then the container adds its own 1-byte
-// Raw/Lzss flag on top.
+// Bytes reserved per chunk in the fixed-slot output layout. Encoders give
+// up (and the chunk is stored raw) before writing past the input size, so
+// the slot only needs the flag byte plus header headroom beyond chunk_size.
 inline uint32_t worst_case_size(uint32_t chunk_size) {
-  return chunk_size + (chunk_size + 7) / 8 + 1;
+  return (chunk_size + 512 + 15) & ~15u;
 }
 
 enum class ChunkFlag : uint8_t {
   Raw = 0,
-  Lzss = 1,
+  Lz = 1,     // LZ4-style token stream, see lz_warp.cuh
+  LzRans = 2, // reserved for the entropy-coded variant
 };
 
 #pragma pack(push, 1)

@@ -1,9 +1,8 @@
 // gzp: a small GPU-accelerated file compressor.
 //
 // Design: the input is split into fixed-size, independent chunks. Each
-// chunk is LZSS-compressed (or stored raw if that doesn't help) by its own
-// CUDA thread, so throughput scales with chunk count, not with cooperation
-// between threads. See README.md for the format and the tradeoffs.
+// chunk is LZ-compressed (or stored raw if that doesn't help) by one CUDA
+// warp. See README.md for the format and the tradeoffs.
 //
 // Host side, batches of chunks flow through a ring of up to three buffer
 // sets, each with its own stream, so batch i+1's file read and upload
@@ -387,22 +386,23 @@ void compress(const std::string& in_path, const std::string& out_path, uint32_t 
 
 struct DecompressSet {
   PinBuf<uint8_t> h_in, h_out;
-  PinBuf<uint32_t> h_in_offsets, h_in_lens, h_out_lens;
+  PinBuf<uint32_t> h_in_offsets, h_in_lens, h_out_lens, h_err;
   DevBuf<uint8_t> d_in, d_out;
-  DevBuf<uint32_t> d_in_offsets, d_in_lens, d_out_lens;
+  DevBuf<uint32_t> d_in_offsets, d_in_lens, d_out_lens, d_err;
   StreamEvents ev;
   uint32_t n = 0, first = 0;
   bool in_flight = false;
 
   bool alloc(uint32_t batch, uint32_t chunk_size, uint32_t slot_stride) {
     return h_in.alloc((size_t)batch * slot_stride) && h_out.alloc((size_t)batch * chunk_size) &&
-           h_in_offsets.alloc(batch) && h_in_lens.alloc(batch) && h_out_lens.alloc(batch) &&
+           h_in_offsets.alloc(batch) && h_in_lens.alloc(batch) && h_out_lens.alloc(batch) && h_err.alloc(1) &&
            d_in.alloc((size_t)batch * slot_stride) && d_out.alloc((size_t)batch * chunk_size) &&
-           d_in_offsets.alloc(batch) && d_in_lens.alloc(batch) && d_out_lens.alloc(batch);
+           d_in_offsets.alloc(batch) && d_in_lens.alloc(batch) && d_out_lens.alloc(batch) && d_err.alloc(1);
   }
   void release() {
     h_in.release(); h_out.release(); h_in_offsets.release(); h_in_lens.release(); h_out_lens.release();
-    d_in.release(); d_out.release(); d_in_offsets.release(); d_in_lens.release(); d_out_lens.release();
+    h_err.release(); d_in.release(); d_out.release(); d_in_offsets.release(); d_in_lens.release();
+    d_out_lens.release(); d_err.release();
   }
 };
 
@@ -447,6 +447,7 @@ struct Decompressor {
     g_stats.add_span(g_stats.h2d_s, s.ev.h2d0, s.ev.h2d1);
     g_stats.add_span(g_stats.kernel_s, s.ev.k0, s.ev.k1);
     g_stats.add_span(g_stats.d2h_s, s.ev.d2h0, s.ev.d2h1);
+    if (*s.h_err.p) die("corrupt input: malformed chunk data");
 
     double t = now_s();
     // Every chunk but the file's last is full-size, so a batch's output is
@@ -508,15 +509,17 @@ struct Decompressor {
     check_cuda(cudaEventRecord(s.ev.h2d1, st), "cudaEventRecord");
     g_stats.h2d_bytes += total_in;
 
+    check_cuda(cudaMemsetAsync(s.d_err.p, 0, sizeof(uint32_t), st), "clear error flag");
     check_cuda(cudaEventRecord(s.ev.k0, st), "cudaEventRecord");
     launch_decompress(s.d_in.p, s.d_in_offsets.p, n, s.d_in_lens.p, s.d_out.p, header.chunk_size,
-                       s.d_out_lens.p, st);
+                       s.d_out_lens.p, s.d_err.p, st);
     check_cuda(cudaGetLastError(), "decompress_kernel launch");
     check_cuda(cudaEventRecord(s.ev.k1, st), "cudaEventRecord");
 
     size_t out_bytes = (size_t)(n - 1) * header.chunk_size + s.h_out_lens.p[n - 1];
     check_cuda(cudaEventRecord(s.ev.d2h0, st), "cudaEventRecord");
     check_cuda(cudaMemcpyAsync(s.h_out.p, s.d_out.p, out_bytes, cudaMemcpyDeviceToHost, st), "D2H output");
+    check_cuda(cudaMemcpyAsync(s.h_err.p, s.d_err.p, sizeof(uint32_t), cudaMemcpyDeviceToHost, st), "D2H err");
     check_cuda(cudaEventRecord(s.ev.d2h1, st), "cudaEventRecord");
     g_stats.d2h_bytes += out_bytes;
     s.in_flight = true;
@@ -541,7 +544,7 @@ void decompress(const std::string& in_path, const std::string& out_path) {
   if (std::fread(&header, sizeof(header), 1, in) != 1) die("truncated header");
   if (header.magic != kMagic) die("bad magic (not a gzp file)");
   if (header.version != kVersion) die("unsupported version");
-  if (header.chunk_size == 0 || header.chunk_size > 65536) die("corrupt header: bad chunk_size");
+  if (header.chunk_size == 0 || header.chunk_size > kMaxChunkSize) die("corrupt header: bad chunk_size");
 
   std::vector<ChunkEntry> entries(header.chunk_count);
   if (header.chunk_count > 0 &&
@@ -596,7 +599,7 @@ int main(int argc, char** argv) {
   if (mode == "c") {
     uint32_t chunk_size = kDefaultChunkSize;
     if (argc >= 5) chunk_size = (uint32_t)std::strtoul(argv[4], nullptr, 10);
-    if (chunk_size == 0 || chunk_size > 65536) die("chunk_size must be in (0, 65536]");
+    if (chunk_size == 0 || chunk_size > kMaxChunkSize) die("chunk_size must be in (0, 65536]");
     compress(in_path, out_path, chunk_size);
   } else if (mode == "d") {
     decompress(in_path, out_path);

@@ -14,9 +14,10 @@ void launch_compress(const uint8_t* d_in, uint32_t chunk_size, uint32_t chunk_co
 
 // Chunk c's compressed data lives at d_in + d_in_offsets[c] with
 // d_in_lens[c] bytes; its output at d_out + c*chunk_size, d_out_lens[c] bytes.
+// *d_err (zeroed by the caller) is set nonzero if any chunk is malformed.
 void launch_decompress(const uint8_t* d_in, const uint32_t* d_in_offsets, uint32_t chunk_count,
                         const uint32_t* d_in_lens, uint8_t* d_out, uint32_t chunk_size,
-                        const uint32_t* d_out_lens, cudaStream_t stream);
+                        const uint32_t* d_out_lens, uint32_t* d_err, cudaStream_t stream);
 
 // Scratch needed by launch_compact for up to max_chunks chunks.
 size_t compaction_temp_bytes(uint32_t max_chunks);
