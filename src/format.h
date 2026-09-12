@@ -14,6 +14,10 @@ constexpr uint32_t kVersion = 2;
 constexpr uint32_t kDefaultChunkSize = 32768;
 constexpr uint32_t kMaxChunkSize = 65536; // match offsets are u16
 
+// Shortest match the LZ stage emits. Baked into both payload formats:
+// token match codes and rANS match-length codes are relative to it.
+constexpr int kMinMatch = 4;
+
 // Bytes reserved per chunk in the fixed-slot output layout. Encoders give
 // up (and the chunk is stored raw) before writing past the input size, so
 // the slot only needs the flag byte plus header headroom beyond chunk_size.

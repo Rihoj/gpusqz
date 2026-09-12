@@ -93,7 +93,7 @@ struct RansDecoder {
 bool decode_lzrans(const uint8_t* in, size_t in_len, uint8_t* out, size_t orig, uint32_t chunk_size) {
   if (in_len < (size_t)kRansHeaderBytes) return false;
   uint32_t n_seq = load_u32(in), n_lit = load_u32(in + 4);
-  if (n_seq > chunk_size / 4 + 1 || n_lit > chunk_size) return false;
+  if (n_seq > chunk_size / kMinMatch + 1 || n_lit > chunk_size) return false;
   RansDecoder d(in, in_len);
   std::vector<Seq> seqs(n_seq);
   std::vector<uint8_t> lits(n_lit);
@@ -108,7 +108,7 @@ bool decode_lzrans(const uint8_t* in, size_t in_len, uint8_t* out, size_t orig, 
     for (int l = 0; l < 32; ++l) {
       if (!active(l)) continue;
       uint32_t v = len_value(mlc[l], mlb[l]);
-      ml[l] = v ? v + 3 : 0;
+      ml[l] = v ? v + (kMinMatch - 1) : 0;
     }
     for (int l = 0; l < 32; ++l) if (active(l) && ml[l]) oc[l] = d.get(l, RansDecoder::kOff, kSmallSyms);
     for (int l = 0; l < 32; ++l) if (active(l) && ml[l]) ob[l] = d.bits(l, oc[l]);
@@ -169,11 +169,11 @@ bool decode_lz(const uint8_t* in, size_t in_len, uint8_t* out, size_t orig) {
     if (ip + 2 > in_len) return false;
     uint32_t off = (uint32_t)in[ip] | ((uint32_t)in[ip + 1] << 8);
     ip += 2;
-    uint32_t ml = (tok & 15) + 4;
+    uint32_t ml = (tok & 15) + kMinMatch;
     if ((tok & 15) == 15) {
       uint32_t e = 15;
       if (!read_ext(in, in_len, ip, e)) return false;
-      ml = e + 4;
+      ml = e + kMinMatch;
     }
     if (off == 0 || off > op || op + ml > orig) return false;
     for (uint32_t k = 0; k < ml; ++k) out[op + k] = out[op - off + k];

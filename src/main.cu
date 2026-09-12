@@ -26,10 +26,13 @@ namespace {
 
 constexpr int kMaxSets = 3;
 // Aim for this many batches per file so the pipeline has something to
-// overlap, but never launch fewer chunks than kMinBatch (tiny launches
-// waste the GPU) unless the file itself is that small.
+// overlap, but keep each batch at least kMinBatchBytes of input (tiny
+// launches waste the GPU) unless the file itself is smaller. Pinned and
+// device allocations scale with batch size and dominate the fixed setup
+// cost on WSL2, so this is deliberately modest; three streams in flight
+// still keep the GPU busy.
 constexpr uint32_t kTargetBatches = 8;
-constexpr uint32_t kMinBatch = 2048;
+constexpr size_t kMinBatchBytes = 16u << 20;
 constexpr size_t kStdioBuf = 4u << 20;
 
 void die(const std::string& msg) {
@@ -152,13 +155,14 @@ struct Plan {
 // Sizes batches from currently-free VRAM (the GPU may be shared) and the
 // file's chunk count. Returns the largest batch we should try; callers
 // halve it if allocation still fails.
-Plan plan_batches(uint32_t chunk_count, size_t dev_bytes_per_chunk) {
+Plan plan_batches(uint32_t chunk_count, uint32_t chunk_size, size_t dev_bytes_per_chunk) {
   size_t free_bytes = 0, total_bytes = 0;
   check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
   size_t budget = std::min<size_t>(free_bytes / 2, 1ull << 30);
 
   uint32_t mem_max = (uint32_t)std::max<size_t>(1, budget / (kMaxSets * dev_bytes_per_chunk));
-  uint32_t want = std::max(kMinBatch, (chunk_count + kTargetBatches - 1) / kTargetBatches);
+  uint32_t min_batch = (uint32_t)std::max<size_t>(1, kMinBatchBytes / chunk_size);
+  uint32_t want = std::max(min_batch, (chunk_count + kTargetBatches - 1) / kTargetBatches);
 
   Plan p;
   p.batch = std::min({want, mem_max, chunk_count});
@@ -219,7 +223,7 @@ struct Compressor {
   void allocate() {
     size_t dev_per_chunk =
         (size_t)chunk_size + 2 * (size_t)slot_stride + scratch_bytes(chunk_size) + 4 * sizeof(uint32_t);
-    plan = plan_batches(chunk_count, dev_per_chunk);
+    plan = plan_batches(chunk_count, chunk_size, dev_per_chunk);
     sets.resize(plan.sets);
     for (auto& s : sets) s.ev.create();
     // Retry with a smaller batch if the GPU (or pinned host memory under
@@ -426,7 +430,7 @@ struct Decompressor {
   void allocate() {
     size_t dev_per_chunk =
         (size_t)header.chunk_size + (size_t)slot_stride + scratch_bytes(header.chunk_size) + 3 * sizeof(uint32_t);
-    plan = plan_batches(header.chunk_count, dev_per_chunk);
+    plan = plan_batches(header.chunk_count, header.chunk_size, dev_per_chunk);
     sets.resize(plan.sets);
     for (auto& s : sets) s.ev.create();
     for (;;) {

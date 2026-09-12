@@ -109,7 +109,7 @@ __device__ inline bool rans_encode_warp(const SeqRec* seqs, uint32_t n_seq, cons
     uint32_t c, nb, b;
     len_code(r.lit_len, c, nb, b);
     atomicAdd(&t.cnt[kLlBase + c], 1u);
-    len_code(r.ml ? r.ml - 3 : 0, c, nb, b);
+    len_code(r.ml ? r.ml - (kMinMatch - 1) : 0, c, nb, b);
     atomicAdd(&t.cnt[kMlBase + c], 1u);
     if (r.ml) {
       off_code(r.off, c, nb, b);
@@ -148,7 +148,7 @@ __device__ inline bool rans_encode_warp(const SeqRec* seqs, uint32_t n_seq, cons
     if (act) r = seqs[idx];
     uint32_t llc, llnb, llb, mlc, mlnb, mlb, oc = 0, onb = 0, ob = 0;
     len_code(r.lit_len, llc, llnb, llb);
-    len_code(r.ml ? r.ml - 3 : 0, mlc, mlnb, mlb);
+    len_code(r.ml ? r.ml - (kMinMatch - 1) : 0, mlc, mlnb, mlb);
     bool has_off = act && r.ml != 0;
     if (has_off) off_code(r.off, oc, onb, ob);
 
@@ -271,7 +271,7 @@ __device__ inline bool rans_decode_warp(const uint8_t* payload, uint32_t len, Ra
     if (!rans_dec_renorm(x, act && nb, rp, rend)) return false;
 
     uint32_t mlv = len_value(mlc, mlb);
-    uint32_t ml = mlv ? mlv + 3 : 0;
+    uint32_t ml = mlv ? mlv + (kMinMatch - 1) : 0;
     bool has_off = act && ml != 0;
     if (has_off) {
       oc = rans_dec_small(x, t.freq + kOffBase, t.cum + kOffBase);

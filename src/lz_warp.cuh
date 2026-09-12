@@ -16,9 +16,11 @@
 #pragma once
 #include <cstdint>
 
+#include "format.h"
+
 namespace gzp {
 
-constexpr int kMinMatch = 4;
+static_assert(kMinMatch == 3 || kMinMatch == 4, "hashing supports 3- or 4-byte minimum matches");
 constexpr int kProbe = 32; // per-lane match-length cap before cooperative extension
 constexpr int kHashBits = 11;
 constexpr int kHashSize = 1 << kHashBits; // u32 buckets holding two u16 positions
@@ -41,7 +43,10 @@ __device__ __forceinline__ uint32_t load4(const uint8_t* p) {
   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-__device__ __forceinline__ uint32_t hash4(uint32_t v) { return (v * 2654435761u) >> (32 - kHashBits); }
+__device__ __forceinline__ uint32_t hash_at(const uint8_t* p) {
+  uint32_t v = kMinMatch == 4 ? load4(p) : ((uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16));
+  return (v * 2654435761u) >> (32 - kHashBits);
+}
 
 __device__ __forceinline__ uint32_t match_len(const uint8_t* in, uint32_t a, uint32_t b, uint32_t max_len) {
   uint32_t l = 0;
@@ -175,7 +180,7 @@ __device__ inline bool lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* ht
     uint32_t h = 0, b = 0xFFFFFFFFu;
     uint32_t best_len = 0, best_off = 0;
     if (valid) {
-      h = hash4(load4(in + p));
+      h = hash_at(in + p);
       b = htab[h];
       uint32_t max_len = min((uint32_t)kProbe, n - p);
       for (int w = 0; w < 2; ++w) {

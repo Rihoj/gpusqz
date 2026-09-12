@@ -6,8 +6,8 @@
 //   literal      byte value, 256 symbols
 //   lit_len v    v < 16: code v, no extra bits
 //                else:   code 12 + floor(log2 v), floor(log2 v) extra bits
-//   match_len    same coding of v = ml - 3 (v = 0 marks a literals-only
-//                final sequence; real matches have ml >= 4 so v >= 1)
+//   match_len    same coding of v = ml - (kMinMatch - 1) (v = 0 marks a
+//                literals-only final sequence; real matches give v >= 1)
 //   offset       code floor(log2 off), that many extra bits
 // Extra bits are written raw (rANS bypass), so there is no side stream.
 #pragma once
