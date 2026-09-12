@@ -36,12 +36,36 @@ struct RansEncTables {
 };
 static_assert(sizeof(RansEncTables) <= kHashSize * sizeof(uint32_t), "encoder tables must fit the hash table region");
 
+// Coarse index for the 32-symbol alphabets: lut[i] is the largest symbol s
+// with cum[s] <= i * (kProbScale >> kSmallLutBits), i.e. a lower bound on
+// the true answer for any slot in that bucket. A short forward scan from
+// there (never more than a few symbols, since buckets are much narrower
+// than a typical run of same-cum zero-frequency symbols) replaces what
+// used to be a full 5-step binary search per length/offset code.
+constexpr int kSmallLutBits = 7;
+constexpr int kSmallLutSize = 1 << kSmallLutBits;
+
 struct RansDecTables {
   uint8_t sym[kProbScale]; // literal alphabet slot -> symbol
   uint16_t freq[kQuantBytes];
   uint16_t cum[kQuantBytes];
   uint8_t q[kQuantBytes];
+  uint8_t ll_lut[kSmallLutSize];
+  uint8_t ml_lut[kSmallLutSize];
+  uint8_t off_lut[kSmallLutSize];
 };
+
+__device__ __forceinline__ void build_small_lut(const uint16_t* cum, uint8_t* lut) {
+  int lane = threadIdx.x & 31;
+  for (int i = lane; i < kSmallLutSize; i += 32) {
+    uint32_t target = (uint32_t)i << (kProbBits - kSmallLutBits);
+    uint32_t s = 0;
+    for (uint32_t k = 1; k < (uint32_t)kSmallSyms; ++k) {
+      if (cum[k] <= target) s = k;
+    }
+    lut[i] = (uint8_t)s;
+  }
+}
 
 __device__ __forceinline__ unsigned lanemask_lt() {
   unsigned m;
@@ -197,18 +221,16 @@ __device__ __forceinline__ uint32_t rans_dec_lit(uint32_t& x, const RansDecTable
   return s;
 }
 
-// Small alphabets: binary search for the last symbol whose cum <= slot,
-// which skips zero-frequency symbols (they share cum with their successor).
-__device__ __forceinline__ uint32_t rans_dec_small(uint32_t& x, const uint16_t* freq, const uint16_t* cum) {
+// Small alphabets: look up a lower-bound symbol from the coarse LUT, then
+// scan forward to the exact answer (skipping zero-frequency symbols,
+// which share cum with their successor).
+__device__ __forceinline__ uint32_t rans_dec_small(uint32_t& x, const uint16_t* freq, const uint16_t* cum,
+                                                   const uint8_t* lut) {
   uint32_t slot = x & (kProbScale - 1);
-  uint32_t lo = 0, hi = kSmallSyms - 1;
-  while (lo < hi) {
-    uint32_t mid = (lo + hi + 1) >> 1;
-    if (cum[mid] <= slot) lo = mid;
-    else hi = mid - 1;
-  }
-  x = freq[lo] * (x >> kProbBits) + slot - cum[lo];
-  return lo;
+  uint32_t s = lut[slot >> (kProbBits - kSmallLutBits)];
+  while (s + 1 < (uint32_t)kSmallSyms && cum[s + 1] <= slot) ++s;
+  x = freq[s] * (x >> kProbBits) + slot - cum[s];
+  return s;
 }
 
 __device__ __forceinline__ uint32_t rans_dec_bits(uint32_t& x, uint32_t nb) {
@@ -241,6 +263,9 @@ __device__ inline bool rans_decode_warp(const uint8_t* payload, uint32_t len, Ra
     uint32_t f = t.freq[kLitBase + s], c = t.cum[kLitBase + s];
     for (uint32_t k = 0; k < f; ++k) t.sym[c + k] = (uint8_t)s;
   }
+  build_small_lut(t.cum + kLlBase, t.ll_lut);
+  build_small_lut(t.cum + kMlBase, t.ml_lut);
+  build_small_lut(t.cum + kOffBase, t.off_lut);
   __syncwarp();
 
   uint32_t x = load_u32(payload + 8 + kQuantBytes + 4 * lane);
@@ -254,7 +279,7 @@ __device__ inline bool rans_decode_warp(const uint8_t* payload, uint32_t len, Ra
     uint32_t llc = 0, mlc = 0, oc = 0, llb = 0, mlb = 0, ob = 0, nb;
 
     if (act) {
-      llc = rans_dec_small(x, t.freq + kLlBase, t.cum + kLlBase);
+      llc = rans_dec_small(x, t.freq + kLlBase, t.cum + kLlBase, t.ll_lut);
       bad |= t.freq[kLlBase + llc] == 0;
     }
     if (!rans_dec_renorm(x, act, rp, rend)) return false;
@@ -263,7 +288,7 @@ __device__ inline bool rans_decode_warp(const uint8_t* payload, uint32_t len, Ra
     if (!rans_dec_renorm(x, act && nb, rp, rend)) return false;
 
     if (act) {
-      mlc = rans_dec_small(x, t.freq + kMlBase, t.cum + kMlBase);
+      mlc = rans_dec_small(x, t.freq + kMlBase, t.cum + kMlBase, t.ml_lut);
       bad |= t.freq[kMlBase + mlc] == 0;
     }
     if (!rans_dec_renorm(x, act, rp, rend)) return false;
@@ -275,7 +300,7 @@ __device__ inline bool rans_decode_warp(const uint8_t* payload, uint32_t len, Ra
     uint32_t ml = mlv ? mlv + (kMinMatch - 1) : 0;
     bool has_off = act && ml != 0;
     if (has_off) {
-      oc = rans_dec_small(x, t.freq + kOffBase, t.cum + kOffBase);
+      oc = rans_dec_small(x, t.freq + kOffBase, t.cum + kOffBase, t.off_lut);
       bad |= t.freq[kOffBase + oc] == 0 || oc > 15;
     }
     if (!rans_dec_renorm(x, has_off, rp, rend)) return false;
