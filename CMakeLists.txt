@@ -26,5 +26,6 @@ set_target_properties(gzp PROPERTIES
 
 target_compile_options(gzp PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
   $<$<COMPILE_LANGUAGE:CXX>:-O3>
 )

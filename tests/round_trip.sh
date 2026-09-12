@@ -2,13 +2,29 @@
 # Round-trip correctness tests for gzp, covering the edge cases most likely
 # to hide bugs: empty input, sub-chunk, exact chunk multiples, and
 # incompressible data.
+#
+#   tests/round_trip.sh [--extremes] [path/to/gzp]
+#
+# Env:
+#   CHUNK=<n>         chunk size to test (default 8192); ignored with --extremes
+#   GZP_PREFIX="..."  command prefix, e.g. "compute-sanitizer --tool memcheck"
+#   EXTRA_FILE=<p>    also round-trip this real file
+#   BIG=1             also run 300MB random + 300MB text (multi-batch) cases
 set -euo pipefail
 
+EXTREMES=0
+if [ "${1:-}" = "--extremes" ]; then
+  EXTREMES=1
+  shift
+fi
 GZP="${1:-./build/gzp}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-CHUNK="${CHUNK:-8192}"
+# Word-split on purpose so a multi-word prefix works.
+# shellcheck disable=SC2206
+PREFIX=(${GZP_PREFIX:-})
+
 fail=0
 
 make_case() {
@@ -24,36 +40,57 @@ make_case() {
 }
 
 run_case() {
-  local name="$1" f="$2"
+  local chunk="$1" name="$2" f="$3"
   local comp="$TMP/$name.gzp" dec="$TMP/$name.out"
-  "$GZP" c "$f" "$comp" "$CHUNK" 2>>"$TMP/log"
-  "$GZP" d "$comp" "$dec" 2>>"$TMP/log"
+  "${PREFIX[@]}" "$GZP" c "$f" "$comp" "$chunk" 2>>"$TMP/log"
+  "${PREFIX[@]}" "$GZP" d "$comp" "$dec" 2>>"$TMP/log"
   if cmp -s "$f" "$dec"; then
     local in_sz comp_sz
     in_sz=$(stat -c%s "$f")
     comp_sz=$(stat -c%s "$comp")
-    printf "PASS %-24s in=%-10d comp=%-10d ratio=%.3f\n" "$name" "$in_sz" "$comp_sz" \
+    printf "PASS chunk=%-6d %-20s in=%-10d comp=%-10d ratio=%.3f\n" "$chunk" "$name" "$in_sz" "$comp_sz" \
       "$(echo "scale=3; $comp_sz / ($in_sz + 0.0001)" | bc)"
   else
-    printf "FAIL %-24s round-trip mismatch\n" "$name"
+    printf "FAIL chunk=%-6d %-20s round-trip mismatch\n" "$chunk" "$name"
     fail=1
+  fi
+  rm -f "$comp" "$dec"
+}
+
+run_suite() {
+  local chunk="$1"
+  local sub=$((chunk > 100 ? chunk - 100 : (chunk > 1 ? chunk / 2 : 1)))
+  run_case "$chunk" "empty" "$(make_case empty 0 empty)"
+  run_case "$chunk" "one_byte" "$(make_case one_byte 1 random)"
+  run_case "$chunk" "sub_chunk" "$(make_case sub_chunk "$sub" text)"
+  run_case "$chunk" "exact_one_chunk" "$(make_case exact_one_chunk "$chunk" text)"
+  run_case "$chunk" "exact_multi_chunk" "$(make_case exact_multi_chunk $((chunk * 5)) text)"
+  run_case "$chunk" "off_by_one_over" "$(make_case off_by_one_over $((chunk + 1)) text)"
+  run_case "$chunk" "all_zeros_5mb" "$(make_case all_zeros_5mb $((5 * 1024 * 1024)) zero)"
+  run_case "$chunk" "random_5mb" "$(make_case random_5mb $((5 * 1024 * 1024)) random)"
+  run_case "$chunk" "mixed_text_5mb" "$(make_case mixed_text_5mb $((5 * 1024 * 1024)) text)"
+  if [ -n "${EXTRA_FILE:-}" ] && [ -f "$EXTRA_FILE" ]; then
+    cp "$EXTRA_FILE" "$TMP/real_file.in"
+    run_case "$chunk" "real_file" "$TMP/real_file.in"
   fi
 }
 
-run_case "empty" "$(make_case empty 0 empty)"
-run_case "one_byte" "$(make_case one_byte 1 random)"
-SUB_CHUNK_SIZE=$((CHUNK > 100 ? CHUNK - 100 : (CHUNK > 1 ? CHUNK / 2 : 1)))
-run_case "sub_chunk" "$(make_case sub_chunk "$SUB_CHUNK_SIZE" text)"
-run_case "exact_one_chunk" "$(make_case exact_one_chunk "$CHUNK" text)"
-run_case "exact_multi_chunk" "$(make_case exact_multi_chunk $((CHUNK * 5)) text)"
-run_case "off_by_one_over" "$(make_case off_by_one_over $((CHUNK + 1)) text)"
-run_case "all_zeros_5mb" "$(make_case all_zeros_5mb $((5 * 1024 * 1024)) zero)"
-run_case "random_5mb" "$(make_case random_5mb $((5 * 1024 * 1024)) random)"
-run_case "mixed_text_5mb" "$(make_case mixed_text_5mb $((5 * 1024 * 1024)) text)"
+if [ "$EXTREMES" -eq 1 ]; then
+  # CHUNK=1 makes every byte its own chunk: slow, but it must still work.
+  # 65535/65536 straddle the u16 offset limit.
+  for chunk in 1 16 4096 8192 32768 65535 65536; do
+    run_suite "$chunk"
+  done
+else
+  run_suite "${CHUNK:-8192}"
+fi
 
-if [ -n "${EXTRA_FILE:-}" ] && [ -f "$EXTRA_FILE" ]; then
-  cp "$EXTRA_FILE" "$TMP/real_file.in"
-  run_case "real_file" "$TMP/real_file.in"
+if [ "${BIG:-0}" = "1" ]; then
+  chunk="${CHUNK:-8192}"
+  # >= 5 batches at any sane batch size; exercises multi-batch paths and
+  # (Phase 1+) a stream-ring wraparound with a batch count not divisible by 3.
+  run_case "$chunk" "big_random_300mb" "$(make_case big_random_300mb $((300 * 1024 * 1024)) random)"
+  run_case "$chunk" "big_text_300mb" "$(make_case big_text_300mb $((300 * 1024 * 1024)) text)"
 fi
 
 if [ "$fail" -ne 0 ]; then
