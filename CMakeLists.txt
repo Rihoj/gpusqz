@@ -30,6 +30,25 @@ target_compile_options(gzp PRIVATE
   $<$<COMPILE_LANGUAGE:CXX>:-O3>
 )
 
+# Occupancy A/B testing. Both kernels carry an explicit __launch_bounds__,
+# which takes precedence over a bare --maxrregcount, so that flag alone
+# cannot force fewer registers here; GZP_MIN_BLOCKS_PER_SM instead sets
+# __launch_bounds__'s second (minBlocksPerSM) argument, which does force
+# ptxas to cut register usage until that many blocks fit (spilling to
+# local memory if it can't). Compare with e.g.:
+#   cmake -S . -B build-b2 -DGZP_MIN_BLOCKS_PER_SM=2 && cmake --build build-b2
+#   bash bench/run_bench.sh <file>   # vs. a build with this unset
+# and check `nvcc -Xptxas -v` for registers/spills alongside GZP_VERBOSE
+# kernel MB/s. Note: as measured, both kernels are shared-memory-bound
+# (compress: 32KB/block caps 3 blocks/SM; decompress: ~23KB/block caps 4)
+# at register counts well below where registers alone would bind, so this
+# knob is unlikely to change occupancy until GZP_MIN_BLOCKS_PER_SM asks
+# for more blocks than the smem footprint allows in the first place.
+set(GZP_MIN_BLOCKS_PER_SM "" CACHE STRING "minBlocksPerSM for __launch_bounds__ on gzp's kernels (empty = compiler default)")
+if(GZP_MIN_BLOCKS_PER_SM)
+  target_compile_definitions(gzp PRIVATE GZP_MIN_BLOCKS_PER_SM=${GZP_MIN_BLOCKS_PER_SM})
+endif()
+
 # CPU reference decoder used by tests/round_trip.sh.
 add_executable(gzp_refdec tests/ref_decode.cpp)
 target_include_directories(gzp_refdec PRIVATE src)

@@ -9,6 +9,16 @@ namespace gzp {
 
 constexpr int kBlockThreads = kWarpsPerBlock * 32;
 
+// GZP_MIN_BLOCKS_PER_SM (set via CMake's GZP_MIN_BLOCKS_PER_SM cache var)
+// forces ptxas to keep register usage low enough for that many blocks per
+// SM, for A/B occupancy testing. Left unset, __launch_bounds__ takes only
+// the thread-count argument and ptxas picks registers freely.
+#ifdef GZP_MIN_BLOCKS_PER_SM
+#define GZP_LAUNCH_BOUNDS __launch_bounds__(kBlockThreads, GZP_MIN_BLOCKS_PER_SM)
+#else
+#define GZP_LAUNCH_BOUNDS __launch_bounds__(kBlockThreads)
+#endif
+
 __device__ __forceinline__ void chunk_scratch(uint8_t* scratch, uint32_t c, uint32_t chunk_size, SeqRec*& seqs,
                                               uint8_t*& lits) {
   uint8_t* base = scratch + (size_t)c * scratch_bytes(chunk_size);
@@ -19,7 +29,7 @@ __device__ __forceinline__ void chunk_scratch(uint8_t* scratch, uint32_t c, uint
 // One warp per chunk. Chunk c's input lives at in + c*chunk_size (in_lens[c]
 // valid bytes); its output goes into the fixed slot out + c*out_slot_stride
 // as [flag byte][payload] starting at out_start[c], total size out_sizes[c].
-__global__ void __launch_bounds__(kBlockThreads)
+__global__ void GZP_LAUNCH_BOUNDS
 compress_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, const uint32_t* in_lens,
                 uint8_t* out, uint32_t out_slot_stride, uint32_t* out_start, uint32_t* out_sizes,
                 uint8_t* scratch, Mode mode) {
@@ -94,7 +104,7 @@ compress_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, co
 // One warp per chunk. Chunk c's compressed data lives at in + in_offsets[c]
 // (in_lens[c] bytes, flag first); output goes to out + c*chunk_size,
 // out_lens[c] bytes. Any malformed chunk sets *err.
-__global__ void __launch_bounds__(kBlockThreads)
+__global__ void GZP_LAUNCH_BOUNDS
 decompress_kernel(const uint8_t* in, const uint32_t* in_offsets, uint32_t chunk_count, const uint32_t* in_lens,
                   uint8_t* out, uint32_t chunk_size, const uint32_t* out_lens, uint8_t* scratch, uint32_t* err) {
   __shared__ RansDecTables tables[kWarpsPerBlock];
