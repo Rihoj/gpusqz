@@ -41,12 +41,12 @@ best() {
 }
 
 run_gzp() {
-  local label="$1"; shift
+  local label="$1"
   local cw=() ck=() dw=() dk=() csize=0
   for ((i = 0; i < REPEAT; i++)); do
     local t0 t1 t2
     t0=$(date +%s.%N)
-    GZP_VERBOSE=1 "$GZP" c "$FILE" "$TMP/out.gzp" ${CHUNK:+$CHUNK} "$@" 2>"$TMP/c.log"
+    GZP_VERBOSE=1 "$GZP" c "$FILE" "$TMP/out.gzp" ${CHUNK:+$CHUNK} 2>"$TMP/c.log"
     t1=$(date +%s.%N)
     GZP_VERBOSE=1 "$GZP" d "$TMP/out.gzp" "$TMP/out.dec" 2>"$TMP/d.log"
     t2=$(date +%s.%N)
@@ -82,8 +82,7 @@ run_cpu() {
     "$(echo "scale=4; $csize / $SIZE" | bc)"
 }
 
-run_gzp "gzp (GPU, lzrans)"
-run_gzp "gzp (GPU, lz)" --mode lz
+run_gzp "gzp (GPU)"
 run_cpu "gzip -1" "gzip -1 -c" "gzip -d -c"
 run_cpu "gzip -6" "gzip -6 -c" "gzip -d -c"
 if command -v zstd >/dev/null; then

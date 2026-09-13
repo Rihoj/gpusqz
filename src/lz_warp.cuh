@@ -137,17 +137,6 @@ __device__ __forceinline__ uint32_t warp_extend(const uint8_t* in, uint32_t p, u
   return len;
 }
 
-// Emits LZ4-style tokens straight into an output buffer.
-struct TokenEmitter {
-  const uint8_t* in;
-  uint8_t* out;
-  uint32_t cap;
-  uint32_t op = 0;
-  __device__ __forceinline__ bool operator()(uint32_t lit_start, uint32_t lit_len, uint32_t off, uint32_t ml) {
-    return emit_seq(in, out, cap, op, lit_start, lit_len, off, ml);
-  }
-};
-
 // Records sequences and copies literals into scratch for a later stage.
 struct SeqEmitter {
   const uint8_t* in;

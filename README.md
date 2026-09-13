@@ -17,8 +17,7 @@ creation); the kernel columns are GPU time only.
 
 | codec | compress MB/s (wall) | kernel MB/s | decompress MB/s (wall) | kernel MB/s | ratio |
 |---|---|---|---|---|---|
-| **gzp** (lzrans, 64KB) | **583** | 1598 | **629** | 3759 | **0.272** |
-| gzp (lz only, 64KB) | 556 | 1594 | 643 | 5498 | 0.370 |
+| **gzp** (64KB chunks) | **583** | 1598 | **629** | 3759 | **0.272** |
 | gzip -1 | 149 | – | 262 | – | 0.284 |
 | gzip -6 | 59 | – | 293 | – | 0.231 |
 | zstd -1 (1 thread) | 513 | – | 1400 | – | 0.252 |
@@ -36,12 +35,11 @@ chunks turn out to decode substantially faster too (more, smaller units
 of parallel work), so this is a real ratio-vs-speed dial, not just a
 ratio-vs-latency one:
 
-| chunk | mode | ratio | compress kernel MB/s | decompress kernel MB/s |
-|---|---|---|---|---|
-| 16KB | lzrans | 0.297 | 2372 | 8106 |
-| 32KB | lzrans | 0.281 | 2073 | 6644 |
-| 64KB | lzrans | 0.272 | 1585 | 3741 |
-| 64KB | lz | 0.370 | 1541 | 5286 |
+| chunk | ratio | compress kernel MB/s | decompress kernel MB/s |
+|---|---|---|---|
+| 16KB | 0.297 | 2372 | 8106 |
+| 32KB | 0.281 | 2073 | 6644 |
+| 64KB | 0.272 | 1585 | 3741 |
 
 ## How it works
 
@@ -70,8 +68,9 @@ that hit the 32-byte cap are extended cooperatively, 32 bytes per step,
 so long runs never serialise on one lane.
 
 The parse emits sequences — a literal run followed by a match `(offset,
-length)` — either as LZ4-style tokens (`--mode lz`) or into scratch for
-the entropy stage.
+length)` — into scratch for the entropy stage below. Per chunk, the
+encoder still keeps whichever of the rANS-coded result or a plain
+LZ4-style token stream comes out smaller (see *rANS stage*).
 
 ### rANS stage (`src/rans.cuh`, `src/rans_codes.h`)
 
@@ -131,7 +130,7 @@ allocation retries with a halved batch on failure.
 ```
 FileHeader    { magic, version=3, chunk_size, original_size, chunk_count, table_group_count }
 ChunkEntry[]  { offset, compressed_size, original_size }         -- one per chunk
-TableGroup[]  { start_chunk, chunk_count, q[352] }               -- one per compression batch (LzRans only)
+TableGroup[]  { start_chunk, chunk_count, q[352] }               -- one per compression batch
 payload       -- each chunk: [flag: Raw | Lz | LzRans] [data]
 ```
 
@@ -139,8 +138,9 @@ payload       -- each chunk: [flag: Raw | Lz | LzRans] [data]
 order; chunk *c*'s rANS table (if it used one) is whichever group's
 range contains *c* — always exactly one host compression batch's worth
 of chunks, decided at compress time and independent of whatever batch
-size decompression later happens to choose. `--mode lz` files (no
-chunk can ever be `LzRans`) have zero table groups.
+size decompression later happens to choose. Not every chunk in a group
+necessarily uses that table (a chunk can still individually fall back
+to `Lz` or `Raw`), but every group is written regardless.
 
 Worst case is the original size plus one byte per chunk plus one table
 per batch (~360 bytes), so a file compressed in very few batches (a
@@ -171,19 +171,19 @@ bound, not register-bound, at their current sizes).
 ## Usage
 
 ```
-./build/gzp c <input> <output> [chunk_size] [--mode lz|lzrans]   # compress (default 65536, lzrans)
-./build/gzp d <input> <output>                                   # decompress
-GZP_VERBOSE=1 ./build/gzp ...                                    # per-stage timing
-GZP_FORCE_BATCH=<n> ./build/gzp ...                              # force chunks/batch (testing only)
+./build/gzp c <input> <output> [chunk_size]   # compress (default chunk_size 65536)
+./build/gzp d <input> <output>                # decompress
+GZP_VERBOSE=1 ./build/gzp ...                 # per-stage timing
+GZP_FORCE_BATCH=<n> ./build/gzp ...           # force chunks/batch (testing only)
 ```
 
 ## Testing
 
 ```
-bash tests/round_trip.sh                 # default chunk size, both modes
-bash tests/round_trip.sh --extremes      # chunk sizes 1, 16, 4K, 8K, 32K, 65535, 65536, both modes,
+bash tests/round_trip.sh                 # default chunk size
+bash tests/round_trip.sh --extremes      # chunk sizes 1, 16, 4K, 8K, 32K, 65535, 65536,
                                           # plus GZP_FORCE_BATCH mismatch cases (see below)
-BIG=1 bash tests/round_trip.sh           # + 300MB random and 300MB text (multi-batch), both modes
+BIG=1 bash tests/round_trip.sh           # + 300MB random and 300MB text (multi-batch)
 ```
 
 `GZP_FORCE_BATCH` exists because a `TableGroup`'s boundaries are fixed
@@ -208,8 +208,8 @@ for i in $(seq 48); do cat corpus.txt; done > corpus_283mb.txt
 bash bench/run_bench.sh corpus_283mb.txt [chunk_size]
 ```
 
-The script reports wall and kernel MB/s for both gzp modes and compares
-against `gzip -1/-6` and single-threaded `zstd -1/-3` when available. It
+The script reports wall and kernel MB/s for gzp and compares against
+`gzip -1/-6` and single-threaded `zstd -1/-3` when available. It
 runs each codec once by default; on a shared GPU a single wall-clock
 measurement can be dominated by another process's contention rather than
 by gzp itself, so set `REPEAT=<n>` to run each codec n times and report
@@ -229,10 +229,12 @@ REPEAT=5 bash bench/run_bench.sh corpus_283mb.txt
   smaller on this corpus even after moving to one shared table per batch
   (a per-chunk table cost ~1-2% more). Repeat-offset codes and a better
   parser (hash chains, optimal parsing) would close more of the gap.
-- **Decode speed still trails the token-only path** (3.7 GB/s vs 5.3 GB/s
-  kernel at 64KB) despite the coarse-LUT decode and per-batch tables
-  (which removed the earlier per-chunk table-rebuild cost entirely) —
-  the remaining gap is the extra work rANS decode itself does per
-  symbol versus a token stream's direct byte copies.
+- **rANS decode is inherently more work than a plain token stream's
+  direct byte copies** — even with the coarse-LUT lookup and per-batch
+  tables (which removed the earlier per-chunk table-rebuild cost
+  entirely), decoding still means an integer divide/multiply and a
+  table lookup per symbol, versus a token stream's `memcpy`-shaped
+  literal and match copies. This is why a chunk that doesn't compress
+  much better under rANS is kept as plain tokens instead.
 - **No multi-GPU, no streaming API** — it's a file-in, file-out CLI.
 - Match offsets are 16-bit, which caps chunks at 64KB.

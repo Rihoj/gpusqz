@@ -8,11 +8,6 @@
 
 namespace gzp {
 
-enum class Mode : uint32_t {
-  Lz = 0,     // LZ tokens only
-  LzRans = 1, // LZ parse + rANS entropy coding (per-batch shared table), falls back to Lz, then Raw
-};
-
 // Every match covers at least kMinMatch bytes, plus one optional tail.
 __host__ __device__ inline uint32_t max_sequences(uint32_t chunk_size) { return chunk_size / kMinMatch + 1; }
 
@@ -43,13 +38,15 @@ struct RansBatchBufs {
 // d_out + c*out_slot_stride starting at byte d_out_start[c], with total
 // size d_out_sizes[c]. d_scratch holds chunk_count * scratch_bytes().
 //
-// For Mode::LzRans this is actually 3 kernel launches on `stream` (parse +
-// histogram, build the shared table, encode against it) rather than 1;
-// d_rans is scratch for that (see RansBatchBufs), unused for Mode::Lz.
+// This is actually 3 kernel launches on `stream` (parse + histogram, build
+// the shared table, encode against it) rather than 1; d_rans is scratch
+// for that (see RansBatchBufs). Each chunk still individually falls back
+// to a plain LZ token stream (ChunkFlag::Lz) when that's smaller than the
+// rANS encoding, or to Raw storage when neither beats the input.
 void launch_compress(const uint8_t* d_in, uint32_t chunk_size, uint32_t chunk_count,
                       const uint32_t* d_in_lens, uint8_t* d_out, uint32_t out_slot_stride,
                       uint32_t* d_out_start, uint32_t* d_out_sizes, uint8_t* d_scratch,
-                      const RansBatchBufs& d_rans, Mode mode, cudaStream_t stream);
+                      const RansBatchBufs& d_rans, cudaStream_t stream);
 
 // Chunk c's compressed data lives at d_in + d_in_offsets[c] with
 // d_in_lens[c] bytes; its output at d_out + c*chunk_size, d_out_lens[c]

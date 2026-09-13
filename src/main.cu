@@ -231,10 +231,9 @@ struct Compressor {
   FILE* out;
   uint32_t chunk_size, chunk_count, slot_stride;
   uint64_t total_size;
-  Mode mode;
   size_t temp_bytes;
   std::vector<ChunkEntry> entries;
-  std::vector<TableGroup> groups; // only populated for Mode::LzRans
+  std::vector<TableGroup> groups; // one per batch
   std::vector<CompressSet> sets;
   Plan plan;
   uint64_t payload_offset = 0;
@@ -296,13 +295,11 @@ struct Compressor {
       entries[s.first + c] = ChunkEntry{payload_offset, csize, s.h_in_lens.p[c]};
       payload_offset += csize;
     }
-    if (mode == Mode::LzRans) {
-      TableGroup g{};
-      g.start_chunk = s.first;
-      g.chunk_count = s.n;
-      std::memcpy(g.q, s.h_q.p, kQuantBytes);
-      groups.push_back(g);
-    }
+    TableGroup g{};
+    g.start_chunk = s.first;
+    g.chunk_count = s.n;
+    std::memcpy(g.q, s.h_q.p, kQuantBytes);
+    groups.push_back(g);
     g_stats.fwrite_s += now_s() - t;
     s.in_flight = false;
     s.d2h_enqueued = false;
@@ -334,7 +331,7 @@ struct Compressor {
 
     check_cuda(cudaEventRecord(s.ev.k0, st), "cudaEventRecord");
     launch_compress(s.d_in.p, chunk_size, n, s.d_in_lens.p, s.d_slots.p, slot_stride, s.d_start.p, s.d_sizes.p,
-                    s.d_scratch.p, s.rans_bufs(), mode, st);
+                    s.d_scratch.p, s.rans_bufs(), st);
     check_cuda(cudaGetLastError(), "compress_kernel launch");
     check_cuda(launch_compact(s.d_slots.p, slot_stride, s.d_start.p, s.d_sizes.p, n, s.d_offsets.p, s.d_packed.p,
                               s.d_temp.p, temp_bytes, st),
@@ -346,9 +343,7 @@ struct Compressor {
     check_cuda(cudaMemcpyAsync(s.h_offsets.p, s.d_offsets.p, (n + 1) * sizeof(uint32_t),
                                cudaMemcpyDeviceToHost, st),
                "D2H offsets");
-    if (mode == Mode::LzRans) {
-      check_cuda(cudaMemcpyAsync(s.h_q.p, s.d_rans_q.p, kQuantBytes, cudaMemcpyDeviceToHost, st), "D2H q");
-    }
+    check_cuda(cudaMemcpyAsync(s.h_q.p, s.d_rans_q.p, kQuantBytes, cudaMemcpyDeviceToHost, st), "D2H q");
     check_cuda(cudaEventRecord(s.ev.meta, st), "cudaEventRecord");
     s.in_flight = true;
     s.d2h_enqueued = false;
@@ -368,13 +363,13 @@ struct Compressor {
       }
     }
     for (int b = std::max(0, plan.batches - plan.sets); b < plan.batches; ++b) finish(sets[b % plan.sets]);
-    if (mode == Mode::LzRans && groups.size() != (size_t)plan.batches) {
+    if (groups.size() != (size_t)plan.batches) {
       die("internal error: table group count mismatch");
     }
   }
 };
 
-void compress(const std::string& in_path, const std::string& out_path, uint32_t chunk_size, Mode mode) {
+void compress(const std::string& in_path, const std::string& out_path, uint32_t chunk_size) {
   FILE* in = std::fopen(in_path.c_str(), "rb");
   if (!in) die("cannot open input: " + in_path);
   std::setvbuf(in, nullptr, _IOFBF, kStdioBuf);
@@ -406,17 +401,15 @@ void compress(const std::string& in_path, const std::string& out_path, uint32_t 
     cz.chunk_count = chunk_count;
     cz.slot_stride = worst_case_size(chunk_size);
     cz.total_size = total_size;
-    cz.mode = mode;
     cz.entries.swap(entries);
 
     double t = now_s();
     cz.allocate();
     g_stats.setup_s += now_s() - t;
 
-    // Now that allocate() has fixed the batch size (and so the batch, and
-    // therefore table-group, count), reserve space for the group array —
-    // one TableGroup per batch in LzRans mode, none otherwise.
-    header.table_group_count = mode == Mode::LzRans ? (uint32_t)cz.plan.batches : 0;
+    // Now that allocate() has fixed the batch size, reserve space for the
+    // group array: one TableGroup per batch.
+    header.table_group_count = (uint32_t)cz.plan.batches;
     groups.resize(header.table_group_count);
     std::fwrite(groups.data(), sizeof(TableGroup), groups.size(), out);
 
@@ -660,9 +653,8 @@ void decompress(const std::string& in_path, const std::string& out_path) {
   // Groups must cover [0, chunk_count) contiguously and in order: a
   // corrupt/adversarial directory here would otherwise let a chunk's
   // group_id land outside chunk_group[] or reference an out-of-range slot.
-  // A file with no groups at all (e.g. compressed with --mode lz, which
-  // never produces an LzRans chunk) is fine as-is: no chunk will ever look
-  // one up.
+  // An empty group list only ever occurs for an empty file (chunk_count
+  // == 0), which is fine as-is: no chunk will ever look one up.
   if (!groups.empty()) {
     uint64_t covered = 0;
     for (const TableGroup& g : groups) {
@@ -705,8 +697,8 @@ void decompress(const std::string& in_path, const std::string& out_path) {
 void usage() {
   std::fprintf(stderr,
                "usage:\n"
-               "  gzp c <input> <output> [chunk_size] [--mode lz|lzrans]   compress (default lzrans)\n"
-               "  gzp d <input> <output>                                   decompress\n");
+               "  gzp c <input> <output> [chunk_size]   compress\n"
+               "  gzp d <input> <output>                decompress\n");
   std::exit(1);
 }
 
@@ -721,20 +713,9 @@ int main(int argc, char** argv) {
   auto t0 = std::chrono::steady_clock::now();
   if (mode == "c") {
     uint32_t chunk_size = kDefaultChunkSize;
-    Mode codec = Mode::LzRans;
-    for (int i = 4; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--mode" && i + 1 < argc) {
-        std::string m = argv[++i];
-        if (m == "lz") codec = Mode::Lz;
-        else if (m == "lzrans") codec = Mode::LzRans;
-        else die("unknown mode: " + m);
-      } else {
-        chunk_size = (uint32_t)std::strtoul(a.c_str(), nullptr, 10);
-      }
-    }
+    if (argc >= 5) chunk_size = (uint32_t)std::strtoul(argv[4], nullptr, 10);
     if (chunk_size == 0 || chunk_size > kMaxChunkSize) die("chunk_size must be in (0, 65536]");
-    compress(in_path, out_path, chunk_size, codec);
+    compress(in_path, out_path, chunk_size);
   } else if (mode == "d") {
     decompress(in_path, out_path);
   } else {
