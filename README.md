@@ -224,7 +224,8 @@ Two measurements drove that design:
   flight are roughly one batch, and a bigger batch beats more sets.
 
 Batch size comes from free VRAM, since the GPU may be shared: at least
-1024 chunks and 32MB of input, within half of free VRAM up to 4GB. A
+1024 chunks and 32MB of input, within half of free VRAM up to 4GB (or an
+explicit `--gpu-mem` budget). A
 file that fits in one or two batches gets the whole budget. Allocation
 retries with a halved batch on failure. Compressed output is compacted
 on the GPU (a CUB scan plus a pack kernel, writing into the batch's
@@ -280,11 +281,19 @@ register spilling.
 ./build/gzp c <input> <output> [chunk_size]                # compress (default chunk_size 65536)
 ./build/gzp c <input> <output> --profile speed|balance|ratio  # ...or pick a chunk-size preset
 ./build/gzp d <input> <output>                              # decompress
+./build/gzp c|d ... --gpu-mem 8G                            # GPU memory for batch buffers
 ```
 
 `chunk_size` and `--profile` are mutually exclusive, and unrecognised
 arguments are rejected. See *Results* for what each profile costs and
 buys.
+
+`--gpu-mem SIZE` (or `GZP_GPU_MEM`) sets how much GPU memory gzp may use
+for its batch buffers: a number with a K, M, G or T suffix, or a bare
+number of MiB. By default gzp takes the smaller of half the free GPU
+memory and 4G; an explicit value may use all but 256MiB of the free
+memory and is reduced, with a note, if it asks for more. Host RAM use
+does not depend on it: gzp pins a fixed ~96MB of staging buffers.
 
 Environment variables, all optional:
 
@@ -399,11 +408,14 @@ size while keeping the content non-repeating. The 1GB corpus in
   sensitive to a *concurrent* GPU process than shared memory was. Under
   ~40% contention, the `ratio` compress kernel measured at half its
   actual speed.
-- **The 4GB batch budget cap binds at `ratio`.** Even with 15GB of VRAM
-  free, a 1GB file at the 1MB profile gets batches of ~350 chunks,
-  because each chunk needs ~6MB of device memory. Kernel throughput
-  follows chunks in flight, so raising `kMaxBudgetBytes` (`main.cu`) on
-  large GPUs is the next thing to measure for that profile.
+- **The default 4GB GPU-memory cap is already enough.** It limits a 1GB
+  file at the 1MB `ratio` profile to batches of ~350 chunks, since each
+  needs ~6MB of device memory. Raising it with `--gpu-mem` to 6–12G fits
+  the whole file in one batch but measured the same kernel throughput
+  (~1550 MB/s, the GPU is saturated) and slightly lower wall throughput
+  (no copy/compute overlap with a single batch). Lowering it does cost:
+  2G measured 900 MB/s. So `--gpu-mem` is mainly for keeping gzp small on
+  a shared GPU.
 - **Literal-context choice is per batch, estimated from the histogram.**
   It is exact about which chunks can't use rANS, but not about which
   chunks will lose to plain tokens later, so a batch can occasionally

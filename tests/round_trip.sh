@@ -142,6 +142,24 @@ run_profile_cases() {
     printf "PASS %-28s unknown --profile rejected\n" "profile"
   fi
   rm -f "$TMP/profile_both.gzp" "$TMP/profile_bogus.gzp"
+
+  # --gpu-mem: a tiny budget forces many small batches on both sides.
+  comp="$TMP/gpumem.gzp"
+  dec="$TMP/gpumem.out"
+  if "${PREFIX[@]}" "$GZP" c "$f" "$comp" 4096 --gpu-mem 64M 2>>"$TMP/log" &&
+     "${PREFIX[@]}" "$GZP" d "$comp" "$dec" --gpu-mem 48M 2>>"$TMP/log" && cmp -s "$f" "$dec"; then
+    printf "PASS %-28s --gpu-mem 64M / 48M\n" "gpu_mem"
+  else
+    printf "FAIL %-28s --gpu-mem round-trip mismatch\n" "gpu_mem"
+    fail=1
+  fi
+  if "${PREFIX[@]}" "$GZP" c "$f" "$comp" --gpu-mem 8Q 2>>"$TMP/log"; then
+    printf "FAIL %-28s bad --gpu-mem unit should be rejected\n" "gpu_mem"
+    fail=1
+  else
+    printf "PASS %-28s bad --gpu-mem unit rejected\n" "gpu_mem"
+  fi
+  rm -f "$comp" "$dec"
 }
 
 # Exercises all three literal-context rules (GZP_FORCE_LIT_SHIFT, see

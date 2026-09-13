@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -54,7 +55,15 @@ constexpr int kMaxSets = 3; // upper bound for GZP_FORCE_SETS
 constexpr uint32_t kTargetBatches = 8;
 constexpr uint32_t kMinBatchChunks = 1024;
 constexpr size_t kMinBatchBytes = 32u << 20;
-constexpr size_t kMaxBudgetBytes = 4ull << 30;
+// GPU memory for batch buffers. By default gzp takes the smaller of half
+// the free VRAM (the GPU may be shared) and kDefaultBudgetCap; --gpu-mem /
+// GZP_GPU_MEM replace that with an explicit budget, limited only to all but
+// kGpuMemReserve of the free VRAM. The cap matters most for the 1MB
+// `ratio` profile, whose chunks need ~6MB of device memory each, so 4GB
+// holds only ~350 of them per batch at two buffer sets.
+constexpr size_t kDefaultBudgetCap = 4ull << 30;
+constexpr size_t kGpuMemReserve = 256ull << 20;
+size_t g_gpu_mem = 0; // explicit budget in bytes, 0 = automatic
 
 // Pinned staging. Pinning is the expensive part of host allocation under
 // WSL2 (cudaHostAlloc measured ~0.3-0.4s per GB, plus ~0.1s per GB to free
@@ -425,7 +434,15 @@ struct Plan {
 Plan plan_batches(uint32_t chunk_count, uint32_t chunk_size, size_t dev_bytes_per_chunk) {
   size_t free_bytes = 0, total_bytes = 0;
   check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
-  size_t budget = std::min<size_t>(free_bytes / 2, kMaxBudgetBytes);
+  size_t budget = std::min<size_t>(free_bytes / 2, kDefaultBudgetCap);
+  if (g_gpu_mem) {
+    size_t avail = free_bytes > kGpuMemReserve ? free_bytes - kGpuMemReserve : 0;
+    budget = std::min(g_gpu_mem, avail);
+    if (budget < g_gpu_mem) {
+      std::fprintf(stderr, "gzp: --gpu-mem %zu MiB is more than the %zu MiB free; using %zu MiB\n",
+                   g_gpu_mem >> 20, free_bytes >> 20, budget >> 20);
+    }
+  }
 
   uint32_t min_batch = (uint32_t)std::max<size_t>(1, kMinBatchBytes / chunk_size);
   uint32_t want = std::max({min_batch, kMinBatchChunks, (chunk_count + kTargetBatches - 1) / kTargetBatches});
@@ -1086,11 +1103,35 @@ void decompress(const std::string& in_path, const std::string& out_path) {
 void usage() {
   std::fprintf(stderr,
                "usage:\n"
-               "  gzp c <input> <output> [chunk_size | --profile speed|balance|ratio]   compress\n"
-               "  gzp d <input> <output>                                               decompress\n"
-               "chunk_size and --profile are mutually exclusive; with neither, chunk_size is %u.\n",
+               "  gzp c <input> <output> [chunk_size | --profile speed|balance|ratio] [--gpu-mem SIZE]\n"
+               "  gzp d <input> <output> [--gpu-mem SIZE]\n"
+               "chunk_size and --profile are mutually exclusive; with neither, chunk_size is %u.\n"
+               "--gpu-mem caps the GPU memory used for batch buffers (e.g. 8G, 512M; a bare\n"
+               "number is MiB). Default: half the free GPU memory, at most 4G. Also GZP_GPU_MEM.\n",
                kDefaultChunkSize);
   std::exit(1);
+}
+
+// Parses a --gpu-mem / GZP_GPU_MEM value: a positive number with an
+// optional K, M, G or T suffix (binary units; a trailing "B" or "iB" is
+// allowed). A bare number is MiB.
+size_t parse_mem_size(const std::string& s) {
+  char* end = nullptr;
+  double v = std::strtod(s.c_str(), &end);
+  if (end == s.c_str() || !(v > 0)) die("bad --gpu-mem value: " + s);
+  std::string unit(end);
+  for (char& ch : unit) ch = (char)std::tolower((unsigned char)ch);
+  if (unit.size() >= 2 && unit.compare(unit.size() - 2, 2, "ib") == 0) unit.resize(unit.size() - 2);
+  else if (!unit.empty() && unit.back() == 'b') unit.pop_back();
+  double mult = unit == "" || unit == "m" ? 1048576.0
+                : unit == "k"             ? 1024.0
+                : unit == "g"             ? 1073741824.0
+                : unit == "t"             ? 1099511627776.0
+                                          : 0.0;
+  if (mult == 0.0) die("bad --gpu-mem unit in: " + s + " (use K, M, G or T)");
+  double bytes = v * mult;
+  if (bytes < 1048576.0) die("--gpu-mem must be at least 1M");
+  return (size_t)bytes;
 }
 
 } // namespace
@@ -1102,14 +1143,27 @@ int main(int argc, char** argv) {
   std::string out_path = argv[3];
 
   auto t0 = std::chrono::steady_clock::now();
+  if (const char* m = std::getenv("GZP_GPU_MEM")) g_gpu_mem = parse_mem_size(m);
+  // --gpu-mem applies to both modes (and wins over GZP_GPU_MEM); the rest
+  // of the arguments are mode-specific.
+  std::vector<std::string> rest;
+  for (int i = 4; i < argc; ++i) {
+    std::string a = argv[i];
+    if (a == "--gpu-mem") {
+      if (i + 1 >= argc) die("--gpu-mem needs a value (e.g. 8G)");
+      g_gpu_mem = parse_mem_size(argv[++i]);
+    } else {
+      rest.push_back(a);
+    }
+  }
   if (mode == "c") {
     bool have_chunk_size = false, have_profile = false;
     uint32_t chunk_size = kDefaultChunkSize;
-    for (int i = 4; i < argc; ++i) {
-      std::string a = argv[i];
+    for (size_t i = 0; i < rest.size(); ++i) {
+      const std::string& a = rest[i];
       if (a == "--profile") {
-        if (i + 1 >= argc) die("--profile needs a value (speed, balance, or ratio)");
-        std::string p = argv[++i];
+        if (i + 1 >= rest.size()) die("--profile needs a value (speed, balance, or ratio)");
+        std::string p = rest[++i];
         if (p == "speed") chunk_size = kProfileSpeedChunkSize;
         else if (p == "balance") chunk_size = kProfileBalanceChunkSize;
         else if (p == "ratio") chunk_size = kProfileRatioChunkSize;
@@ -1131,7 +1185,7 @@ int main(int argc, char** argv) {
     }
     compress(in_path, out_path, chunk_size);
   } else if (mode == "d") {
-    if (argc != 4) usage();
+    if (!rest.empty()) die("unrecognised argument: " + rest[0]);
     decompress(in_path, out_path);
   } else {
     usage();
