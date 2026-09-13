@@ -19,6 +19,7 @@ set(GPUSQZ_VERSION "0.5.0" CACHE STRING "Version stamped into packages (CI sets 
 project(gpusqz VERSION ${GPUSQZ_VERSION} DESCRIPTION "GPU (CUDA) file compressor" LANGUAGES CXX)
 if(GPUSQZ_BUILD_GPU)
   enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
 endif()
 
 set(CMAKE_CXX_STANDARD 17)
@@ -35,9 +36,13 @@ endif()
 
 if(GPUSQZ_BUILD_GPU)
   add_executable(gpusqz
-    src/main.cu
+    src/main.cpp
+    src/cuda_backend.cu
     src/kernels.cu
   )
+  target_compile_definitions(gpusqz PRIVATE GPUSQZ_HAVE_CUDA)
+  # main.cpp is plain C++; the CUDA runtime is linked for cuda_backend.cu.
+  target_link_libraries(gpusqz PRIVATE CUDA::cudart_static)
 
   # All kernels live in kernels.cu, so no relocatable device code is needed;
   # with it, the device link step dropped the PTX that lets newer GPUs run.
