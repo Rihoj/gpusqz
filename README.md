@@ -19,32 +19,32 @@ creation); the kernel columns are GPU time only.
 
 | codec | compress MB/s (wall) | kernel MB/s | decompress MB/s (wall) | kernel MB/s | ratio |
 |---|---|---|---|---|---|
-| **gzp** (`--profile speed`, 64KB) | **440** | 766 | **731** | 3474 | 0.263 |
-| gzip -1 | 153 | – | 274 | – | 0.284 |
-| gzip -6 | 59 | – | 301 | – | 0.231 |
-| zstd -1 (1 thread) | 552 | – | 1403 | – | 0.252 |
-| zstd -3 (1 thread) | 425 | – | 1366 | – | 0.225 |
+| **gzp** (`--profile speed`, 64KB) | **402** | 719 | **760** | 3009 | 0.2775 |
+| gzip -1 | 142 | – | 258 | – | 0.2985 |
+| gzip -6 | 57 | – | 297 | – | 0.2457 |
+| zstd -1 (1 thread) | 524 | – | 1412 | – | 0.2724 |
+| zstd -3 (1 thread) | 399 | – | 1363 | – | 0.2426 |
 
 gzp beats `gzip -1` on both ratio and speed at every chunk size, and
-beats `zstd -1`'s compress speed here (zstd's hand-tuned decoder is
-still faster to decode). Earlier measurements taken while another
-process held ~90% of the GPU showed much lower and noisier numbers
-purely from contention — `REPEAT=<n>` (see *Benchmarking*) exists
-because of exactly that.
+beats `zstd -1`'s ratio here too (zstd's hand-tuned decoder is still
+faster on both ends). Earlier measurements taken while another process
+held ~90% of the GPU showed much lower and noisier numbers purely from
+contention — `REPEAT=<n>` (see *Benchmarking*) exists because of
+exactly that.
 
 Chunk size trades ratio for speed — bigger chunks give the match finder
 more history to search, at the cost of fewer, coarser-grained units of
 GPU parallelism. `--profile <name>` (see *Usage*) selects one of three
-presets; `ratio` is the largest chunk this format allows and is the
-only one that beats `zstd -1`'s ratio on this corpus:
+presets:
 
 | profile | chunk | ratio | compress kernel MB/s | decompress kernel MB/s |
 |---|---|---|---|---|
-| speed (default) | 64KB | 0.263 | 766 | 3361 |
-| balance | 256KB | 0.253 | 508 | 923 |
-| ratio | 1MB | **0.250** | 252 | 242 |
+| speed (default) | 64KB | 0.2775 | 719 | 3009 |
+| balance | 256KB | 0.2687 | 468 | 828 |
+| ratio | 1MB | **0.2561** | 203 | 208 |
 
-(`zstd -1`'s ratio on this corpus is 0.252, `zstd -3`'s is 0.225.)
+(`zstd -1`'s ratio on this corpus is 0.2724, `zstd -3`'s is 0.2426 — gzp
+beats both at every profile here, at a real decompress-speed cost.)
 
 ## How it works
 
@@ -62,31 +62,60 @@ cannot damage another.
 ### LZ parse (`src/lz_warp.cuh`)
 
 The warp walks a chunk in 32-byte windows. Every lane hashes the 4 bytes
-at its own position, reads a 4-way bucket from a per-warp shared-memory
-hash table (2048 buckets, one u32 chunk-relative position per word — 32KB
-per warp, the whole default static shared-memory budget for one warp's
-table, since positions no longer fit in 16 bits once chunks can exceed
-64KB) and compares against all four candidates, capped at 32 bytes so
-per-lane work is bounded. One deterministic lane per bucket then inserts
-its position, evicting the oldest of the four; lanes that found nothing
-re-probe once more so repeats shorter than a window apart are caught
-immediately. The window's matches are selected
-warp-uniformly from a ballot mask with a one-position lazy lookahead
-(take position *i+1*'s match instead if it's clearly longer), and matches
-that hit the 32-byte cap are extended cooperatively, 32 bytes per step,
-so long runs never serialise on one lane.
+at its own position, reads a 4-way bucket from a per-warp **dynamic**
+shared-memory hash table and compares against all four candidates,
+capped at 32 bytes so per-lane work is bounded. One deterministic lane
+per bucket then inserts its position, evicting the oldest of the four;
+lanes that found nothing re-probe once more so repeats shorter than a
+window apart are caught immediately. The table starts at 2048 buckets
+(32KB, one u32 chunk-relative position per word — positions no longer
+fit in 16 bits once chunks can exceed 64KB) and grows with chunk_size
+(`pick_hash_bits()`) up to the device's opt-in dynamic-shared-memory
+ceiling, but only once a chunk is big enough that the extra table-zeroing
+cost is worth it: the default 64KB and 256KB profiles keep the original
+32KB table (measured: growing it further cost roughly 2x kernel speed
+for a ~3% ratio gain at 256KB — not worth it there), while the 1MB
+`ratio` profile grows to 64KB (this device's practical ceiling at 4-way
+buckets), where the same fixed cost amortises over 4x more parsing work
+for a real ratio win at negligible speed cost.
+
+The window's matches are selected warp-uniformly from a ballot mask with
+a lazy lookahead of up to `kLazySteps` positions (take position *i+1*'s
+match instead if it's clearly longer, then *i+2* if that's clearer
+longer still, and so on) — zstd calls the 2-step version "lazy2". Matches
+that hit the 32-byte probe cap are extended cooperatively, 32 bytes per
+step, so long runs never serialise on one lane.
 
 The parse emits sequences — a literal run followed by a match `(offset,
 length)` — into scratch for the entropy stage below. Per chunk, the
 encoder still keeps whichever of the rANS-coded result or a plain
 LZ4-style token stream comes out smaller (see *rANS stage*).
 
+A full hash-chain match finder (following arbitrarily long chains of
+same-hash positions, rather than this fixed 4-way bucket) would likely
+find still more/better matches, but needs a chunk_size-scaled scratch
+array unlike this small, fixed-size table — left as a bigger, riskier
+follow-up.
+
 ### rANS stage (`src/rans.cuh`, `src/rans_codes.h`)
 
 Literals, literal-run lengths, match lengths and offsets are coded with
 rANS. Length and offset alphabets are zstd-style log2 buckets with raw
 extra bits (written straight into the rANS state, so there is no side
-stream). The frequency table is **shared by every chunk compressed in
+stream) — except the offset alphabet's top 3 codes, which are
+**repeat-offset codes**: "reuse the 1st/2nd/3rd most-recently-used
+distinct match offset" instead of coding a fresh magnitude, zstd-style,
+for data (especially struct/record-shaped binary formats) that reuses a
+handful of strides constantly. That reuse state is a genuine
+sequence-order dependency that the interleaved decoder's own per-group
+parallel decode doesn't carry across lanes for free: the encoder
+precomputes it in one forward serial pass over the already-parsed
+sequences (`compute_repeat_codes()`, cheap next to the LZ parse that
+produced them), and the decoder replays the same state machine
+per-group with a register-only shuffle walk (see the comment above
+`rans_decode_warp` for the mechanics) rather than any new rANS step.
+
+The frequency table is **shared by every chunk compressed in
 the same host batch** (a "table group" — see *Container format*) rather
 than stored per chunk: compression runs as three kernels per batch —
 parse every chunk into scratch while atomically accumulating one shared
@@ -174,11 +203,15 @@ silently fell back to sm_52 instead of detecting the GPU.)
 occupancy testing — see the comment above it in `CMakeLists.txt` for
 why a bare `--maxrregcount` can't do this (both kernels already carry
 an explicit `__launch_bounds__`, which takes precedence). The parse
-kernel's match-finding table now uses 32KB of the 48KB default static
-shared-memory budget for one warp (see *LZ parse*), leaving no room for
-a second block, so it's shared-memory-bound at 1 warp/SM regardless of
-this flag; decompress is register-bound, where this flag can actually
-move the needle.
+kernel's match-finding table lives in dynamic shared memory sized per
+launch (32-64KB depending on chunk size, see *LZ parse*), so it's
+shared-memory-bound at 1 warp/SM regardless of this flag; measured
+against decompress too (52 registers/thread, no spills per
+`nvcc -Xptxas -v`) with `GZP_MIN_BLOCKS_PER_SM=4` and saw no measurable
+change — it's apparently already at whatever ceiling the hardware's
+max-blocks-per-SM limit imposes on 32-thread blocks, not a register
+one, so this knob is mostly useful as a regression check that a future
+change hasn't pushed either kernel into register spilling.
 
 ## Usage
 
@@ -245,22 +278,24 @@ REPEAT=5 bash bench/run_bench.sh corpus_283mb.txt
   on this WSL2 machine; on a 94MB file that is half the wall time. It
   amortises on larger inputs and is outside gzp's control.
 - **Ratio vs zstd at the default profile.** gzp's rANS codes literals
-  with an order-0 model and its parser is a single-pass hash match
-  finder with a fixed-capacity table; at the default 64KB chunk size
-  `zstd -1` is still smaller (0.252 vs 0.263 on this corpus). Only the
-  `ratio` profile's 1MB chunks close and slightly reverse that gap
-  (0.250) — `--profile balance` (256KB) is a middle ground that gets
-  close (0.253) without paying `ratio`'s full speed cost. Repeat-offset
-  codes and a better parser (hash chains, optimal parsing) would improve
-  the ratio at every chunk size, not just the largest.
-- **The match-finding hash table's capacity doesn't scale with chunk
-  size.** It's a fixed-size, per-warp shared-memory table (32KB — the
-  full default static-shared-memory budget for one warp), so a 1MB
-  chunk gets the same "recently seen positions" recall as a 64KB one,
-  just spread over 16x more data. This is *why* the ratio gain from
-  bigger chunks is real but sub-linear, and why the natural next lever
-  is a bigger table via dynamic (rather than static) shared memory,
-  which can exceed the current 48KB-per-block static limit.
+  with an order-0 model and its parser is a hash match finder with a
+  fixed-capacity table plus a short lazy lookahead (see *LZ parse*); at
+  the default 64KB chunk size `zstd -1` is still smaller (0.2724 vs
+  0.2775 on this corpus). The `balance` (256KB) and `ratio` (1MB)
+  profiles close and reverse that gap (0.2687, 0.2561) by growing the
+  match-finding table and giving the parser more history, but at a real
+  compress/decompress speed cost. A real optimal parser (rather than
+  greedy-plus-lookahead) and a context-mixing literal model would
+  improve the ratio at every chunk size, not just the larger ones.
+- **compute_repeat_codes' encode-side pass is serial, not
+  warp-parallel.** Resolving repeat-offset codes (see *rANS stage*)
+  needs the exact sequence-order state the decoder will reconstruct, so
+  one lane walks all of a chunk's sequences before the parallel rANS
+  encode step runs. Measured cost was real but modest on this corpus's
+  prose-like text (6-12% slower compress kernel for the ratio gain);
+  struct-of-arrays/binary formats with recurring strides should see a
+  bigger ratio win here, and would be the place to check whether that
+  cost still pays for itself.
 - **rANS decode is inherently more work than a plain token stream's
   direct byte copies** — even with the coarse-LUT lookup and per-batch
   tables (which removed the earlier per-chunk table-rebuild cost
