@@ -5,10 +5,10 @@ chunk of the input (64KB by default, up to 1MB) is handled by one warp: an
 LZ parse where all 32 lanes search for matches together, followed by a
 32-way interleaved rANS entropy coder with order-1 literal contexts. It's
 a from-scratch, educational implementation — not a drop-in replacement for
-zstd — but at its default setting it compresses 1.5–2.5x faster than
+zstd — but at its default setting it compresses 1.4–2.5x faster than
 single-threaded `zstd -1` at about the same ratio, and its `ratio`
 profile lands within 0.5% of `zstd -3`'s output size while compressing
-1.5–2.3x faster (see *Results*; zstd still decompresses faster).
+1.3–2.2x faster (see *Results*; zstd still decompresses faster).
 
 ## Results
 
@@ -18,71 +18,72 @@ whole-process (file I/O, PCIe copies, and for gzp ~0.2s of CUDA context
 creation and allocation); the kernel columns are the wall-clock time any
 gzp kernel was running. Ratio is output/input, so **lower is better**.
 
-**Measurement conditions.** An idle `ollama` model held ~11.5GB of the
-GPU's 16GB and 1–12% of its compute throughout. gzp sizes its batches from
-free VRAM, so these runs had a ~2.2GB batch budget instead of the 4GB an
-idle GPU gives; the 1MB `ratio` profile is the one that loses most from
-that (smaller batches, fewer warps in flight). Numbers on an otherwise
-idle GPU should be the same or better, not worse.
+**Measurement conditions.** The GPU was otherwise idle (~1GB used by the
+desktop, 0–2% utilisation), so gzp's batch budget was its full 4GB. On
+the 283MB corpus about half of gzp's wall time is the ~0.2s fixed startup
+cost, which varies by ±15% between runs, so its wall figures there move
+by that much from run to run; the kernel figures and the 1GB corpus are
+the steadier comparison. An earlier set of runs with another process
+holding 11.5GB of VRAM gave kernel figures and ratios within 1% of these.
 
 Varied 1GB corpus (every distinct `/usr/include` header, concatenated
 without repetition; see *Benchmarking*):
 
 | codec | compress MB/s (wall) | kernel MB/s | decompress MB/s (wall) | kernel MB/s | ratio |
 |---|---|---|---|---|---|
-| **gzp** (default, `speed`, 64KB) | **1323** | 2978 | 1281 | 4538 | 0.2526 |
-| gzp `--profile balance` (256KB) | 1006 | 1837 | 1291 | 3347 | 0.2387 |
-| gzp `--profile ratio` (1MB) | 914 | 1544 | 1068 | 1905 | 0.2255 |
-| gzip -1 | 142 | – | 241 | – | 0.2836 |
-| gzip -6 | 55 | – | 270 | – | 0.2306 |
-| zstd -1 (1 thread) | 520 | – | **1379** | – | 0.2518 |
-| zstd -3 (1 thread) | 399 | – | 1229 | – | **0.2245** |
+| **gzp** (default, `speed`, 64KB) | **1297** | 2983 | 1130 | 4567 | 0.2526 |
+| gzp `--profile balance` (256KB) | 989 | 1847 | 1267 | 3353 | 0.2387 |
+| gzp `--profile ratio` (1MB) | 873 | 1552 | 1176 | 1906 | 0.2255 |
+| gzip -1 | 145 | – | 250 | – | 0.2836 |
+| gzip -6 | 56 | – | 278 | – | 0.2306 |
+| zstd -1 (1 thread) | 516 | – | **1434** | – | 0.2518 |
+| zstd -3 (1 thread) | 401 | – | 1335 | – | **0.2245** |
 
 Repetitive 283MB corpus (one 5.4MB block of headers repeated 48 times — a
 friendlier shape for a match finder, see the caveat in *Benchmarking*):
 
 | codec | compress MB/s (wall) | kernel MB/s | decompress MB/s (wall) | kernel MB/s | ratio |
 |---|---|---|---|---|---|
-| **gzp** (default, `speed`, 64KB) | **751** | 2400 | 803 | 3814 | 0.2673 |
-| gzp `--profile balance` (256KB) | 617 | 1738 | 785 | 3419 | 0.2547 |
-| gzp `--profile ratio` (1MB) | 552 | 1238 | 752 | 1515 | **0.2423** |
-| gzip -1 | 138 | – | 247 | – | 0.2985 |
-| gzip -6 | 52 | – | 268 | – | 0.2457 |
-| zstd -1 (1 thread) | 492 | – | **1278** | – | 0.2724 |
-| zstd -3 (1 thread) | 374 | – | 1233 | – | 0.2426 |
+| **gzp** (default, `speed`, 64KB) | **664** | 2390 | 718 | 3805 | 0.2673 |
+| gzp `--profile balance` (256KB) | 552 | 1746 | 715 | 3414 | 0.2547 |
+| gzp `--profile ratio` (1MB) | 487 | 1232 | 657 | 1515 | **0.2423** |
+| gzip -1 | 140 | – | 249 | – | 0.2985 |
+| gzip -6 | 53 | – | 273 | – | 0.2457 |
+| zstd -1 (1 thread) | 482 | – | **1328** | – | 0.2724 |
+| zstd -3 (1 thread) | 373 | – | 1188 | – | 0.2426 |
 
 Against the CPU tools:
 
-- **Default profile vs `zstd -1`.** gzp compresses 1.5x (283MB) to 2.5x
+- **Default profile vs `zstd -1`.** gzp compresses 1.4x (283MB) to 2.5x
   (1GB) faster. Its output is 1.9% smaller on the repetitive corpus and
-  0.3% larger on the varied one. `zstd -1` decompresses faster: 1.6x on
-  the smaller file, where gzp's fixed startup cost weighs more, and 1.08x
+  0.3% larger on the varied one. `zstd -1` decompresses faster: 1.85x on
+  the smaller file, where gzp's fixed startup cost weighs more, and 1.3x
   on the 1GB file.
-- **`ratio` profile vs `zstd -3`.** gzp compresses 1.5–2.3x faster. Its
+- **`ratio` profile vs `zstd -3`.** gzp compresses 1.3–2.2x faster. Its
   output is 0.1% smaller on the repetitive corpus and 0.5% larger on the
-  varied one. `zstd -3` decompresses 1.15–1.6x faster.
+  varied one. `zstd -3` decompresses 1.1–1.8x faster.
 - **vs `gzip`.** Every gzp profile beats `gzip -1` on both ratio and
   speed. The `ratio` profile also beats `gzip -6`'s ratio on both corpora
-  while compressing 10–17x faster; `balance` does not beat `gzip -6`.
+  while compressing 9–16x faster; `balance` does not beat `gzip -6`.
 
 The gzp wall figures on the 1GB corpus are bounded by file I/O more than
 by the GPU: under WSL2, decompression spends most of its time in
-`fwrite` (see *Known limitations*), and the kernels run 1.7–3.5x faster
+`fwrite` (see *Known limitations*), and the kernels run 1.6–4x faster
 than the wall-clock rate.
 
 ### What changed in this round
 
-Same machine and conditions, best of 3, previous version (d5073da)
-against this one:
+Same machine, idle GPU, best of 3, previous version (d5073da) against
+this one, run back to back:
 
 | corpus | profile | compress wall | compress kernel | decompress wall | decompress kernel | ratio |
 |---|---|---|---|---|---|---|
-| 1GB varied | speed | 1375 → 1353 | 2886 → 2966 | 1039 → 1428 | 3552 → 4580 | 0.2621 → 0.2526 |
-| 1GB varied | balance | 736 → 1007 | 1055 → 1836 | 1090 → 1368 | 1276 → 3315 | 0.2517 → 0.2387 |
-| 1GB varied | ratio | 265 → 892 | 299 → 1544 | 813 → 1104 | 324 → 1907 | 0.2329 → 0.2255 |
-| 283MB repetitive | speed | 669 → 731 | 2475 → 2393 | 766 → 834 | 3027 → 3808 | 0.2775 → 0.2673 |
-| 283MB repetitive | balance | 424 → 609 | 807 → 1737 | 725 → 860 | 836 → 3413 | 0.2687 → 0.2547 |
-| 283MB repetitive | ratio | 174 → 537 | 214 → 1236 | 443 → 764 | 206 → 1509 | 0.2500 → 0.2423 |
+| 1GB varied | speed | 1295 → 1279 | 2912 → 2980 | 1258 → 1466 | 3573 → 4595 | 0.2621 → 0.2526 |
+| 1GB varied | balance | 721 → 1008 | 1066 → 1851 | 1231 → 1314 | 1283 → 3357 | 0.2517 → 0.2387 |
+| 1GB varied | ratio | 265 → 871 | 301 → 1550 | 858 → 1206 | 326 → 1917 | 0.2329 → 0.2255 |
+| 283MB repetitive | speed | 614 → 647 | 2474 → 2382 | 707 → 769 | 3054 → 3804 | 0.2775 → 0.2673 |
+| 283MB repetitive | balance | 409 → 579 | 809 → 1737 | 679 → 746 | 837 → 3416 | 0.2687 → 0.2547 |
+| 283MB repetitive | ratio | 171 → 499 | 216 → 1233 | 425 → 703 | 206 → 1515 | 0.2500 → 0.2423 |
 
 (MB/s). The four changes behind it, in order of impact:
 
@@ -398,6 +399,11 @@ size while keeping the content non-repeating. The 1GB corpus in
   sensitive to a *concurrent* GPU process than shared memory was. Under
   ~40% contention, the `ratio` compress kernel measured at half its
   actual speed.
+- **The 4GB batch budget cap binds at `ratio`.** Even with 15GB of VRAM
+  free, a 1GB file at the 1MB profile gets batches of ~350 chunks,
+  because each chunk needs ~6MB of device memory. Kernel throughput
+  follows chunks in flight, so raising `kMaxBudgetBytes` (`main.cu`) on
+  large GPUs is the next thing to measure for that profile.
 - **Literal-context choice is per batch, estimated from the histogram.**
   It is exact about which chunks can't use rANS, but not about which
   chunks will lose to plain tokens later, so a batch can occasionally
