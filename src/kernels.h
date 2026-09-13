@@ -12,14 +12,17 @@ namespace gzp {
 __host__ __device__ inline uint32_t max_sequences(uint32_t chunk_size) { return chunk_size / kMinMatch + 1; }
 
 // Per-chunk device scratch used by the LzRans paths: a 12-byte record per
-// sequence followed by the literals, each section 16-byte aligned. Must
-// agree with chunk_scratch() in kernels.cu (which uses sizeof(SeqRec)
-// directly; this copy exists only because lz_warp.cuh, where SeqRec is
-// defined, includes this header, not the other way around).
+// sequence, then one repeat-offset-code byte per sequence
+// (compute_repeat_codes(), rans.cuh), then the literals -- each section
+// 16-byte aligned. Must agree with chunk_scratch() in kernels.cu (which
+// uses sizeof(SeqRec) directly; this copy exists only because lz_warp.cuh,
+// where SeqRec is defined, includes this header, not the other way
+// around).
 __host__ __device__ inline size_t scratch_bytes(uint32_t chunk_size) {
   size_t seqs = ((size_t)12 * max_sequences(chunk_size) + 15) & ~(size_t)15;
+  size_t rep = ((size_t)max_sequences(chunk_size) + 15) & ~(size_t)15;
   size_t lits = ((size_t)chunk_size + 15) & ~(size_t)15;
-  return seqs + lits;
+  return seqs + rep + lits;
 }
 
 // Per-batch buffers for the LzRans pipeline, all sized independently of

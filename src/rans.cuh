@@ -20,6 +20,18 @@
 //   u32 n_seq, u32 n_lit, u32 state[32], u16 words[]
 // Decode order: sequence groups of 32 (sub-steps ll_code, ll_bits,
 // ml_code, ml_bits, off_code, off_bits), then literal groups of 32.
+//
+// Offset codes reuse one of the last 3 distinct match offsets (see
+// kOffRepBase, rans_codes.h) when possible, zstd-style, instead of always
+// coding a fresh magnitude -- struct/record-shaped data tends to reuse a
+// handful of strides constantly. That MRU state is inherently sequential
+// (state at sequence i depends on every real offset before it), which
+// the interleaved rANS's own per-group parallel decode doesn't carry
+// across lanes on its own: compute_repeat_codes() (encode side, a
+// forward serial replay over the already-parsed sequences) and
+// rans_decode_warp's inline replay (decode side, a register-only
+// per-group shuffle walk) both reconstruct the same state machine so
+// encode and decode agree without adding any new rANS steps.
 #pragma once
 #include <cstdint>
 #include <initializer_list>
@@ -127,13 +139,62 @@ __device__ __forceinline__ void store_u32(uint8_t* p, uint32_t v) {
   p[3] = (uint8_t)(v >> 24);
 }
 
+// Serially replays the zstd-style 3-slot MRU repeat-offset state forward
+// over this chunk's already-parsed sequences, writing rep_code[i] for
+// every match sequence (ml != 0): 0 means "code seqs[i].off explicitly",
+// 1/2/3 means "reuse the 1st/2nd/3rd most-recently-used distinct offset"
+// (see kOffRepBase, rans_codes.h). rep_code[i] is left unset for literal-
+// only sequences (ml == 0); callers must not read it there.
+//
+// This has to be a genuine forward-order serial replay, not a per-group
+// parallel one: the encoder needs the exact state decode will reconstruct
+// at each sequence, decode reads sequences in ascending order, and the
+// state at sequence i depends on every real offset before it, including
+// ones the interleaved rANS group loop would otherwise decode in
+// parallel with i (see rans_decode_warp's own replay of this same state
+// machine over an already-decoded group, which faces the same
+// constraint from the decode side). One lane does this; it is O(n_seq)
+// but each step is a handful of scalar compares -- tiny next to the LZ
+// parse that produced `seqs`.
+__device__ inline void compute_repeat_codes(const SeqRec* seqs, uint32_t n_seq, uint8_t* rep_code) {
+  int lane = threadIdx.x & 31;
+  if (lane == 0) {
+    uint32_t r0 = 0, r1 = 0, r2 = 0; // 0 never matches: real offsets are >= 1
+    for (uint32_t i = 0; i < n_seq; ++i) {
+      uint32_t ml = seqs[i].ml, off = seqs[i].off;
+      uint8_t code = 0;
+      if (ml) {
+        if (off == r0) {
+          code = 1;
+        } else if (off == r1) {
+          code = 2;
+          r1 = r0;
+          r0 = off;
+        } else if (off == r2) {
+          code = 3;
+          r2 = r1;
+          r1 = r0;
+          r0 = off;
+        } else {
+          r2 = r1;
+          r1 = r0;
+          r0 = off;
+        }
+      }
+      rep_code[i] = code;
+    }
+  }
+  __syncwarp();
+}
+
 // Adds one chunk's symbol counts into a batch-wide histogram (kQuantBytes
 // entries, indexed like everything else by kLitBase/kLlBase/kMlBase/
 // kOffBase) via atomics, so every chunk in a host batch can contribute to
 // one shared table. Call once per chunk, all lanes, after that chunk's LZ
-// parse has filled `seqs`/`lits`.
-__device__ inline void accumulate_hist(const SeqRec* seqs, uint32_t n_seq, const uint8_t* lits, uint32_t n_lit,
-                                       uint32_t* batch_cnt) {
+// parse has filled `seqs`/`lits` and compute_repeat_codes has filled
+// `rep_code`.
+__device__ inline void accumulate_hist(const SeqRec* seqs, uint32_t n_seq, const uint8_t* rep_code,
+                                       const uint8_t* lits, uint32_t n_lit, uint32_t* batch_cnt) {
   int lane = threadIdx.x & 31;
   for (uint32_t i = lane; i < n_lit; i += 32) atomicAdd(&batch_cnt[kLitBase + lits[i]], 1u);
   for (uint32_t i = lane; i < n_seq; i += 32) {
@@ -144,7 +205,12 @@ __device__ inline void accumulate_hist(const SeqRec* seqs, uint32_t n_seq, const
     len_code(r.ml ? (uint32_t)r.ml - (kMinMatch - 1) : 0, c, nb, b);
     atomicAdd(&batch_cnt[kMlBase + c], 1u);
     if (r.ml) {
-      off_code(r.off, c, nb, b);
+      uint8_t rc = rep_code[i];
+      if (rc) {
+        c = kOffRepBase + (rc - 1);
+      } else {
+        off_code(r.off, c, nb, b);
+      }
       atomicAdd(&batch_cnt[kOffBase + c], 1u);
     }
   }
@@ -210,14 +276,15 @@ __device__ __forceinline__ bool rans_enc_bits(uint32_t& x, bool active, uint32_t
 
 // Encodes a chunk already parsed into `seqs`/`lits` against a table shared
 // by its whole batch (freq/cum, kQuantBytes entries, indexed by
-// kLitBase/kLlBase/kMlBase/kOffBase as usual). Words are written backward
-// from the end of the slot and the header is placed right before them, so
-// the payload starts at *out_start within the slot. The caller guarantees
-// in_len > kRansHeaderBytes + 1.
-__device__ inline bool rans_encode_warp(const SeqRec* seqs, uint32_t n_seq, const uint8_t* lits, uint32_t n_lit,
-                                        const uint16_t* freq, const uint16_t* cum, uint8_t* slot,
-                                        uint32_t slot_stride, uint32_t in_len, uint32_t* out_start,
-                                        uint32_t* out_size) {
+// kLitBase/kLlBase/kMlBase/kOffBase as usual). `rep_code` is
+// compute_repeat_codes()'s output for these same `seqs`. Words are written
+// backward from the end of the slot and the header is placed right before
+// them, so the payload starts at *out_start within the slot. The caller
+// guarantees in_len > kRansHeaderBytes + 1.
+__device__ inline bool rans_encode_warp(const SeqRec* seqs, uint32_t n_seq, const uint8_t* rep_code,
+                                        const uint8_t* lits, uint32_t n_lit, const uint16_t* freq,
+                                        const uint16_t* cum, uint8_t* slot, uint32_t slot_stride, uint32_t in_len,
+                                        uint32_t* out_start, uint32_t* out_size) {
   int lane = threadIdx.x & 31;
 
   // The whole payload must not beat raw storage, so the stream may use at
@@ -244,7 +311,14 @@ __device__ inline bool rans_encode_warp(const SeqRec* seqs, uint32_t n_seq, cons
     len_code(r.lit_len, llc, llnb, llb);
     len_code(ml ? ml - (kMinMatch - 1) : 0, mlc, mlnb, mlb);
     bool has_off = act && ml != 0;
-    if (has_off) off_code(off, oc, onb, ob);
+    if (has_off) {
+      uint8_t rc = rep_code[idx];
+      if (rc) {
+        oc = kOffRepBase + (rc - 1); // onb, ob stay 0: repeat codes carry no extra bits
+      } else {
+        off_code(off, oc, onb, ob);
+      }
+    }
 
     if (!rans_enc_bits(x, has_off, onb, ob, wp, wlimit)) return false;
     if (!rans_enc_put(x, has_off, freq[kOffBase + oc], cum[kOffBase + oc], wp, wlimit)) return false;
@@ -351,6 +425,11 @@ __device__ inline bool rans_decode_warp(const uint8_t* payload, uint32_t len, co
   const uint8_t* rp = payload + kRansHeaderBytes;
   const uint8_t* rend = payload + len;
   bool bad = false;
+  // Repeat-offset MRU state, carried across groups. Every lane keeps an
+  // identical copy, advanced by the register-only replay below -- see
+  // compute_repeat_codes for why this can't just fall out of the
+  // group's normal per-lane-parallel decode.
+  uint32_t rep0 = 0, rep1 = 0, rep2 = 0;
 
   for (uint32_t g = 0; g < (n_seq + 31) / 32; ++g) {
     uint32_t idx = g * 32 + lane;
@@ -376,17 +455,52 @@ __device__ inline bool rans_decode_warp(const uint8_t* payload, uint32_t len, co
     bool has_off = act && ml != 0;
     if (has_off) {
       oc = rans_dec_small(x, t.freq + kOffBase, t.cum + kOffBase, t.off_lut);
-      // oc must stay < 32 regardless of chunk size: it's a shift count
-      // below (nb = oc), and rans_dec_bits(x, 32) would be undefined.
-      bad |= t.freq[kOffBase + oc] == 0 || oc >= (uint32_t)kSmallSyms;
+      bad |= t.freq[kOffBase + oc] == 0;
     }
     if (!rans_dec_renorm(x, has_off, rp, rend)) return false;
-    if (!rans_dec_bits(x, has_off, oc, ob, rp, rend)) return false;
+    if (!rans_dec_bits(x, has_off, off_nb(oc), ob, rp, rend)) return false;
+
+    // Resolve this group's offsets: every lane replays the same forward
+    // MRU walk over all 32 (has_off, oc, ob) triples via shuffles,
+    // keeping only its own lane's result -- see compute_repeat_codes.
+    uint32_t off = 0;
+    {
+      uint32_t r0 = rep0, r1 = rep1, r2 = rep2;
+      for (int j = 0; j < 32; ++j) {
+        bool j_has = __shfl_sync(kFullMask, has_off, j);
+        uint32_t j_oc = __shfl_sync(kFullMask, oc, j);
+        uint32_t j_ob = __shfl_sync(kFullMask, ob, j);
+        uint32_t jo = 0;
+        if (j_has) {
+          if (j_oc >= kOffRepBase) {
+            uint32_t slot = j_oc - kOffRepBase;
+            jo = slot == 0 ? r0 : slot == 1 ? r1 : r2;
+            if (slot == 1) {
+              r1 = r0;
+              r0 = jo;
+            } else if (slot == 2) {
+              r2 = r1;
+              r1 = r0;
+              r0 = jo;
+            }
+          } else {
+            jo = off_value(j_oc, j_ob);
+            r2 = r1;
+            r1 = r0;
+            r0 = jo;
+          }
+        }
+        if (j == lane) off = jo;
+      }
+      rep0 = r0;
+      rep1 = r1;
+      rep2 = r2;
+    }
 
     if (act) {
       if (ml == 0 && idx != n_seq - 1) bad = true;
       if (ml > max_lit) bad = true; // a match can never be longer than the chunk itself
-      seqs[idx] = SeqRec{len_value(llc, llb), has_off ? off_value(oc, ob) : 0, ml};
+      seqs[idx] = SeqRec{len_value(llc, llb), has_off ? off : 0, ml};
     }
     if (__any_sync(kFullMask, bad)) return false;
   }

@@ -141,8 +141,15 @@ bool decode_lzrans(const uint8_t* in, size_t in_len, uint8_t* out, size_t orig, 
   RansDecoder d(in, in_len, group_q);
   std::vector<Seq> seqs(n_seq);
   std::vector<uint8_t> lits(n_lit);
-  uint32_t llc[32], mlc[32], oc[32], llb[32], mlb[32], ob[32], ml[32], nb[32];
+  uint32_t llc[32], mlc[32], oc[32], llb[32], mlb[32], ob[32], ml[32], nb[32], off[32];
   bool active[32], has_off[32];
+  // Repeat-offset MRU state (see kOffRepBase, rans_codes.h), carried
+  // across groups -- mirrors rans_decode_warp's rep0/rep1/rep2 exactly,
+  // just as a plain sequential walk instead of a shuffle-based replay
+  // (this decoder has no lanes to shuffle between; visiting l = 0..31 in
+  // order after each group's codes are already known reproduces the same
+  // forward-order state machine compute_repeat_codes built on encode).
+  uint32_t rep0 = 0, rep1 = 0, rep2 = 0;
 
   for (uint32_t g = 0; g < (n_seq + 31) / 32; ++g) {
     for (int l = 0; l < 32; ++l) active[l] = g * 32 + l < n_seq;
@@ -159,15 +166,37 @@ bool decode_lzrans(const uint8_t* in, size_t in_len, uint8_t* out, size_t orig, 
     }
     for (int l = 0; l < 32; ++l) has_off[l] = active[l] && ml[l] != 0;
     for (int l = 0; l < 32; ++l) if (has_off[l]) oc[l] = d.get(l, RansDecoder::kOff, kSmallSyms);
-    for (int l = 0; l < 32; ++l) nb[l] = has_off[l] ? oc[l] : 0; // oc is itself a shift count (nb = oc)
+    for (int l = 0; l < 32; ++l) nb[l] = has_off[l] ? off_nb(oc[l]) : 0;
     bits_pass(d, has_off, nb, ob);
+    for (int l = 0; l < 32; ++l) {
+      uint32_t jo = 0;
+      if (has_off[l]) {
+        if (oc[l] >= kOffRepBase) {
+          uint32_t slot = oc[l] - kOffRepBase;
+          jo = slot == 0 ? rep0 : slot == 1 ? rep1 : rep2;
+          if (slot == 1) {
+            rep1 = rep0;
+            rep0 = jo;
+          } else if (slot == 2) {
+            rep2 = rep1;
+            rep1 = rep0;
+            rep0 = jo;
+          }
+        } else {
+          jo = off_value(oc[l], ob[l]);
+          rep2 = rep1;
+          rep1 = rep0;
+          rep0 = jo;
+        }
+      }
+      off[l] = jo;
+    }
     for (int l = 0; l < 32; ++l) {
       if (!active[l]) continue;
       uint32_t idx = g * 32 + l;
       if (ml[l] == 0 && idx != n_seq - 1) return false;
       if (ml[l] > chunk_size) return false; // a match can never be longer than the chunk itself
-      if (ml[l] && oc[l] >= (uint32_t)kSmallSyms) return false;
-      seqs[idx] = Seq{len_value(llc[l], llb[l]), ml[l], ml[l] ? off_value(oc[l], ob[l]) : 0};
+      seqs[idx] = Seq{len_value(llc[l], llb[l]), ml[l], ml[l] ? off[l] : 0};
     }
     if (d.bad) return false;
   }

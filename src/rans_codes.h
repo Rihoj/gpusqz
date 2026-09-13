@@ -8,7 +8,13 @@
 //                else:   code 12 + floor(log2 v), floor(log2 v) extra bits
 //   match_len    same coding of v = ml - (kMinMatch - 1) (v = 0 marks a
 //                literals-only final sequence; real matches give v >= 1)
-//   offset       code floor(log2 off), that many extra bits
+//   offset       code floor(log2 off), that many extra bits -- except the
+//                top 3 codes (kOffRepBase..kOffRepBase+2), which are never
+//                a real floor(log2 off) for any offset this format allows
+//                and instead mean "reuse the 1st/2nd/3rd most-recently-used
+//                distinct match offset" (zstd-style repeat offsets), with
+//                zero extra bits: see kOffRepBase below and
+//                compute_repeat_codes()/its decode-side mirror in rans.cuh.
 // Extra bits are written raw (rANS bypass), so there is no side stream.
 #pragma once
 #include <cstdint>
@@ -19,7 +25,12 @@ constexpr int kProbBits = 12;
 constexpr uint32_t kProbScale = 1u << kProbBits;
 constexpr uint32_t kRansL = 1u << 16; // state lower bound; 16-bit output words
 constexpr int kLitSyms = 256;
-constexpr int kSmallSyms = 32; // lit_len / match_len / offset alphabets (29, 28, 16 used)
+constexpr int kSmallSyms = 32; // lit_len / match_len / offset alphabets (29, 28, 29 used)
+// Offset codes >= kOffRepBase are repeat-offset codes, not real
+// floor(log2 off) values: kMaxChunkSize (1MB, format.h) caps a real
+// off_code() at floor_log2(1<<20) = 20, comfortably below this.
+constexpr uint32_t kOffRepBase = kSmallSyms - 3;
+static_assert(kOffRepBase > 20, "repeat-offset codes must exceed any real off_code() for kMaxChunkSize");
 constexpr int kRansStates = 32;
 constexpr int kQuantBytes = kLitSyms + 3 * kSmallSyms;
 // Payload header after the chunk flag: n_seq, n_lit, states. The quantised
@@ -65,6 +76,10 @@ GZP_HD void off_code(uint32_t off, uint32_t& code, uint32_t& nb, uint32_t& bits)
   bits = off - (1u << l);
 }
 GZP_HD uint32_t off_value(uint32_t code, uint32_t bits) { return (1u << code) + bits; }
+// Bypass-bit width for a decoded offset code: for a real off_code() this
+// is the code itself (nb == floor(log2 off), see off_code above); a
+// repeat-offset code (>= kOffRepBase) carries no extra bits at all.
+GZP_HD uint32_t off_nb(uint32_t code) { return code >= kOffRepBase ? 0 : code; }
 
 // Quantises counts to one byte each for the header: zero iff absent,
 // otherwise 1..255 scaled to the largest count.

@@ -20,10 +20,13 @@ constexpr int kBlockThreads = kWarpsPerBlock * 32;
 #endif
 
 __device__ __forceinline__ void chunk_scratch(uint8_t* scratch, uint32_t c, uint32_t chunk_size, SeqRec*& seqs,
-                                              uint8_t*& lits) {
+                                              uint8_t*& rep_code, uint8_t*& lits) {
   uint8_t* base = scratch + (size_t)c * scratch_bytes(chunk_size);
   seqs = reinterpret_cast<SeqRec*>(base);
-  lits = base + ((sizeof(SeqRec) * max_sequences(chunk_size) + 15) & ~(size_t)15);
+  size_t seqs_bytes = (sizeof(SeqRec) * max_sequences(chunk_size) + 15) & ~(size_t)15;
+  size_t rep_bytes = (max_sequences(chunk_size) + 15) & ~(size_t)15;
+  rep_code = base + seqs_bytes;
+  lits = base + seqs_bytes + rep_bytes;
 }
 
 // ---------------------------------------------------------------------------
@@ -67,11 +70,13 @@ parse_hist_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, 
   }
 
   SeqRec* seqs;
+  uint8_t* rep_code;
   uint8_t* lits;
-  chunk_scratch(scratch, c, chunk_size, seqs, lits);
+  chunk_scratch(scratch, c, chunk_size, seqs, rep_code, lits);
   SeqEmitter em{chunk_in, seqs, lits};
   lz_parse_warp(chunk_in, in_len, htab, hash_bits, em);
-  accumulate_hist(seqs, em.n_seq, lits, em.n_lit, batch_cnt);
+  compute_repeat_codes(seqs, em.n_seq, rep_code);
+  accumulate_hist(seqs, em.n_seq, rep_code, lits, em.n_lit, batch_cnt);
   if (lane == 0) {
     n_seq_arr[c] = em.n_seq;
     n_lit_arr[c] = em.n_lit;
@@ -103,8 +108,9 @@ rans_encode_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count,
   const uint8_t* chunk_in = in + (size_t)c * chunk_size;
   uint8_t* slot = out + (size_t)c * out_slot_stride;
   SeqRec* seqs;
+  uint8_t* rep_code;
   uint8_t* lits;
-  chunk_scratch(scratch, c, chunk_size, seqs, lits);
+  chunk_scratch(scratch, c, chunk_size, seqs, rep_code, lits);
   uint32_t n_seq = n_seq_arr[c], n_lit = n_lit_arr[c];
 
   uint32_t tok_total = 0;
@@ -117,7 +123,8 @@ rans_encode_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count,
   bool ok = false;
   uint32_t start = 0, size = 0;
   if (in_len > (uint32_t)kRansHeaderBytes + 1) {
-    ok = rans_encode_warp(seqs, n_seq, lits, n_lit, freq, cum, slot, out_slot_stride, in_len, &start, &size);
+    ok = rans_encode_warp(seqs, n_seq, rep_code, lits, n_lit, freq, cum, slot, out_slot_stride, in_len, &start,
+                          &size);
     if (ok && 1 + tok_total < size) ok = false;
   }
   if (!ok) {
@@ -174,8 +181,9 @@ decompress_kernel(const uint8_t* in, const uint32_t* in_offsets, uint32_t chunk_
       ok = lz_decode_warp(slot + 1, len - 1, chunk_out, orig);
     } else if (flag == ChunkFlag::LzRans) {
       SeqRec* seqs;
+      uint8_t* rep_code;
       uint8_t* lits;
-      chunk_scratch(scratch, c, chunk_size, seqs, lits);
+      chunk_scratch(scratch, c, chunk_size, seqs, rep_code, lits); // rep_code unused: decode keeps its state in registers
       uint32_t n_seq = 0, n_lit = 0;
       const RansGroupTable& gt = group_tables[group_id[c]];
       ok = rans_decode_warp(slot + 1, len - 1, gt, seqs, max_sequences(chunk_size), lits, chunk_size, &n_seq,
