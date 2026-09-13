@@ -9,17 +9,20 @@
 // 16-bit words each step moves at most one word per lane, which is what
 // keeps the encoder's and decoder's step-by-step word counts identical.
 //
-// The frequency table is NOT part of the per-chunk payload: it is shared
-// by every chunk in the same TableGroup (see format.h), expanded once
-// (RansGroupTable, built by expand_group_table_warp) and referenced from
-// global memory by every chunk's decode. This removes the ~490-byte/chunk
-// table overhead the earlier per-chunk-table design paid, and also means
-// decode no longer rebuilds a table per chunk.
+// The frequency tables are NOT part of the per-chunk payload: they are
+// shared by every chunk in the same TableGroup (see format.h), expanded
+// once (expand_group_table, into the layout table_view() describes) and
+// referenced from global memory by every chunk's decode. This removes the
+// per-chunk table overhead an earlier design paid, and also means decode
+// never rebuilds a table per chunk.
 //
 // Payload layout (ChunkFlag::LzRans, after the flag byte):
 //   u32 n_seq, u32 n_lit, u32 state[32], u16 words[]
-// Decode order: sequence groups of 32 (sub-steps ll_code, ll_bits,
-// ml_code, ml_bits, off_code, off_bits), then literal groups of 32.
+// Decode order: sequence groups of 32, lane j owning sequence 32g+j
+// (sub-steps ll_code, ll_bits, ml_code, ml_bits, off_code, off_bits), then
+// the literals, lane j owning one contiguous run of lit_run_len(n_lit) of
+// them so that each literal's context -- the previous literal of its run,
+// see rans_codes.h -- is already decoded in that lane's registers.
 //
 // Offset codes reuse one of the last 3 distinct match offsets (see
 // kOffRepBase, rans_codes.h) when possible, zstd-style, instead of always
@@ -42,11 +45,6 @@
 
 namespace gzp {
 
-constexpr int kLitBase = 0;
-constexpr int kLlBase = kLitSyms;
-constexpr int kMlBase = kLitSyms + kSmallSyms;
-constexpr int kOffBase = kLitSyms + 2 * kSmallSyms;
-
 // Coarse index for the 32-symbol alphabets: lut[i] is the largest symbol s
 // with cum[s] <= i * (kProbScale >> kSmallLutBits), i.e. a lower bound on
 // the true answer for any slot in that bucket. A short forward scan from
@@ -56,9 +54,9 @@ constexpr int kOffBase = kLitSyms + 2 * kSmallSyms;
 constexpr int kSmallLutBits = 7;
 constexpr int kSmallLutSize = 1 << kSmallLutBits;
 
+// Called by every thread of the block; entries are split across threads.
 __device__ __forceinline__ void build_small_lut(const uint16_t* cum, uint8_t* lut) {
-  int lane = threadIdx.x & 31;
-  for (int i = lane; i < kSmallLutSize; i += 32) {
+  for (int i = threadIdx.x; i < kSmallLutSize; i += blockDim.x) {
     uint32_t target = (uint32_t)i << (kProbBits - kSmallLutBits);
     uint32_t s = 0;
     for (uint32_t k = 1; k < (uint32_t)kSmallSyms; ++k) {
@@ -68,59 +66,93 @@ __device__ __forceinline__ void build_small_lut(const uint16_t* cum, uint8_t* lu
   }
 }
 
-// One table, shared by every chunk in a TableGroup. Built once per group
-// (expand_group_table_warp), then read (never written) by every chunk's
-// decode, straight out of global memory — small enough that L2 keeps a
-// hot group cached across the many chunks that reference it.
-struct RansGroupTable {
-  uint8_t sym[kProbScale]; // literal alphabet slot -> symbol
-  uint16_t freq[kQuantBytes];
-  uint16_t cum[kQuantBytes];
-  uint8_t ll_lut[kSmallLutSize];
-  uint8_t ml_lut[kSmallLutSize];
-  uint8_t off_lut[kSmallLutSize];
+// One group's decode tables, shared by every chunk in a TableGroup. Built
+// once per group (expand_group_table), then read (never written) by every
+// chunk's decode straight out of global memory. The size depends on the
+// file's literal context count (group_table_bytes); table_view() finds the
+// parts within one group's region:
+//   sym[n_ctx][kProbScale]   literal slot -> symbol, per context
+//   freq, cum[quant_bytes(n_ctx)]   indexed like the quantised counts
+//   ll_lut, ml_lut, off_lut[kSmallLutSize]
+// At 256 contexts that is ~1.2MB per group, which L2 (32MB here) holds for
+// the few groups a decode batch touches.
+struct RansTableView {
+  uint8_t* sym;
+  uint16_t* freq;
+  uint16_t* cum;
+  uint8_t* ll_lut;
+  uint8_t* ml_lut;
+  uint8_t* off_lut;
 };
+
+__host__ __device__ inline size_t align16(size_t v) { return (v + 15) & ~(size_t)15; }
+__host__ __device__ inline size_t group_table_bytes(int n_ctx) {
+  size_t sym = align16((size_t)n_ctx << kProbBits);
+  size_t fc = align16(sizeof(uint16_t) * (size_t)quant_bytes(n_ctx));
+  return sym + 2 * fc + align16(3 * kSmallLutSize);
+}
+__device__ __forceinline__ RansTableView table_view(uint8_t* base, int n_ctx) {
+  size_t sym = align16((size_t)n_ctx << kProbBits);
+  size_t fc = align16(sizeof(uint16_t) * (size_t)quant_bytes(n_ctx));
+  RansTableView v;
+  v.sym = base;
+  v.freq = reinterpret_cast<uint16_t*>(base + sym);
+  v.cum = reinterpret_cast<uint16_t*>(base + sym + fc);
+  v.ll_lut = base + sym + 2 * fc;
+  v.ml_lut = v.ll_lut + kSmallLutSize;
+  v.off_lut = v.ml_lut + kSmallLutSize;
+  return v;
+}
+
+// Quantises+normalises table t of n_ctx + 3 (the literal contexts, then the
+// three small alphabets): row base and size in the shared layout.
+__device__ __forceinline__ void table_row(int t, int n_ctx, int& base, int& k) {
+  if (t < n_ctx) {
+    base = lit_entry((uint32_t)t, 0);
+    k = kLitSyms;
+  } else {
+    base = (t - n_ctx) * kSmallSyms; // kLlBase, kMlBase, kOffBase
+    k = kSmallSyms;
+  }
+}
 
 // Quantises a batch-wide histogram (as accumulated by accumulate_hist) into
 // the q[] bytes stored in the file for this TableGroup, and expands them
-// into freq/cum for the encoder to use directly. One warp, called once per
-// batch (not once per chunk).
-__device__ inline void build_batch_table_warp(const uint32_t* cnt, uint8_t* q_out, uint16_t* freq, uint16_t* cum) {
-  int lane = threadIdx.x & 31;
-  if (lane == 0) {
-    quantize_counts(cnt + kLitBase, kLitSyms, q_out + kLitBase);
-    normalize_table(q_out + kLitBase, kLitSyms, freq + kLitBase, cum + kLitBase);
-    for (int base : {kLlBase, kMlBase, kOffBase}) {
-      quantize_counts(cnt + base, kSmallSyms, q_out + base);
-      normalize_table(q_out + base, kSmallSyms, freq + base, cum + base);
-    }
+// into freq/cum for the encoder to use directly. One block, called once
+// per batch; each thread handles whole tables (up to 259 of them).
+__device__ inline void build_batch_table(const uint32_t* cnt, int n_ctx, uint8_t* q_out, uint16_t* freq,
+                                         uint16_t* cum) {
+  for (int t = threadIdx.x; t < n_ctx + 3; t += blockDim.x) {
+    int base, k;
+    table_row(t, n_ctx, base, k);
+    quantize_counts(cnt + base, k, q_out + base);
+    normalize_table(q_out + base, k, freq + base, cum + base);
   }
-  __syncwarp();
 }
 
-// Expands one group's quantised bytes into a full RansGroupTable. Callers
-// must zero-initialize `t` first (or otherwise ensure it starts zeroed):
-// a group with no LzRans chunks has an all-zero q[] and normalize_table
-// leaves freq/cum untouched on that path, which is fine as long as `t`
-// started zeroed and nothing ever decodes against it (guaranteed: a chunk
-// only gets ChunkFlag::LzRans if its group's histogram was non-empty).
-__device__ inline void expand_group_table_warp(const uint8_t* q, RansGroupTable& t) {
-  int lane = threadIdx.x & 31;
-  if (lane == 0) {
-    normalize_table(q + kLitBase, kLitSyms, t.freq + kLitBase, t.cum + kLitBase);
-    for (int base : {kLlBase, kMlBase, kOffBase}) {
-      normalize_table(q + base, kSmallSyms, t.freq + base, t.cum + base);
-    }
+// Expands one group's quantised bytes into its decode tables. One block
+// per group. Callers must zero the region first: a table whose counts are
+// all zero (a context no literal used, or a group with no LzRans chunks)
+// leaves freq/cum/sym untouched, which is fine as long as they started
+// zeroed -- a zero frequency is then what flags a corrupt chunk that
+// decodes against one.
+__device__ inline void expand_group_table(const uint8_t* q, int n_ctx, uint8_t* region) {
+  RansTableView v = table_view(region, n_ctx);
+  for (int t = threadIdx.x; t < n_ctx + 3; t += blockDim.x) {
+    int base, k;
+    table_row(t, n_ctx, base, k);
+    normalize_table(q + base, k, v.freq + base, v.cum + base);
   }
-  __syncwarp();
-  for (int s = lane; s < kLitSyms; s += 32) {
-    uint32_t f = t.freq[kLitBase + s], c = t.cum[kLitBase + s];
-    for (uint32_t k = 0; k < f; ++k) t.sym[c + k] = (uint8_t)s;
+  __syncthreads();
+  for (int i = threadIdx.x; i < n_ctx * kLitSyms; i += blockDim.x) {
+    uint32_t ctx = (uint32_t)i / kLitSyms, s = (uint32_t)i % kLitSyms;
+    uint32_t f = v.freq[kLitBase + i], c = v.cum[kLitBase + i];
+    uint8_t* row = v.sym + ((size_t)ctx << kProbBits);
+    for (uint32_t k = 0; k < f; ++k) row[c + k] = (uint8_t)s;
   }
-  build_small_lut(t.cum + kLlBase, t.ll_lut);
-  build_small_lut(t.cum + kMlBase, t.ml_lut);
-  build_small_lut(t.cum + kOffBase, t.off_lut);
-  __syncwarp();
+  build_small_lut(v.cum + kLlBase, v.ll_lut);
+  build_small_lut(v.cum + kMlBase, v.ml_lut);
+  build_small_lut(v.cum + kOffBase, v.off_lut);
 }
 
 __device__ __forceinline__ unsigned lanemask_lt() {
@@ -187,16 +219,26 @@ __device__ inline void compute_repeat_codes(const SeqRec* seqs, uint32_t n_seq, 
   __syncwarp();
 }
 
-// Adds one chunk's symbol counts into a batch-wide histogram (kQuantBytes
-// entries, indexed like everything else by kLitBase/kLlBase/kMlBase/
-// kOffBase) via atomics, so every chunk in a host batch can contribute to
+// Adds one chunk's symbol counts into a batch-wide histogram
+// (quant_bytes(lit_ctx_count(lit_shift)) entries, in the layout of
+// rans_codes.h) via atomics, so every chunk in a host batch can contribute to
 // one shared table. Call once per chunk, all lanes, after that chunk's LZ
 // parse has filled `seqs`/`lits` and compute_repeat_codes has filled
 // `rep_code`.
 __device__ inline void accumulate_hist(const SeqRec* seqs, uint32_t n_seq, const uint8_t* rep_code,
-                                       const uint8_t* lits, uint32_t n_lit, uint32_t* batch_cnt) {
+                                       const uint8_t* lits, uint32_t n_lit, uint32_t lit_shift,
+                                       uint32_t* batch_cnt) {
   int lane = threadIdx.x & 31;
-  for (uint32_t i = lane; i < n_lit; i += 32) atomicAdd(&batch_cnt[kLitBase + lits[i]], 1u);
+  // Literals: each lane walks its own run in order, with the same context
+  // rule the encoder and decoders use (see lit_run_len, rans_codes.h).
+  uint32_t run_len = lit_run_len(n_lit);
+  uint32_t run0 = lane * run_len, run_end = min(n_lit, run0 + run_len);
+  uint32_t prev = 0;
+  for (uint32_t i = run0; i < run_end; ++i) {
+    uint32_t sym = lits[i];
+    atomicAdd(&batch_cnt[lit_entry(lit_ctx(prev, lit_shift), sym)], 1u);
+    prev = sym;
+  }
   for (uint32_t i = lane; i < n_seq; i += 32) {
     SeqRec r = seqs[i];
     uint32_t c, nb, b;
@@ -280,17 +322,18 @@ __device__ __forceinline__ bool rans_enc_bits(uint32_t& x, bool active, uint32_t
   return rans_enc_bits16(x, active, hi_nb, bits >> 16, wp, wlimit);
 }
 
-// Encodes a chunk already parsed into `seqs`/`lits` against a table shared
-// by its whole batch (freq/cum, kQuantBytes entries, indexed by
-// kLitBase/kLlBase/kMlBase/kOffBase as usual). `rep_code` is
+// Encodes a chunk already parsed into `seqs`/`lits` against tables shared
+// by its whole batch (freq/cum, in the layout of rans_codes.h, with
+// lit_ctx_count(lit_shift) literal contexts). `rep_code` is
 // compute_repeat_codes()'s output for these same `seqs`. Words are written
 // backward from the end of the slot and the header is placed right before
 // them, so the payload starts at *out_start within the slot. The caller
 // guarantees in_len > kRansHeaderBytes + 1.
 __device__ inline bool rans_encode_warp(const SeqRec* seqs, uint32_t n_seq, const uint8_t* rep_code,
-                                        const uint8_t* lits, uint32_t n_lit, const uint16_t* freq,
-                                        const uint16_t* cum, uint8_t* slot, uint32_t slot_stride, uint32_t in_len,
-                                        uint32_t* out_start, uint32_t* out_size) {
+                                        const uint8_t* lits, uint32_t n_lit, uint32_t lit_shift,
+                                        const uint16_t* freq, const uint16_t* cum, uint8_t* slot,
+                                        uint32_t slot_stride, uint32_t in_len, uint32_t* out_start,
+                                        uint32_t* out_size) {
   int lane = threadIdx.x & 31;
 
   // The whole payload must not beat raw storage, so the stream may use at
@@ -308,11 +351,15 @@ __device__ inline bool rans_encode_warp(const SeqRec* seqs, uint32_t n_seq, cons
   for (uint32_t i = lane; i < n_seq; i += 32) too_long |= seqs[i].lit_len() > kMaxLenValue;
   if (__any_sync(kFullMask, too_long)) return false;
 
-  for (int g = (int)((n_lit + 31) / 32) - 1; g >= 0; --g) {
-    uint32_t idx = g * 32 + lane;
+  // Literals, last step first; lane j owns the run starting at j * run_len
+  // and codes each literal in the context of the one before it in that run.
+  uint32_t run_len = lit_run_len(n_lit);
+  for (int t = (int)run_len - 1; t >= 0; --t) {
+    uint32_t idx = lane * run_len + (uint32_t)t;
     bool act = idx < n_lit;
-    uint32_t s = act ? lits[idx] : 0;
-    if (!rans_enc_put(x, act, freq[kLitBase + s], cum[kLitBase + s], wp, wlimit)) return false;
+    uint32_t e = 0;
+    if (act) e = lit_entry(lit_ctx(t ? lits[idx - 1] : 0, lit_shift), lits[idx]);
+    if (!rans_enc_put(x, act, freq[e], cum[e], wp, wlimit)) return false;
   }
   for (int g = (int)((n_seq + 31) / 32) - 1; g >= 0; --g) {
     uint32_t idx = g * 32 + lane;
@@ -369,10 +416,16 @@ __device__ __forceinline__ bool rans_dec_renorm(uint32_t& x, bool active, const 
   return true;
 }
 
-__device__ __forceinline__ uint32_t rans_dec_lit(uint32_t& x, const RansGroupTable& t) {
+// Decodes one literal in context ctx. Sets `bad` if the table entry it
+// lands on has zero frequency, which a valid stream never produces (an
+// unused context's sym row is all zeros, and so is its symbol 0's freq).
+__device__ __forceinline__ uint32_t rans_dec_lit(uint32_t& x, const RansTableView& t, uint32_t ctx, bool& bad) {
   uint32_t slot = x & (kProbScale - 1);
-  uint32_t s = t.sym[slot];
-  x = t.freq[kLitBase + s] * (x >> kProbBits) + slot - t.cum[kLitBase + s];
+  uint32_t s = t.sym[(ctx << kProbBits) + slot];
+  int e = lit_entry(ctx, s);
+  uint32_t f = t.freq[e];
+  bad |= f == 0;
+  x = f * (x >> kProbBits) + slot - t.cum[e];
   return s;
 }
 
@@ -426,9 +479,9 @@ __device__ __forceinline__ bool rans_dec_bits(uint32_t& x, bool active, uint32_t
 // already-expanded group table `t`. Rejects any malformed input (empty
 // tables in use, truncated or over-long streams) without touching memory
 // beyond the scratch bounds.
-__device__ inline bool rans_decode_warp(const uint8_t* payload, uint32_t len, const RansGroupTable& t, SeqRec* seqs,
-                                        uint32_t max_seq, uint8_t* lits, uint32_t max_lit, uint32_t* n_seq_out,
-                                        uint32_t* n_lit_out) {
+__device__ inline bool rans_decode_warp(const uint8_t* payload, uint32_t len, const RansTableView& t,
+                                        uint32_t lit_shift, SeqRec* seqs, uint32_t max_seq, uint8_t* lits,
+                                        uint32_t max_lit, uint32_t* n_seq_out, uint32_t* n_lit_out) {
   int lane = threadIdx.x & 31;
   if (len < (uint32_t)kRansHeaderBytes) return false;
   uint32_t n_seq = load_u32(payload), n_lit = load_u32(payload + 4);
@@ -521,15 +574,30 @@ __device__ inline bool rans_decode_warp(const uint8_t* payload, uint32_t len, co
     if (__any_sync(kFullMask, bad)) return false;
   }
 
-  for (uint32_t g = 0; g < (n_lit + 31) / 32; ++g) {
-    uint32_t idx = g * 32 + lane;
+  // Literals: lane j decodes its own run in order (see lit_run_len), the
+  // previous literal of the run giving the context. Runs start 4-byte
+  // aligned, so each lane packs 4 literals and stores them as one word.
+  uint32_t run_len = lit_run_len(n_lit);
+  uint32_t run0 = lane * run_len;
+  uint32_t prev = 0, pack = 0;
+  for (uint32_t k = 0; k < run_len; ++k) {
+    uint32_t idx = run0 + k;
     bool act = idx < n_lit;
     if (act) {
-      uint32_t s = rans_dec_lit(x, t);
-      bad |= t.freq[kLitBase + s] == 0;
-      lits[idx] = (uint8_t)s;
+      uint32_t s = rans_dec_lit(x, t, lit_ctx(prev, lit_shift), bad);
+      prev = s;
+      pack |= s << (8 * (k & 3));
+      if ((k & 3) == 3) {
+        *reinterpret_cast<uint32_t*>(lits + idx - 3) = pack;
+        pack = 0;
+      }
     }
     if (!rans_dec_renorm(x, act, rp, rend)) return false;
+  }
+  if (run0 < n_lit) {
+    uint32_t run_end = min(n_lit, run0 + run_len);
+    uint32_t rem = (run_end - run0) & 3;
+    for (uint32_t k = 0; k < rem; ++k) lits[run_end - rem + k] = (uint8_t)(pack >> (8 * k));
   }
   if (__any_sync(kFullMask, bad)) return false;
   if (rp != rend) return false;

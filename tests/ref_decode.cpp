@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 #include <string>
 
@@ -35,25 +36,36 @@ struct Seq {
 // word take one in lane order, so visiting lanes 0..31 within each
 // sub-step, reading a word whenever that lane needs one, consumes the
 // stream identically.
+// One TableGroup's tables, expanded from its quantised counts: the three
+// small alphabets, then one literal table per context (layout in
+// rans_codes.h).
+struct Tables {
+  int n_ctx = 1;
+  std::vector<uint16_t> freq, cum;
+  std::vector<uint8_t> sym; // n_ctx * kProbScale, literal slot -> symbol per context
+
+  Tables(const uint8_t* q, int nctx) : n_ctx(nctx), freq(quant_bytes(nctx), 0), cum(quant_bytes(nctx), 0),
+      sym((size_t)nctx * kProbScale, 0) {
+    for (int base : {kLlBase, kMlBase, kOffBase}) normalize_table(q + base, kSmallSyms, &freq[base], &cum[base]);
+    for (int c = 0; c < n_ctx; ++c) {
+      int base = lit_entry(c, 0);
+      normalize_table(q + base, kLitSyms, &freq[base], &cum[base]);
+      for (int s = 0; s < kLitSyms; ++s) {
+        for (uint32_t k = 0; k < freq[base + s]; ++k) sym[(size_t)c * kProbScale + cum[base + s] + k] = (uint8_t)s;
+      }
+    }
+  }
+};
+
 struct RansDecoder {
   const uint8_t* p;
   size_t len, rp;
   uint32_t x[32];
-  uint16_t freq[kQuantBytes], cum[kQuantBytes];
-  std::vector<uint8_t> sym;
+  const Tables& t;
   bool bad = false;
 
-  static constexpr int kLit = 0, kLl = kLitSyms, kMl = kLitSyms + kSmallSyms, kOff = kLitSyms + 2 * kSmallSyms;
-
-  // `q` is this chunk's TableGroup's quantised bytes (shared by every
-  // chunk in the group, not stored in the per-chunk payload anymore).
-  RansDecoder(const uint8_t* payload, size_t n, const uint8_t* q) : p(payload), len(n), rp(kRansHeaderBytes),
-      sym(kProbScale, 0) {
-    normalize_table(q + kLit, kLitSyms, freq + kLit, cum + kLit);
-    for (int base : {kLl, kMl, kOff}) normalize_table(q + base, kSmallSyms, freq + base, cum + base);
-    for (int s = 0; s < kLitSyms; ++s) {
-      for (uint32_t k = 0; k < freq[kLit + s]; ++k) sym[cum[kLit + s] + k] = (uint8_t)s;
-    }
+  RansDecoder(const uint8_t* payload, size_t n, const Tables& tables) : p(payload), len(n), rp(kRansHeaderBytes),
+      t(tables) {
     for (int l = 0; l < 32; ++l) x[l] = load_u32(p + 8 + 4 * l);
   }
 
@@ -67,21 +79,32 @@ struct RansDecoder {
       rp += 2;
     }
   }
+  // Decodes one symbol for lane l from a small alphabet at `base`, then
+  // renormalises that lane.
   uint32_t get(int l, int base, int k) {
     uint32_t slot = x[l] & (kProbScale - 1);
-    uint32_t s;
-    if (base == kLit) {
-      s = sym[slot];
-    } else {
-      s = 0;
-      for (int i = 0; i < k; ++i) {
-        if (cum[base + i] <= slot) s = i;
-      }
+    uint32_t s = 0;
+    for (int i = 0; i < k; ++i) {
+      if (t.cum[base + i] <= slot) s = i;
     }
-    if (freq[base + s] == 0) bad = true;
-    x[l] = freq[base + s] * (x[l] >> kProbBits) + slot - cum[base + s];
-    renorm(l);
+    step(l, base + (int)s, slot);
     return s;
+  }
+  // Decodes one literal for lane l in context ctx.
+  uint32_t get_lit(int l, uint32_t ctx) {
+    if ((int)ctx >= t.n_ctx) {
+      bad = true;
+      return 0;
+    }
+    uint32_t slot = x[l] & (kProbScale - 1);
+    uint32_t s = t.sym[(size_t)ctx * kProbScale + slot];
+    step(l, lit_entry(ctx, s), slot);
+    return s;
+  }
+  void step(int l, int e, uint32_t slot) {
+    if (t.freq[e] == 0) bad = true;
+    x[l] = t.freq[e] * (x[l] >> kProbBits) + slot - t.cum[e];
+    renorm(l);
   }
   // Mirrors the GPU's rans_dec_bits16 exactly: extracts at most 16 bits
   // for lane l (0 if !on), then renorms -- but renorm's word-need check
@@ -134,11 +157,11 @@ void bits_pass(RansDecoder& d, bool active[32], const uint32_t nb[32], uint32_t 
 }
 
 bool decode_lzrans(const uint8_t* in, size_t in_len, uint8_t* out, size_t orig, uint32_t chunk_size,
-                   const uint8_t* group_q) {
+                   const Tables& tables, uint32_t lit_shift) {
   if (in_len < (size_t)kRansHeaderBytes) return false;
   uint32_t n_seq = load_u32(in), n_lit = load_u32(in + 4);
   if (n_seq > chunk_size / kMinMatch + 1 || n_lit > chunk_size) return false;
-  RansDecoder d(in, in_len, group_q);
+  RansDecoder d(in, in_len, tables);
   std::vector<Seq> seqs(n_seq);
   std::vector<uint8_t> lits(n_lit);
   uint32_t llc[32], mlc[32], oc[32], llb[32], mlb[32], ob[32], ml[32], nb[32], off[32];
@@ -153,10 +176,10 @@ bool decode_lzrans(const uint8_t* in, size_t in_len, uint8_t* out, size_t orig, 
 
   for (uint32_t g = 0; g < (n_seq + 31) / 32; ++g) {
     for (int l = 0; l < 32; ++l) active[l] = g * 32 + l < n_seq;
-    for (int l = 0; l < 32; ++l) if (active[l]) llc[l] = d.get(l, RansDecoder::kLl, kSmallSyms);
+    for (int l = 0; l < 32; ++l) if (active[l]) llc[l] = d.get(l, kLlBase, kSmallSyms);
     for (int l = 0; l < 32; ++l) nb[l] = active[l] ? len_nb(llc[l]) : 0;
     bits_pass(d, active, nb, llb);
-    for (int l = 0; l < 32; ++l) if (active[l]) mlc[l] = d.get(l, RansDecoder::kMl, kSmallSyms);
+    for (int l = 0; l < 32; ++l) if (active[l]) mlc[l] = d.get(l, kMlBase, kSmallSyms);
     for (int l = 0; l < 32; ++l) nb[l] = active[l] ? len_nb(mlc[l]) : 0;
     bits_pass(d, active, nb, mlb);
     for (int l = 0; l < 32; ++l) {
@@ -165,7 +188,7 @@ bool decode_lzrans(const uint8_t* in, size_t in_len, uint8_t* out, size_t orig, 
       ml[l] = v ? v + (kMinMatch - 1) : 0;
     }
     for (int l = 0; l < 32; ++l) has_off[l] = active[l] && ml[l] != 0;
-    for (int l = 0; l < 32; ++l) if (has_off[l]) oc[l] = d.get(l, RansDecoder::kOff, kSmallSyms);
+    for (int l = 0; l < 32; ++l) if (has_off[l]) oc[l] = d.get(l, kOffBase, kSmallSyms);
     for (int l = 0; l < 32; ++l) nb[l] = has_off[l] ? off_nb(oc[l]) : 0;
     bits_pass(d, has_off, nb, ob);
     for (int l = 0; l < 32; ++l) {
@@ -200,10 +223,18 @@ bool decode_lzrans(const uint8_t* in, size_t in_len, uint8_t* out, size_t orig, 
     }
     if (d.bad) return false;
   }
-  for (uint32_t g = 0; g < (n_lit + 31) / 32; ++g) {
+  // Literals: lane l owns the run [l*L, (l+1)*L) and codes each literal in
+  // the context of the previous one in its run (the first in context 0);
+  // every step visits lanes 0..31 in order, as the GPU's ballot does.
+  uint32_t run_len = lit_run_len(n_lit);
+  uint32_t prev[32] = {};
+  for (uint32_t k = 0; k < run_len; ++k) {
     for (int l = 0; l < 32; ++l) {
-      uint32_t idx = g * 32 + l;
-      if (idx < n_lit) lits[idx] = (uint8_t)d.get(l, RansDecoder::kLit, kLitSyms);
+      uint32_t idx = (uint32_t)l * run_len + k;
+      if (idx >= n_lit) continue;
+      uint32_t s = d.get_lit(l, lit_ctx(prev[l], lit_shift));
+      lits[idx] = (uint8_t)s;
+      prev[l] = s;
     }
   }
   if (d.bad || d.rp != in_len) return false;
@@ -287,6 +318,19 @@ int main(int argc, char** argv) {
       std::fread(groups.data(), sizeof(TableGroup), h.table_group_count, in) != h.table_group_count) {
     fail("truncated table group directory");
   }
+  long payload_start = std::ftell(in);
+  // The table section: each group's quantised counts, in group order, at
+  // tables_offset (after the payload). Each group has its own
+  // literal-context rule and so its own size.
+  std::vector<Tables> tables;
+  tables.reserve(h.table_group_count);
+  if (std::fseek(in, (long)h.tables_offset, SEEK_SET) != 0) fail("bad tables_offset");
+  for (const TableGroup& g : groups) {
+    if (!lit_shift_valid(g.lit_ctx_shift)) fail("bad lit_ctx_shift");
+    std::vector<uint8_t> q(group_quant_bytes(g));
+    if (std::fread(q.data(), 1, q.size(), in) != q.size()) fail("truncated table section");
+    tables.emplace_back(q.data(), lit_ctx_count(g.lit_ctx_shift));
+  }
   // Every chunk's group, found independently of any GPU-side batching:
   // this is exactly the directory-coverage logic the file format promises,
   // read straight off disk with no runtime batch size involved at all.
@@ -301,8 +345,6 @@ int main(int argc, char** argv) {
     }
     if (covered != h.chunk_count) fail("corrupt table group directory: doesn't cover all chunks");
   }
-
-  long payload_start = std::ftell(in);
 
   std::vector<uint8_t> cbuf, obuf(h.chunk_size);
   uint64_t produced = 0;
@@ -324,7 +366,7 @@ int main(int argc, char** argv) {
         break;
       case ChunkFlag::LzRans:
         ok = decode_lzrans(cbuf.data() + 1, e.compressed_size - 1, obuf.data(), e.original_size, h.chunk_size,
-                           groups[chunk_group[c]].q);
+                           tables[chunk_group[c]], groups[chunk_group[c]].lit_ctx_shift);
         break;
       default:
         break;

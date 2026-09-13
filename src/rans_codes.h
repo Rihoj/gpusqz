@@ -3,7 +3,8 @@
 // derive bit-identical tables from the same quantised counts.
 //
 // Alphabets (zstd-style, so tables stay small):
-//   literal      byte value, 256 symbols
+//   literal      byte value, 256 symbols, coded with one of lit_ctx_count()
+//                tables chosen by the previous literal (see lit_ctx below)
 //   lit_len v    v < 16: code v, no extra bits
 //                else:   code 12 + floor(log2 v), floor(log2 v) extra bits
 //   match_len    same coding of v = ml - (kMinMatch - 1) (v = 0 marks a
@@ -39,7 +40,6 @@ static_assert(kOffRepBase > 20, "repeat-offset codes must exceed any real off_co
 // 255-extension lengths are unbounded); see rans_encode_warp.
 constexpr uint32_t kMaxLenValue = (1u << (kSmallSyms - 12)) - 1;
 constexpr int kRansStates = 32;
-constexpr int kQuantBytes = kLitSyms + 3 * kSmallSyms;
 // Payload header after the chunk flag: n_seq, n_lit, states. The quantised
 // tables live once per table group (see format.h's TableGroup), not per
 // chunk, so they are not part of this per-chunk header.
@@ -50,6 +50,46 @@ constexpr int kRansHeaderBytes = 8 + kRansStates * 4;
 #else
 #define GZP_HD inline
 #endif
+
+// ---- Order-1 literal contexts ----
+//
+// Literals are coded with one of lit_ctx_count(shift) tables, chosen by the
+// previous literal in the same lane's run: ctx = prev >> shift, so shift 8
+// is plain order-0 (one table), 4 keys on the previous byte's high nibble
+// (16 tables) and 0 on the whole previous byte (256 tables). Each table
+// group (one compression batch) picks its own shift: the compressor always
+// collects the full order-1 histogram, then keeps whichever rule minimises
+// the estimated coded size plus 256 table bytes per context (see
+// build_table_kernel), so incompressible or literal-poor batches don't pay
+// for tables they can't use.
+//
+// For the previous literal to be known to the decoder, each of the 32
+// rANS lanes owns one contiguous run of the chunk's literal stream, not
+// every 32nd literal: lane j owns literals [j*L, min((j+1)*L, n_lit)) with
+// L = lit_run_len(n_lit), and the first literal of every run uses context
+// 0. L is a multiple of 4 so every run starts 4-byte aligned, which lets
+// the decoder store 4 literals at a time. The histogram, the encoder and
+// both decoders all derive contexts from exactly this rule; a mismatch
+// would code a literal with a zero-frequency table entry.
+constexpr uint32_t kLitShiftOrder0 = 8, kLitShiftNibble = 4, kLitShiftByte = 0;
+GZP_HD bool lit_shift_valid(uint32_t shift) {
+  return shift == kLitShiftOrder0 || shift == kLitShiftNibble || shift == kLitShiftByte;
+}
+GZP_HD int lit_ctx_count(uint32_t shift) { return 256 >> shift; }
+GZP_HD uint32_t lit_ctx(uint32_t prev, uint32_t shift) { return prev >> shift; }
+GZP_HD uint32_t lit_run_len(uint32_t n_lit) { return ((n_lit + 31) / 32 + 3) & ~3u; }
+
+// Layout of every quantised-count / frequency array: the three small
+// alphabets first, then one 256-entry literal table per context, so the
+// number of contexts moves nothing else.
+constexpr int kLlBase = 0;
+constexpr int kMlBase = kSmallSyms;
+constexpr int kOffBase = 2 * kSmallSyms;
+constexpr int kLitBase = 3 * kSmallSyms;
+constexpr int kMaxLitCtx = 256;
+GZP_HD int lit_entry(uint32_t ctx, uint32_t sym) { return kLitBase + (int)(ctx * kLitSyms + sym); }
+GZP_HD int quant_bytes(int n_ctx) { return kLitBase + n_ctx * kLitSyms; }
+constexpr int kMaxQuantBytes = kLitBase + kMaxLitCtx * kLitSyms;
 
 GZP_HD uint32_t floor_log2(uint32_t v) { // v >= 1
 #if defined(__CUDA_ARCH__)
@@ -117,7 +157,10 @@ GZP_HD bool normalize_table(const uint8_t* q, int k, uint16_t* freq, uint16_t* c
   for (int s = 0; s < k; ++s) {
     uint32_t f = 0;
     if (q[s]) {
-      f = (uint32_t)(((uint64_t)q[s] << kProbBits) / total);
+      // Round to nearest: flooring biased every symbol low, e.g. a flat
+      // 256-symbol histogram (q of 254 or 255 each) came out as a noisy mix
+      // of 15s and 16s out of 4096, costing ~1% on such data.
+      f = (uint32_t)((((uint64_t)q[s] << kProbBits) + total / 2) / total);
       if (f < 1) f = 1;
     }
     freq[s] = (uint16_t)f;

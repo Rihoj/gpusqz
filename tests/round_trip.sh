@@ -37,6 +37,18 @@ make_case() {
     zero) head -c "$size" /dev/zero > "$f" ;;
     random) head -c "$size" /dev/urandom > "$f" ;;
     text) yes "the quick brown fox jumps over the lazy dog" | head -c "$size" > "$f" ;;
+    # Literal-heavy text: 64 symbols, no long repeats, so most of it reaches
+    # the literal coder (the `text` case above is almost all matches).
+    base64) head -c $((size * 3 / 4)) /dev/urandom | base64 -w 76 | head -c "$size" > "$f" ;;
+    # Real prose-like text with ordinary literal/match mix: this repo's own
+    # sources, repeated up to size.
+    source)
+      local here
+      here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+      while [ "$(stat -c%s "$f" 2>/dev/null || echo 0)" -lt "$size" ]; do
+        cat "$here"/src/* "$here"/tests/*.cpp "$here"/README.md >> "$f"
+      done
+      truncate -s "$size" "$f" ;;
     empty) : > "$f" ;;
   esac
   echo "$f"
@@ -132,6 +144,21 @@ run_profile_cases() {
   rm -f "$TMP/profile_both.gzp" "$TMP/profile_bogus.gzp"
 }
 
+# Exercises all three literal-context rules (GZP_FORCE_LIT_SHIFT, see
+# rans_codes.h) on literal-heavy inputs; the automatic choice depends on
+# file size, so small test files would otherwise only ever use order-0.
+run_lit_ctx_cases() {
+  local chunk="$1" sh b64 src
+  b64="$(make_case base64_3mb $((3 * 1024 * 1024)) base64)"
+  src="$(make_case source_2mb $((2 * 1024 * 1024)) source)"
+  for sh in 8 4 0; do
+    export GZP_FORCE_LIT_SHIFT="$sh"
+    run_case "$chunk" "base64_3mb_lit$sh" "$b64"
+    run_case "$chunk" "source_2mb_lit$sh" "$src"
+    unset GZP_FORCE_LIT_SHIFT
+  done
+}
+
 run_suite() {
   local chunk="$1"
   local sub=$((chunk > 100 ? chunk - 100 : (chunk > 1 ? chunk / 2 : 1)))
@@ -157,8 +184,12 @@ if [ "$EXTREMES" -eq 1 ]; then
   for chunk in 1 16 4096 8192 32768 65535 65536 1048575 1048576; do
     run_suite "$chunk"
   done
+  for chunk in 4096 65536 1048576; do
+    run_lit_ctx_cases "$chunk"
+  done
 else
   run_suite "${CHUNK:-8192}"
+  run_lit_ctx_cases "${CHUNK:-8192}"
   run_profile_cases
 fi
 
@@ -166,6 +197,13 @@ if [ "$EXTREMES" -eq 1 ]; then
   mismatch_file="$(make_case mismatch_batch_src $((5 * 1024 * 1024)) text)"
   run_case_mismatched_batch "small_enc_large_dec" "$mismatch_file" 64 4000
   run_case_mismatched_batch "large_enc_small_dec" "$mismatch_file" 4000 64
+  # Same, with 256 literal contexts on literal-heavy data, so the group
+  # lookup is exercised with the largest per-group tables.
+  mismatch_b64="$(make_case mismatch_b64_src $((5 * 1024 * 1024)) base64)"
+  export GZP_FORCE_LIT_SHIFT=0
+  run_case_mismatched_batch "b64_lit0_small_enc_large_dec" "$mismatch_b64" 16 4000
+  run_case_mismatched_batch "b64_lit0_large_enc_small_dec" "$mismatch_b64" 4000 16
+  unset GZP_FORCE_LIT_SHIFT
 
   # A De Bruijn sequence B(32,4) is exactly 2^20 bytes in which every 4-byte
   # string occurs once, so the LZ parse finds no match and a 1MB chunk is a

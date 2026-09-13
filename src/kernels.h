@@ -56,8 +56,8 @@ __host__ __device__ inline size_t hash_table_bytes(uint32_t chunk_size) {
 //
 // Compress also reuses the batch's scratch as the destination of the
 // output compaction (launch_compact's d_packed): scratch is dead once the
-// encode kernel has run, and it is always at least one output slot per
-// chunk (see scratch_holds_packed below).
+// encode kernel has run, and main.cu allocates it at least one output slot
+// per chunk (compress_scratch_bytes).
 constexpr size_t kSeqRecBytes = 8;
 __host__ __device__ inline size_t scratch_seqs_bytes(uint32_t chunk_size) {
   return (kSeqRecBytes * max_sequences(chunk_size) + 15) & ~(size_t)15;
@@ -72,15 +72,17 @@ __host__ __device__ inline size_t scratch_bytes(uint32_t chunk_size) {
   return scratch_lits_offset(chunk_size) + (((size_t)chunk_size + 15) & ~(size_t)15);
 }
 
-// Per-batch buffers for the LzRans pipeline, all sized independently of
-// chunk_size/chunk_count (kQuantBytes is a small fixed constant): the
-// running histogram, its expansion into freq/cum, and the quantised bytes
-// the host reads back to store in this batch's TableGroup.
+// Per-batch buffers for the LzRans pipeline, sized independently of
+// chunk_size/chunk_count: the running histogram, its expansion into
+// freq/cum, and the quantised bytes the host reads back to store in this
+// batch's TableGroup. Allocate kMaxQuantBytes entries each (rans_codes.h);
+// a batch uses quant_bytes(lit_ctx_count(*lit_shift)) of them.
 struct RansBatchBufs {
-  uint32_t* cnt;    // kQuantBytes, zeroed by the caller before parsing
-  uint16_t* freq;   // kQuantBytes
-  uint16_t* cum;    // kQuantBytes
-  uint8_t* q;       // kQuantBytes
+  uint32_t* cnt;       // zeroed by launch_compress before parsing
+  uint16_t* freq;
+  uint16_t* cum;
+  uint8_t* q;
+  uint32_t* lit_shift; // 1 entry: the literal-context rule this batch chose
   uint32_t* n_seq;  // batch-sized: valid sequence count per chunk's scratch
   uint32_t* n_lit;  // batch-sized: valid literal count per chunk's scratch
 };
@@ -95,35 +97,42 @@ struct RansBatchBufs {
 // living in d_scratch or shared memory).
 //
 // This is actually 3 kernel launches on `stream` (parse + histogram, build
-// the shared table, encode against it) rather than 1; d_rans is scratch
-// for that (see RansBatchBufs). Each chunk still individually falls back
-// to a plain LZ token stream (ChunkFlag::Lz) when that's smaller than the
-// rANS encoding, or to Raw storage when neither beats the input.
+// the shared tables, encode against them) rather than 1; d_rans is scratch
+// for that (see RansBatchBufs). The batch picks its own literal-context
+// rule (rans_codes.h) and reports it in *d_rans.lit_shift, unless
+// forced_lit_shift >= 0 forces one. Each chunk still individually falls
+// back to a plain LZ token stream (ChunkFlag::Lz) when that's smaller than
+// the rANS encoding, or to Raw storage when neither beats the input.
 void launch_compress(const uint8_t* d_in, uint32_t chunk_size, uint32_t chunk_count,
                       const uint32_t* d_in_lens, uint8_t* d_out, uint32_t out_slot_stride,
                       uint32_t* d_out_start, uint32_t* d_out_sizes, uint8_t* d_scratch, uint32_t* d_htab,
-                      const RansBatchBufs& d_rans, cudaStream_t stream);
+                      int forced_lit_shift, const RansBatchBufs& d_rans, cudaStream_t stream);
 
 // Chunk c's compressed data lives at d_in + d_in_offsets[c] with
 // d_in_lens[c] bytes; its output at d_out + c*chunk_size, d_out_lens[c]
-// bytes. LzRans chunks look up their table at d_group_tables[d_group_id[c]]
-// (already expanded by launch_expand_group_tables). *d_err (zeroed by the
-// caller) is set nonzero if any chunk is malformed.
+// bytes. LzRans chunks look up their tables in group g = d_group_id[c]'s
+// region at d_group_tables + d_group_off[g], expanded (by
+// launch_expand_group_tables) for its literal-context rule d_group_shift[g].
+// *d_err (zeroed by the caller) is set nonzero if any chunk is malformed.
 void launch_decompress(const uint8_t* d_in, const uint32_t* d_in_offsets, uint32_t chunk_count,
                         const uint32_t* d_in_lens, uint8_t* d_out, uint32_t chunk_size,
-                        const uint32_t* d_out_lens, uint8_t* d_scratch, const void* d_group_tables,
-                        const uint32_t* d_group_id, uint32_t* d_err, cudaStream_t stream);
+                        const uint32_t* d_out_lens, uint8_t* d_scratch, uint8_t* d_group_tables,
+                        const uint64_t* d_group_off, const uint32_t* d_group_shift, const uint32_t* d_group_id,
+                        uint32_t* d_err, cudaStream_t stream);
 
-// Bytes needed by one RansGroupTable (opaque here so main.cu need not
-// include rans.cuh just to size a buffer of them).
-size_t rans_group_table_bytes();
+// Bytes of one group's expanded decode tables (opaque here so main.cu need
+// not include rans.cuh just to size a buffer of them).
+size_t rans_group_table_bytes(uint32_t lit_shift);
 
-// Expands group_count groups' quantised bytes (d_q, group_count *
-// kQuantBytes) into group_count RansGroupTables at d_tables (must already
-// be zeroed: groups with no LzRans chunks have an all-zero q[], which
-// leaves their table's freq/cum untouched — harmless since no chunk ever
-// references such a group, but the memory must not be garbage regardless).
-void launch_expand_group_tables(const uint8_t* d_q, uint32_t group_count, void* d_tables, cudaStream_t stream);
+// Expands each group g's quantised bytes (at d_q + d_q_off[g], for
+// literal-context rule d_shift[g]) into its table region at d_tables +
+// d_table_off[g], rans_group_table_bytes(d_shift[g]) bytes. d_tables must
+// already be zeroed: an all-zero table (an unused context, or a group with
+// no LzRans chunks) leaves its region untouched, and a zero frequency is
+// what flags a corrupt chunk that decodes against one.
+void launch_expand_group_tables(const uint8_t* d_q, const uint64_t* d_q_off, const uint64_t* d_table_off,
+                                const uint32_t* d_shift, uint32_t group_count, uint8_t* d_tables,
+                                cudaStream_t stream);
 
 // Scratch needed by launch_compact for up to max_chunks chunks.
 size_t compaction_temp_bytes(uint32_t max_chunks);

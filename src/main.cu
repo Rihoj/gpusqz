@@ -482,12 +482,12 @@ size_t compress_scratch_bytes(uint32_t chunk_size, uint32_t slot_stride) {
 }
 
 struct CompressSet {
-  PinBuf<uint32_t> h_in_lens, h_sizes, h_offsets;
-  PinBuf<uint8_t> h_q; // this batch's quantised table (kQuantBytes)
+  PinBuf<uint32_t> h_in_lens, h_sizes, h_offsets, h_shift;
+  PinBuf<uint8_t> h_q; // this batch's quantised tables (up to kMaxQuantBytes)
   DevBuf<uint8_t> d_in, d_slots, d_temp, d_scratch; // d_scratch doubles as the packed output
   DevBuf<uint32_t> d_htab; // LZ parse's match-finding table, one region per chunk; see hash_table_bytes()
   DevBuf<uint32_t> d_in_lens, d_start, d_sizes, d_offsets;
-  DevBuf<uint32_t> d_rans_cnt, d_rans_n_seq, d_rans_n_lit;
+  DevBuf<uint32_t> d_rans_cnt, d_rans_shift, d_rans_n_seq, d_rans_n_lit;
   DevBuf<uint16_t> d_rans_freq, d_rans_cum;
   DevBuf<uint8_t> d_rans_q;
   cudaStream_t stream = nullptr;
@@ -503,23 +503,28 @@ struct CompressSet {
     if (stream) cudaStreamDestroy(stream);
   }
   bool alloc(uint32_t batch, uint32_t chunk_size, uint32_t slot_stride, size_t temp_bytes) {
-    return h_in_lens.alloc(batch) && h_sizes.alloc(batch) && h_offsets.alloc(batch + 1) &&
-           h_q.alloc(kQuantBytes) && d_in.alloc((size_t)batch * chunk_size) &&
+    return h_in_lens.alloc(batch) && h_sizes.alloc(batch) && h_offsets.alloc(batch + 1) && h_shift.alloc(1) &&
+           h_q.alloc(kMaxQuantBytes) && d_in.alloc((size_t)batch * chunk_size) &&
            d_slots.alloc((size_t)batch * slot_stride) && d_temp.alloc(temp_bytes) &&
            d_scratch.alloc((size_t)batch * compress_scratch_bytes(chunk_size, slot_stride)) &&
            d_htab.alloc((size_t)batch * (hash_table_bytes(chunk_size) / sizeof(uint32_t))) &&
            d_in_lens.alloc(batch) && d_start.alloc(batch) && d_sizes.alloc(batch) && d_offsets.alloc(batch + 1) &&
-           d_rans_cnt.alloc(kQuantBytes) && d_rans_n_seq.alloc(batch) && d_rans_n_lit.alloc(batch) &&
-           d_rans_freq.alloc(kQuantBytes) && d_rans_cum.alloc(kQuantBytes) && d_rans_q.alloc(kQuantBytes);
+           d_rans_cnt.alloc(kMaxQuantBytes) && d_rans_shift.alloc(1) && d_rans_n_seq.alloc(batch) &&
+           d_rans_n_lit.alloc(batch) &&
+           d_rans_freq.alloc(kMaxQuantBytes) && d_rans_cum.alloc(kMaxQuantBytes) &&
+           d_rans_q.alloc(kMaxQuantBytes);
   }
   void release() {
-    h_in_lens.release(); h_sizes.release(); h_offsets.release(); h_q.release();
+    h_in_lens.release(); h_sizes.release(); h_offsets.release(); h_shift.release(); h_q.release();
     d_in.release(); d_slots.release(); d_temp.release(); d_scratch.release(); d_htab.release();
     d_in_lens.release(); d_start.release(); d_sizes.release(); d_offsets.release();
-    d_rans_cnt.release(); d_rans_n_seq.release(); d_rans_n_lit.release(); d_rans_freq.release();
+    d_rans_cnt.release(); d_rans_shift.release(); d_rans_n_seq.release(); d_rans_n_lit.release();
+    d_rans_freq.release();
     d_rans_cum.release(); d_rans_q.release();
   }
-  RansBatchBufs rans_bufs() { return {d_rans_cnt.p, d_rans_freq.p, d_rans_cum.p, d_rans_q.p, d_rans_n_seq.p, d_rans_n_lit.p}; }
+  RansBatchBufs rans_bufs() {
+    return {d_rans_cnt.p, d_rans_freq.p, d_rans_cum.p, d_rans_q.p, d_rans_shift.p, d_rans_n_seq.p, d_rans_n_lit.p};
+  }
 };
 
 struct Compressor {
@@ -530,6 +535,8 @@ struct Compressor {
   size_t temp_bytes;
   std::vector<ChunkEntry> entries;
   std::vector<TableGroup> groups; // one per batch
+  std::vector<uint8_t> tables;     // each group's quantised counts, in group order
+  int forced_lit_shift = -1;       // GZP_FORCE_LIT_SHIFT, tests and tuning only
   std::unique_ptr<CompressSet[]> sets;
   Plan plan;
   InRing in_ring;
@@ -620,7 +627,7 @@ struct Compressor {
     uint32_t n = s.n;
     g_stats.mark(s.batch, kK0, st);
     launch_compress(s.d_in.p, chunk_size, n, s.d_in_lens.p, s.d_slots.p, slot_stride, s.d_start.p, s.d_sizes.p,
-                    s.d_scratch.p, s.d_htab.p, s.rans_bufs(), st);
+                    s.d_scratch.p, s.d_htab.p, forced_lit_shift, s.rans_bufs(), st);
     check_cuda(cudaGetLastError(), "compress_kernel launch");
     dump_literals(s);
     // The encode kernel is done with scratch (same stream), so the packed
@@ -635,7 +642,9 @@ struct Compressor {
     check_cuda(cudaMemcpyAsync(s.h_offsets.p, s.d_offsets.p, (n + 1) * sizeof(uint32_t),
                                cudaMemcpyDeviceToHost, st),
                "D2H offsets");
-    check_cuda(cudaMemcpyAsync(s.h_q.p, s.d_rans_q.p, kQuantBytes, cudaMemcpyDeviceToHost, st), "D2H q");
+    check_cuda(cudaMemcpyAsync(s.h_shift.p, s.d_rans_shift.p, sizeof(uint32_t), cudaMemcpyDeviceToHost, st),
+               "D2H shift");
+    check_cuda(cudaMemcpyAsync(s.h_q.p, s.d_rans_q.p, kMaxQuantBytes, cudaMemcpyDeviceToHost, st), "D2H q");
     check_cuda(cudaEventRecord(s.meta, st), "cudaEventRecord");
     s.d2h_pending = true;
   }
@@ -651,11 +660,9 @@ struct Compressor {
       entries[s.first + c] = ChunkEntry{payload_offset, csize, s.h_in_lens.p[c]};
       payload_offset += csize;
     }
-    TableGroup g{};
-    g.start_chunk = s.first;
-    g.chunk_count = s.n;
-    std::memcpy(g.q, s.h_q.p, kQuantBytes);
+    TableGroup g{s.first, s.n, *s.h_shift.p};
     groups.push_back(g);
+    tables.insert(tables.end(), s.h_q.p, s.h_q.p + group_quant_bytes(g));
 
     g_stats.mark(s.batch, kD2h0, s.stream);
     download(writer, s.d_scratch.p, total, s.stream, nullptr);
@@ -689,6 +696,16 @@ struct Compressor {
   }
 };
 
+// GZP_FORCE_LIT_SHIFT=0|4|8 forces every batch's literal-context rule
+// (rans_codes.h) instead of letting each batch pick; tests and tuning only.
+int forced_lit_shift() {
+  const char* f = std::getenv("GZP_FORCE_LIT_SHIFT");
+  if (!f) return -1;
+  uint32_t v = (uint32_t)std::strtoul(f, nullptr, 10);
+  if (!lit_shift_valid(v)) die("GZP_FORCE_LIT_SHIFT must be 0, 4 or 8");
+  return (int)v;
+}
+
 void compress(const std::string& in_path, const std::string& out_path, uint32_t chunk_size) {
   FILE* in = std::fopen(in_path.c_str(), "rb");
   if (!in) die("cannot open input: " + in_path);
@@ -704,13 +721,14 @@ void compress(const std::string& in_path, const std::string& out_path, uint32_t 
   // table_group_count is unknown until Compressor::allocate() picks a
   // batch size, so the header is written with a placeholder and patched
   // at the end, same as the ChunkEntry and TableGroup arrays below.
-  FileHeader header{kMagic, kVersion, chunk_size, total_size, chunk_count, 0};
+  FileHeader header{kMagic, kVersion, chunk_size, total_size, chunk_count, 0, 0};
   std::fwrite(&header, sizeof(header), 1, out);
   long entries_pos = ftell(out);
   std::vector<ChunkEntry> entries(chunk_count);
   std::fwrite(entries.data(), sizeof(ChunkEntry), (size_t)chunk_count, out);
 
   std::vector<TableGroup> groups;
+  std::vector<uint8_t> tables;
   long groups_pos = ftell(out);
 
   if (chunk_count > 0) {
@@ -722,6 +740,7 @@ void compress(const std::string& in_path, const std::string& out_path, uint32_t 
     cz.slot_stride = worst_case_size(chunk_size);
     cz.total_size = total_size;
     cz.entries.swap(entries);
+    cz.forced_lit_shift = forced_lit_shift();
     if (const char* p = std::getenv("GZP_DUMP_LITS")) {
       cz.lit_dump = std::fopen(p, "wb");
       if (!cz.lit_dump) die(std::string("cannot open GZP_DUMP_LITS file: ") + p);
@@ -733,8 +752,8 @@ void compress(const std::string& in_path, const std::string& out_path, uint32_t 
     g_stats.start_clock(cz.sets[0].stream);
 
     // Now that allocate() has fixed the batch size, reserve space for the
-    // group array: one TableGroup per batch. The writer thread appends the
-    // payload after it.
+    // group directory: one TableGroup per batch. The writer thread appends
+    // the payload after it.
     header.table_group_count = (uint32_t)cz.plan.batches;
     groups.resize(header.table_group_count);
     std::fwrite(groups.data(), sizeof(TableGroup), groups.size(), out);
@@ -744,10 +763,16 @@ void compress(const std::string& in_path, const std::string& out_path, uint32_t 
     if (cz.lit_dump) std::fclose(cz.lit_dump);
     entries.swap(cz.entries);
     groups.swap(cz.groups);
+    tables.swap(cz.tables);
     g_stats.bytes_in = total_size;
     g_stats.bytes_out = cz.payload_offset + sizeof(FileHeader) + entries.size() * sizeof(ChunkEntry) +
-                        groups.size() * sizeof(TableGroup);
+                        groups.size() * sizeof(TableGroup) + tables.size();
   }
+
+  // The table section follows the payload (the writer thread is done, so
+  // the stream position is the payload's end) and ends the file.
+  header.tables_offset = (uint64_t)ftell(out);
+  if (!tables.empty() && std::fwrite(tables.data(), 1, tables.size(), out) != tables.size()) die("write failed");
 
   std::fseek(out, 0, SEEK_SET);
   std::fwrite(&header, sizeof(header), 1, out);
@@ -799,8 +824,11 @@ struct Decompressor {
   long payload_start;
   std::vector<ChunkEntry> entries;
   std::vector<TableGroup> groups;
+  std::vector<uint8_t> tables;       // the file's table section: each group's quantised counts in order
   std::vector<uint32_t> chunk_group; // header.chunk_count entries, from `groups`
-  DevBuf<uint8_t> d_group_tables;    // groups.size() * rans_group_table_bytes(), expanded once
+  DevBuf<uint8_t> d_group_tables;    // every group's expanded tables, see prepare_group_tables
+  DevBuf<uint64_t> d_group_off;      // byte offset of group g's region in d_group_tables
+  DevBuf<uint32_t> d_group_shift;    // group g's literal-context rule
   std::unique_ptr<DecompressSet[]> sets;
   PinBuf<uint32_t> h_err; // one flag per batch, checked by the writer before writing it
   Plan plan;
@@ -820,22 +848,41 @@ struct Decompressor {
     }
     if (groups.empty()) return;
 
-    std::vector<uint8_t> q_all(groups.size() * kQuantBytes);
+    // Each group's quantised counts and expanded tables vary in size with
+    // its literal-context rule, so both are located by offset.
+    std::vector<uint64_t> q_off(groups.size()), table_off(groups.size());
+    std::vector<uint32_t> shift(groups.size());
+    uint64_t q_total = 0, table_bytes = 0;
     for (uint32_t g = 0; g < groups.size(); ++g) {
-      std::memcpy(q_all.data() + (size_t)g * kQuantBytes, groups[g].q, kQuantBytes);
+      q_off[g] = q_total;
+      table_off[g] = table_bytes;
+      shift[g] = groups[g].lit_ctx_shift;
+      q_total += group_quant_bytes(groups[g]);
+      table_bytes += rans_group_table_bytes(shift[g]);
     }
     DevBuf<uint8_t> d_q;
-    if (!d_q.alloc(q_all.size())) die("out of GPU memory expanding table groups");
-    check_cuda(cudaMemcpyAsync(d_q.p, q_all.data(), q_all.size(), cudaMemcpyHostToDevice, stream), "H2D q_all");
-    if (!d_group_tables.alloc(groups.size() * rans_group_table_bytes())) {
+    DevBuf<uint64_t> d_q_off;
+    if (!d_q.alloc(tables.size()) || !d_q_off.alloc(groups.size()) || !d_group_off.alloc(groups.size()) ||
+        !d_group_shift.alloc(groups.size()) || !d_group_tables.alloc(table_bytes)) {
       die("out of GPU memory expanding table groups");
     }
-    // Groups with no LzRans chunks have an all-zero q[]; zeroing first
-    // keeps their (never-read) freq/cum/sym well-defined instead of
+    check_cuda(cudaMemcpyAsync(d_q.p, tables.data(), tables.size(), cudaMemcpyHostToDevice, stream), "H2D tables");
+    check_cuda(cudaMemcpyAsync(d_q_off.p, q_off.data(), q_off.size() * sizeof(uint64_t), cudaMemcpyHostToDevice,
+                               stream),
+               "H2D q offsets");
+    check_cuda(cudaMemcpyAsync(d_group_off.p, table_off.data(), table_off.size() * sizeof(uint64_t),
+                               cudaMemcpyHostToDevice, stream),
+               "H2D table offsets");
+    check_cuda(cudaMemcpyAsync(d_group_shift.p, shift.data(), shift.size() * sizeof(uint32_t), cudaMemcpyHostToDevice,
+                               stream),
+               "H2D shifts");
+    // Unused contexts and groups with no LzRans chunks have all-zero
+    // counts, which leave their tables untouched; zeroing first makes those
+    // zero frequencies (what flags a corrupt chunk using one) rather than
     // whatever cudaMalloc happened to hand back.
-    check_cuda(cudaMemsetAsync(d_group_tables.p, 0, groups.size() * rans_group_table_bytes(), stream),
-               "zero group tables");
-    launch_expand_group_tables(d_q.p, (uint32_t)groups.size(), d_group_tables.p, stream);
+    check_cuda(cudaMemsetAsync(d_group_tables.p, 0, table_bytes, stream), "zero group tables");
+    launch_expand_group_tables(d_q.p, d_q_off.p, d_group_off.p, d_group_shift.p, (uint32_t)groups.size(),
+                               d_group_tables.p, stream);
     check_cuda(cudaGetLastError(), "expand_group_tables launch");
     check_cuda(cudaStreamSynchronize(stream), "expand_group_tables sync");
   }
@@ -910,7 +957,8 @@ struct Decompressor {
     check_cuda(cudaMemsetAsync(s.d_err.p, 0, sizeof(uint32_t), st), "clear error flag");
     g_stats.mark(s.batch, kK0, st);
     launch_decompress(s.d_in.p, s.d_in_offsets.p, s.n, s.d_in_lens.p, s.d_out.p, header.chunk_size,
-                      s.d_out_lens.p, s.d_scratch.p, d_group_tables.p, s.d_group_id.p, s.d_err.p, st);
+                      s.d_out_lens.p, s.d_scratch.p, d_group_tables.p, d_group_off.p, d_group_shift.p,
+                      s.d_group_id.p, s.d_err.p, st);
     check_cuda(cudaGetLastError(), "decompress_kernel launch");
     g_stats.mark(s.batch, kK1, st);
     // Downloaded ahead of the output on the same stream, so the writer can
@@ -981,12 +1029,29 @@ void decompress(const std::string& in_path, const std::string& out_path) {
     uint64_t covered = 0;
     for (const TableGroup& g : groups) {
       if (g.start_chunk != covered || g.chunk_count == 0) die("corrupt table group directory: not contiguous");
+      if (!lit_shift_valid(g.lit_ctx_shift)) die("corrupt table group directory: bad lit_ctx_shift");
       covered += g.chunk_count;
     }
     if (covered != header.chunk_count) die("corrupt table group directory: doesn't cover all chunks");
   }
 
   long payload_start = ftell(in);
+
+  // The payload runs from here to the table section, which ends the file.
+  // Checking that the chunk table covers exactly that range keeps any batch
+  // read inside the payload.
+  uint64_t payload_bytes = entries.empty() ? 0 : entries.back().offset + entries.back().compressed_size;
+  uint64_t tables_bytes = 0;
+  for (const TableGroup& g : groups) tables_bytes += group_quant_bytes(g);
+  if (header.tables_offset != (uint64_t)payload_start + payload_bytes ||
+      header.tables_offset + tables_bytes != file_size(in)) {
+    die("corrupt header: payload and table section don't match the file");
+  }
+  std::vector<uint8_t> tables(tables_bytes);
+  if (std::fseek(in, (long)header.tables_offset, SEEK_SET) != 0 ||
+      (tables_bytes && std::fread(tables.data(), 1, tables_bytes, in) != tables_bytes)) {
+    die("truncated table section");
+  }
 
   FILE* out = std::fopen(out_path.c_str(), "wb");
   if (!out) die("cannot open output: " + out_path);
@@ -1001,6 +1066,7 @@ void decompress(const std::string& in_path, const std::string& out_path) {
     dz.payload_start = payload_start;
     dz.entries.swap(entries);
     dz.groups.swap(groups);
+    dz.tables.swap(tables);
 
     double t = now_s();
     dz.allocate();
