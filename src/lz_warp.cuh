@@ -72,14 +72,25 @@ constexpr unsigned kFullMask = 0xFFFFFFFFu;
 constexpr uint32_t kEmptyPos = 0xFFFFFFFFu;
 
 // One parsed sequence: lit_len literals followed by a match of ml bytes
-// at backward distance off (ml == 0 only for a literals-only tail). Both
-// can be as large as the chunk itself, so both are u32.
+// at backward distance off (ml == 0 only for a literals-only tail). Each
+// is at most kMaxChunkSize = 2^20 (lit_len reaches it exactly for a
+// match-free chunk; off and ml stay below it), so all three pack into 21
+// bits of one u64. That is 8 bytes of scratch per sequence instead of 12,
+// which at 1MB chunks is 1MB less device memory per chunk in flight and so
+// more chunks resident per batch (see plan_batches in main.cu). Decode
+// rejects any off or ml above the chunk size before packing one.
 struct SeqRec {
-  uint32_t lit_len;
-  uint32_t off;
-  uint32_t ml;
+  uint64_t v;
+  static constexpr uint64_t kMask = (1ull << 21) - 1;
+  __device__ __forceinline__ SeqRec() : v(0) {}
+  __device__ __forceinline__ SeqRec(uint32_t lit_len, uint32_t off, uint32_t ml)
+      : v((uint64_t)lit_len | ((uint64_t)off << 21) | ((uint64_t)ml << 42)) {}
+  __device__ __forceinline__ uint32_t lit_len() const { return (uint32_t)(v & kMask); }
+  __device__ __forceinline__ uint32_t off() const { return (uint32_t)((v >> 21) & kMask); }
+  __device__ __forceinline__ uint32_t ml() const { return (uint32_t)((v >> 42) & kMask); }
 };
-static_assert(sizeof(SeqRec) == 12, "scratch_bytes() assumes 12-byte sequence records");
+static_assert(sizeof(SeqRec) == kSeqRecBytes, "scratch_bytes() (kernels.h) assumes kSeqRecBytes-byte records");
+static_assert(kMaxChunkSize <= SeqRec::kMask + 1, "SeqRec's 21-bit fields must hold any chunk-sized value");
 
 __device__ __forceinline__ uint32_t load4(const uint8_t* p) {
   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -196,8 +207,8 @@ __device__ inline bool tokens_from_seqs(const uint8_t* in, const SeqRec* seqs, u
   uint32_t op = 0, pos = 0;
   for (uint32_t i = 0; i < n_seq; ++i) {
     SeqRec r = seqs[i];
-    if (!emit_seq(in, out, cap, op, pos, r.lit_len, r.off, r.ml)) return false;
-    pos += r.lit_len + r.ml;
+    if (!emit_seq(in, out, cap, op, pos, r.lit_len(), r.off(), r.ml())) return false;
+    pos += r.lit_len() + r.ml();
   }
   *out_len = op;
   return true;

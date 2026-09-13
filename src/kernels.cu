@@ -23,10 +23,8 @@ __device__ __forceinline__ void chunk_scratch(uint8_t* scratch, uint32_t c, uint
                                               uint8_t*& rep_code, uint8_t*& lits) {
   uint8_t* base = scratch + (size_t)c * scratch_bytes(chunk_size);
   seqs = reinterpret_cast<SeqRec*>(base);
-  size_t seqs_bytes = (sizeof(SeqRec) * max_sequences(chunk_size) + 15) & ~(size_t)15;
-  size_t rep_bytes = (max_sequences(chunk_size) + 15) & ~(size_t)15;
-  rep_code = base + seqs_bytes;
-  lits = base + seqs_bytes + rep_bytes;
+  rep_code = base + scratch_seqs_bytes(chunk_size);
+  lits = base + scratch_lits_offset(chunk_size);
 }
 
 // ---------------------------------------------------------------------------
@@ -114,7 +112,7 @@ rans_encode_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count,
   uint32_t tok_total = 0;
   for (uint32_t i = lane; i < n_seq; i += 32) {
     SeqRec r = seqs[i];
-    tok_total += seq_size(r.lit_len, r.ml);
+    tok_total += seq_size(r.lit_len(), r.ml());
   }
   for (int o = 16; o > 0; o >>= 1) tok_total += __shfl_xor_sync(kFullMask, tok_total, o);
 

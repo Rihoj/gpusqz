@@ -141,7 +141,7 @@ __device__ __forceinline__ void store_u32(uint8_t* p, uint32_t v) {
 
 // Serially replays the zstd-style 3-slot MRU repeat-offset state forward
 // over this chunk's already-parsed sequences, writing rep_code[i] for
-// every match sequence (ml != 0): 0 means "code seqs[i].off explicitly",
+// every match sequence (ml != 0): 0 means "code seqs[i].off() explicitly",
 // 1/2/3 means "reuse the 1st/2nd/3rd most-recently-used distinct offset"
 // (see kOffRepBase, rans_codes.h). rep_code[i] is left unset for literal-
 // only sequences (ml == 0); callers must not read it there.
@@ -161,7 +161,7 @@ __device__ inline void compute_repeat_codes(const SeqRec* seqs, uint32_t n_seq, 
   if (lane == 0) {
     uint32_t r0 = 0, r1 = 0, r2 = 0; // 0 never matches: real offsets are >= 1
     for (uint32_t i = 0; i < n_seq; ++i) {
-      uint32_t ml = seqs[i].ml, off = seqs[i].off;
+      uint32_t ml = seqs[i].ml(), off = seqs[i].off();
       uint8_t code = 0;
       if (ml) {
         if (off == r0) {
@@ -204,18 +204,18 @@ __device__ inline void accumulate_hist(const SeqRec* seqs, uint32_t n_seq, const
     // match-free kMaxChunkSize chunk, see kMaxLenValue) would index past
     // the ll table into the ml one. That chunk never uses rANS, so just
     // leave its run out of the histogram.
-    if (r.lit_len <= kMaxLenValue) {
-      len_code(r.lit_len, c, nb, b);
+    if (r.lit_len() <= kMaxLenValue) {
+      len_code(r.lit_len(), c, nb, b);
       atomicAdd(&batch_cnt[kLlBase + c], 1u);
     }
-    len_code(r.ml ? (uint32_t)r.ml - (kMinMatch - 1) : 0, c, nb, b);
+    len_code(r.ml() ? (uint32_t)r.ml() - (kMinMatch - 1) : 0, c, nb, b);
     atomicAdd(&batch_cnt[kMlBase + c], 1u);
-    if (r.ml) {
+    if (r.ml()) {
       uint8_t rc = rep_code[i];
       if (rc) {
         c = kOffRepBase + (rc - 1);
       } else {
-        off_code(r.off, c, nb, b);
+        off_code(r.off(), c, nb, b);
       }
       atomicAdd(&batch_cnt[kOffBase + c], 1u);
     }
@@ -305,7 +305,7 @@ __device__ inline bool rans_encode_warp(const SeqRec* seqs, uint32_t n_seq, cons
   // a match-free kMaxChunkSize chunk is one literal run of 2^20, one past
   // what the ll alphabet can code. Such a chunk falls back to Lz tokens.
   bool too_long = false;
-  for (uint32_t i = lane; i < n_seq; i += 32) too_long |= seqs[i].lit_len > kMaxLenValue;
+  for (uint32_t i = lane; i < n_seq; i += 32) too_long |= seqs[i].lit_len() > kMaxLenValue;
   if (__any_sync(kFullMask, too_long)) return false;
 
   for (int g = (int)((n_lit + 31) / 32) - 1; g >= 0; --g) {
@@ -319,9 +319,9 @@ __device__ inline bool rans_encode_warp(const SeqRec* seqs, uint32_t n_seq, cons
     bool act = idx < n_seq;
     SeqRec r{0, 0, 0};
     if (act) r = seqs[idx];
-    uint32_t ml = r.ml, off = r.off;
+    uint32_t ml = r.ml(), off = r.off();
     uint32_t llc, llnb, llb, mlc, mlnb, mlb, oc = 0, onb = 0, ob = 0;
-    len_code(r.lit_len, llc, llnb, llb);
+    len_code(r.lit_len(), llc, llnb, llb);
     len_code(ml ? ml - (kMinMatch - 1) : 0, mlc, mlnb, mlb);
     bool has_off = act && ml != 0;
     if (has_off) {
@@ -512,7 +512,10 @@ __device__ inline bool rans_decode_warp(const uint8_t* payload, uint32_t len, co
 
     if (act) {
       if (ml == 0 && idx != n_seq - 1) bad = true;
-      if (ml > max_lit) bad = true; // a match can never be longer than the chunk itself
+      // A match can never be longer, or reach further back, than the chunk
+      // itself. Checked here, before packing into SeqRec's 21-bit fields,
+      // so a corrupt offset is rejected rather than silently truncated.
+      if (ml > max_lit || (has_off && off > max_lit)) bad = true;
       seqs[idx] = SeqRec{len_value(llc, llb), has_off ? off : 0, ml};
     }
     if (__any_sync(kFullMask, bad)) return false;
@@ -542,11 +545,11 @@ __device__ inline bool lz_reconstruct_warp(const SeqRec* seqs, uint32_t n_seq, c
   uint32_t op = 0, lp = 0;
   for (uint32_t i = 0; i < n_seq; ++i) {
     SeqRec r = seqs[i];
-    if (lp + r.lit_len > n_lit || op + r.lit_len > orig) return false;
-    for (uint32_t k = lane; k < r.lit_len; k += 32) out[op + k] = lits[lp + k];
-    op += r.lit_len;
-    lp += r.lit_len;
-    uint32_t ml = r.ml, off = r.off;
+    if (lp + r.lit_len() > n_lit || op + r.lit_len() > orig) return false;
+    for (uint32_t k = lane; k < r.lit_len(); k += 32) out[op + k] = lits[lp + k];
+    op += r.lit_len();
+    lp += r.lit_len();
+    uint32_t ml = r.ml(), off = r.off();
     if (ml) {
       if (off == 0 || off > op || op + ml > orig) return false;
       __syncwarp();

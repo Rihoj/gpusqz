@@ -4,17 +4,27 @@
 // chunk is LZ-compressed (or stored raw if that doesn't help) by one CUDA
 // warp. See README.md for the format and the tradeoffs.
 //
-// Host side, batches of chunks flow through a ring of up to three buffer
-// sets, each with its own stream, so batch i+1's file read and upload
-// overlap batch i's kernel and batch i-1's download and file write.
+// Host side, batches of chunks live only in device memory (a ring of up to
+// kMaxSets device buffer sets, each with its own stream). File data moves
+// through a small, fixed pool of pinned staging buffers instead: the main
+// thread freads into an input stage and copies it up asynchronously, and a
+// writer thread drains output stages the main thread fills with
+// asynchronous downloads. So batch i+1's read and upload overlap batch i's
+// kernels, and batch i-1's download and file write overlap both.
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cstdint>
-#include <vector>
+#include <deque>
+#include <memory>
+#include <mutex>
 #include <string>
-#include <chrono>
-#include <algorithm>
+#include <thread>
+#include <vector>
 #include <cuda_runtime.h>
 
 #include "format.h"
@@ -24,18 +34,39 @@ using namespace gzp;
 
 namespace {
 
-constexpr int kMaxSets = 3;
-// Aim for this many batches per file so the pipeline has something to
-// overlap, but keep each batch at least kMinBatchBytes of input (tiny
-// launches waste the GPU) unless the file itself is smaller. Pinned and
-// device allocations scale with batch size and dominate the fixed setup
-// cost on WSL2, so this is deliberately modest; three streams in flight
-// still keep the GPU busy.
+// Device buffer sets in the ring (see plan_batches). Two measured best: a
+// third only buys concurrent D2H/H2D copies, which PCIe at ~13GB/s doesn't
+// need, and costs a third of each batch's size.
+constexpr int kDefaultSets = 2;
+constexpr int kMaxSets = 3; // upper bound for GZP_FORCE_SETS
+
+// Batch sizing (see plan_batches). Every chunk is one warp, and each warp's
+// LZ parse is latency-bound: it sustains only a few MB/s on its own, so
+// kernel throughput is almost exactly proportional to how many chunks are
+// in flight at once. A batch therefore wants at least kMinBatchChunks
+// chunks (and at least kMinBatchBytes of input) whenever the file and the
+// memory budget allow it; kTargetBatches only matters for files so large
+// that even that many chunks would still leave more than kTargetBatches
+// batches. The earlier policy (one-eighth of the file per batch, 1GB
+// budget) left the 1MB `ratio` profile with 32 chunks per batch -- 32 warps
+// on a 36-SM GPU -- and was ~6x slower on that profile for that reason
+// alone.
 constexpr uint32_t kTargetBatches = 8;
+constexpr uint32_t kMinBatchChunks = 1024;
 constexpr size_t kMinBatchBytes = 32u << 20;
+constexpr size_t kMaxBudgetBytes = 4ull << 30;
+
+// Pinned staging. Pinning is the expensive part of host allocation under
+// WSL2 (cudaHostAlloc measured ~0.3-0.4s per GB, plus ~0.1s per GB to free
+// at exit, versus ~3ms per GB for cudaMalloc), so batches are sized by
+// device memory alone and host transfers go through this many fixed-size
+// stages, whatever the batch size.
+constexpr size_t kStageBytes = 8u << 20;
+constexpr int kInStages = 4;
+constexpr int kOutStages = 8;
 constexpr size_t kStdioBuf = 4u << 20;
 
-void die(const std::string& msg) {
+[[noreturn]] void die(const std::string& msg) {
   std::fprintf(stderr, "gzp: %s\n", msg.c_str());
   std::exit(1);
 }
@@ -52,37 +83,90 @@ double now_s() {
 
 // GZP_VERBOSE=1 prints per-stage timing so we can tell whether a run is
 // bound by file I/O, PCIe copies, or the kernel. GPU stages are measured
-// with cudaEvents on their own streams, so they stay meaningful when the
-// GPU is shared and stages overlap; their sum can legitimately exceed wall.
+// with per-batch cudaEvents on their own streams, so they stay meaningful
+// when stages overlap; their sums can legitimately exceed wall time.
+enum Mark { kH2d0, kH2d1, kK0, kK1, kD2h0, kD2h1, kMarks };
+
 struct Stats {
-  bool enabled = std::getenv("GZP_VERBOSE") != nullptr;
-  double setup_s = 0, fread_s = 0, h2d_s = 0, kernel_s = 0, d2h_s = 0, fwrite_s = 0;
+  bool enabled = [] {
+    const char* v = std::getenv("GZP_VERBOSE");
+    return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
+  }();
+  double setup_s = 0, fread_s = 0, fwrite_s = 0, in_wait_s = 0, out_wait_s = 0;
   uint64_t h2d_bytes = 0, d2h_bytes = 0, bytes_in = 0, bytes_out = 0;
   int batches = 0, sets = 0;
   uint32_t batch_chunks = 0;
+  // `origin` is recorded before any batch is queued; each batch's marks are
+  // measured against it so overlapping kernel spans can be unioned.
+  cudaEvent_t origin = nullptr;
+  std::vector<std::array<cudaEvent_t, kMarks>> marks;
 
-  void add_span(double& acc, cudaEvent_t a, cudaEvent_t b) {
+  void start_clock(cudaStream_t stream) {
     if (!enabled) return;
-    float ms = 0;
-    check_cuda(cudaEventElapsedTime(&ms, a, b), "cudaEventElapsedTime");
-    acc += ms / 1000.0;
+    check_cuda(cudaEventCreate(&origin), "cudaEventCreate");
+    check_cuda(cudaEventRecord(origin, stream), "cudaEventRecord");
   }
-  void report(const char* mode, double wall_s) const {
+  void mark(int batch, Mark m, cudaStream_t stream) {
     if (!enabled) return;
+    if ((size_t)batch >= marks.size()) marks.resize(batch + 1);
+    cudaEvent_t& e = marks[batch][m];
+    if (!e) check_cuda(cudaEventCreate(&e), "cudaEventCreate");
+    check_cuda(cudaEventRecord(e, stream), "cudaEventRecord");
+  }
+  // Call once all GPU work has finished.
+  void report(const char* mode, double wall_s) {
+    if (!enabled) return;
+    check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
+    double h2d_s = 0, kernel_s = 0, d2h_s = 0;
+    std::vector<std::pair<float, float>> spans;
+    auto at = [&](cudaEvent_t e) {
+      float ms = 0;
+      check_cuda(cudaEventElapsedTime(&ms, origin, e), "cudaEventElapsedTime");
+      return ms;
+    };
+    for (auto& m : marks) {
+      if (m[kH2d0] && m[kH2d1]) h2d_s += (at(m[kH2d1]) - at(m[kH2d0])) / 1000.0;
+      if (m[kK0] && m[kK1]) {
+        spans.emplace_back(at(m[kK0]), at(m[kK1]));
+        kernel_s += (spans.back().second - spans.back().first) / 1000.0;
+      }
+      if (m[kD2h0] && m[kD2h1]) d2h_s += (at(m[kD2h1]) - at(m[kD2h0])) / 1000.0;
+    }
+    // Batches on different streams can run concurrently, so the sum of
+    // spans overstates GPU time once they overlap; the union of intervals
+    // is the wall-clock time during which some kernel was running.
+    std::sort(spans.begin(), spans.end());
+    double busy = 0, a = 0, b = -1;
+    for (auto [x, y] : spans) {
+      if (x > b) {
+        if (b > a) busy += b - a;
+        a = x;
+        b = y;
+      } else if (y > b) {
+        b = y;
+      }
+    }
+    if (b > a) busy += b - a;
+    busy /= 1000.0;
+
     auto mbps = [](uint64_t bytes, double s) { return s > 0 ? bytes / 1e6 / s : 0.0; };
     std::fprintf(stderr,
                  "gzp[%s] in=%llu out=%llu wall=%.3fs (%.1f MB/s)  batches=%d x %u chunks, %d buffer sets\n"
                  "  setup  %.3fs  (CUDA context + buffer allocation, fixed cost)\n"
-                 "  fread  %.3fs  (%.1f MB/s of input)\n"
+                 "  steady %.3fs  (%.1f MB/s of input: wall minus setup)\n"
+                 "  fread  %.3fs  (%.1f MB/s of input; main thread)\n"
                  "  h2d    %.3fs  (%.1f MB/s, %llu bytes)\n"
-                 "  kernel %.3fs  (%.1f MB/s of input)\n"
+                 "  kernel %.3fs  (%.1f MB/s of input; sum of per-batch spans)\n"
+                 "  kbusy  %.3fs  (%.1f MB/s of input; wall-clock time any kernel ran)\n"
                  "  d2h    %.3fs  (%.1f MB/s, %llu bytes)\n"
-                 "  fwrite %.3fs  (%.1f MB/s of output)\n",
+                 "  fwrite %.3fs  (%.1f MB/s of output; writer thread)\n"
+                 "  stall  %.3fs waiting for a free input stage, %.3fs for a free output stage\n",
                  mode, (unsigned long long)bytes_in, (unsigned long long)bytes_out, wall_s,
-                 mbps(bytes_in, wall_s), batches, batch_chunks, sets, setup_s, fread_s,
-                 mbps(bytes_in, fread_s), h2d_s, mbps(h2d_bytes, h2d_s), (unsigned long long)h2d_bytes,
-                 kernel_s, mbps(bytes_in, kernel_s), d2h_s, mbps(d2h_bytes, d2h_s),
-                 (unsigned long long)d2h_bytes, fwrite_s, mbps(bytes_out, fwrite_s));
+                 mbps(bytes_in, wall_s), batches, batch_chunks, sets, setup_s, wall_s - setup_s,
+                 mbps(bytes_in, wall_s - setup_s), fread_s, mbps(bytes_in, fread_s), h2d_s,
+                 mbps(h2d_bytes, h2d_s), (unsigned long long)h2d_bytes, kernel_s, mbps(bytes_in, kernel_s), busy,
+                 mbps(bytes_in, busy), d2h_s, mbps(d2h_bytes, d2h_s), (unsigned long long)d2h_bytes, fwrite_s,
+                 mbps(bytes_out, fwrite_s), in_wait_s, out_wait_s);
   }
 };
 Stats g_stats;
@@ -127,24 +211,201 @@ struct PinBuf {
   ~PinBuf() { release(); }
 };
 
-struct StreamEvents {
-  cudaStream_t stream = nullptr;
-  cudaEvent_t h2d0 = nullptr, h2d1 = nullptr, k0 = nullptr, k1 = nullptr, d2h0 = nullptr, d2h1 = nullptr;
-  cudaEvent_t meta = nullptr;
+// ---------------------------------------------------------------------------
+// Pinned staging
+// ---------------------------------------------------------------------------
 
-  void create() {
-    check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
-    for (cudaEvent_t* e : {&h2d0, &h2d1, &k0, &k1, &d2h0, &d2h1, &meta}) {
-      check_cuda(cudaEventCreate(e), "cudaEventCreate");
-    }
+// One pinned staging buffer plus the event of the last async copy using it.
+struct Stage {
+  PinBuf<uint8_t> buf;
+  cudaEvent_t ev = nullptr;
+  bool pending = false; // ev recorded and not yet waited on (input stages only)
+
+  bool init() {
+    if (!buf.alloc(kStageBytes)) return false;
+    check_cuda(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "cudaEventCreate");
+    return true;
   }
-  ~StreamEvents() {
-    for (cudaEvent_t e : {h2d0, h2d1, k0, k1, d2h0, d2h1, meta}) {
-      if (e) cudaEventDestroy(e);
-    }
-    if (stream) cudaStreamDestroy(stream);
+  ~Stage() {
+    if (ev) cudaEventDestroy(ev);
   }
 };
+
+// Input stages, used only by the main thread: fread into a stage, copy it
+// up asynchronously, and reuse the stage once that copy's event has fired.
+struct InRing {
+  std::unique_ptr<Stage[]> st;
+  int n = 0, next = 0;
+
+  bool init(int count) {
+    st.reset(new Stage[count]);
+    n = count;
+    for (int i = 0; i < n; ++i) {
+      if (!st[i].init()) return false;
+    }
+    return true;
+  }
+
+  // Copies the next `bytes` of `in` to dev[0..bytes) on `stream`.
+  void upload(FILE* in, uint8_t* dev, uint64_t bytes, cudaStream_t stream, const char* short_read_msg) {
+    for (uint64_t off = 0; off < bytes; off += kStageBytes) {
+      size_t len = (size_t)std::min<uint64_t>(kStageBytes, bytes - off);
+      Stage& s = st[next];
+      next = (next + 1) % n;
+      if (s.pending) {
+        double t = now_s();
+        check_cuda(cudaEventSynchronize(s.ev), "wait for input stage");
+        g_stats.in_wait_s += now_s() - t;
+        s.pending = false;
+      }
+      double t = now_s();
+      if (std::fread(s.buf.p, 1, len, in) != len) die(short_read_msg);
+      g_stats.fread_s += now_s() - t;
+      check_cuda(cudaMemcpyAsync(dev + off, s.buf.p, len, cudaMemcpyHostToDevice, stream), "H2D stage");
+      check_cuda(cudaEventRecord(s.ev, stream), "cudaEventRecord");
+      s.pending = true;
+    }
+    g_stats.h2d_bytes += bytes;
+  }
+};
+
+// Output stages plus the thread that drains them. The main thread queues an
+// async download into a free stage and hands (stage, length) over; the
+// writer waits for that copy, fwrites it, and frees the stage. Jobs are
+// written strictly in the order they were pushed. fwrite (~1.3GB/s on this
+// WSL2 setup) is the slowest stage of decompression, so moving it off the
+// main thread lets the next batch's read, upload and kernels overlap it.
+class Writer {
+ public:
+  ~Writer() {
+    if (th_.joinable()) {
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        done_ = true;
+        cv_.notify_all();
+      }
+      th_.join();
+    }
+  }
+
+  bool init(FILE* out, int count) {
+    out_ = out;
+    n_ = count;
+    st_.reset(new Stage[count]);
+    busy_.assign(count, 0);
+    for (int i = 0; i < n_; ++i) {
+      if (!st_[i].init()) return false;
+    }
+    th_ = std::thread([this] { run(); });
+    return true;
+  }
+
+  // Blocks until the next stage in ring order is free.
+  Stage& acquire(int& idx) {
+    std::unique_lock<std::mutex> lk(mu_);
+    double t = now_s();
+    cv_.wait(lk, [&] { return !busy_[next_] || !error_.empty(); });
+    g_stats.out_wait_s += now_s() - t;
+    if (!error_.empty()) die(error_);
+    idx = next_;
+    busy_[idx] = 1;
+    next_ = (next_ + 1) % n_;
+    return st_[idx];
+  }
+
+  // The caller has recorded st[idx].ev after its download. `err`, if not
+  // null, is a pinned flag downloaded before that copy on the same stream:
+  // nonzero means the batch was corrupt and must not be written.
+  void push(int idx, size_t len, const uint32_t* err) {
+    std::lock_guard<std::mutex> lk(mu_);
+    q_.push_back(Job{idx, len, err});
+    cv_.notify_all();
+  }
+
+  // Writes everything queued, stops the thread, and dies if any write failed.
+  void finish() {
+    if (!th_.joinable()) return;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      done_ = true;
+      cv_.notify_all();
+    }
+    th_.join();
+    g_stats.fwrite_s += fwrite_s_;
+    if (!error_.empty()) die(error_);
+  }
+
+ private:
+  struct Job {
+    int idx;
+    size_t len;
+    const uint32_t* err;
+  };
+
+  void run() {
+    for (;;) {
+      Job j;
+      {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [&] { return !q_.empty() || done_; });
+        if (q_.empty()) return;
+        j = q_.front();
+        q_.pop_front();
+      }
+      cudaError_t e = cudaEventSynchronize(st_[j.idx].ev);
+      std::string err;
+      if (e != cudaSuccess) {
+        err = std::string("wait for output stage: ") + cudaGetErrorString(e);
+      } else if (j.err && *(const volatile uint32_t*)j.err) {
+        err = "corrupt input: malformed chunk data";
+      } else {
+        double t = now_s();
+        bool ok = std::fwrite(st_[j.idx].buf.p, 1, j.len, out_) == j.len;
+        fwrite_s_ += now_s() - t;
+        if (!ok) err = "write failed";
+      }
+      std::lock_guard<std::mutex> lk(mu_);
+      if (!err.empty() && error_.empty()) error_ = err;
+      busy_[j.idx] = 0;
+      cv_.notify_all();
+      if (!error_.empty()) {
+        // Stop writing, but keep freeing stages so the main thread never
+        // blocks forever; it dies at its next acquire() or finish().
+        for (Job& k : q_) busy_[k.idx] = 0;
+        q_.clear();
+      }
+    }
+  }
+
+  FILE* out_ = nullptr;
+  int n_ = 0, next_ = 0;
+  std::unique_ptr<Stage[]> st_;
+  std::vector<char> busy_;
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::deque<Job> q_;
+  bool done_ = false;
+  std::string error_;
+  std::thread th_;
+  double fwrite_s_ = 0;
+};
+
+// Downloads dev[0..bytes) through the writer's stages on `stream`.
+void download(Writer& w, const uint8_t* dev, uint64_t bytes, cudaStream_t stream, const uint32_t* err) {
+  for (uint64_t off = 0; off < bytes; off += kStageBytes) {
+    size_t len = (size_t)std::min<uint64_t>(kStageBytes, bytes - off);
+    int idx;
+    Stage& s = w.acquire(idx);
+    check_cuda(cudaMemcpyAsync(s.buf.p, dev + off, len, cudaMemcpyDeviceToHost, stream), "D2H stage");
+    check_cuda(cudaEventRecord(s.ev, stream), "cudaEventRecord");
+    w.push(idx, len, err);
+  }
+  g_stats.d2h_bytes += bytes;
+}
+
+// ---------------------------------------------------------------------------
+// Batch planning
+// ---------------------------------------------------------------------------
 
 struct Plan {
   uint32_t batch = 0;
@@ -155,14 +416,19 @@ struct Plan {
 // Sizes batches from currently-free VRAM (the GPU may be shared) and the
 // file's chunk count. Returns the largest batch we should try; callers
 // halve it if allocation still fails.
+//
+// A file that fits in one or two batches gets the whole budget split over
+// that many sets instead of being cut into smaller ones: kernel throughput
+// follows the chunks in flight (see kMinBatchChunks), and in practice
+// batches on different streams barely overlap on the GPU (the next one is
+// still being read while this one runs), so a bigger batch beats more sets.
 Plan plan_batches(uint32_t chunk_count, uint32_t chunk_size, size_t dev_bytes_per_chunk) {
   size_t free_bytes = 0, total_bytes = 0;
   check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
-  size_t budget = std::min<size_t>(free_bytes / 2, 1ull << 30);
+  size_t budget = std::min<size_t>(free_bytes / 2, kMaxBudgetBytes);
 
-  uint32_t mem_max = (uint32_t)std::max<size_t>(1, budget / (kMaxSets * dev_bytes_per_chunk));
   uint32_t min_batch = (uint32_t)std::max<size_t>(1, kMinBatchBytes / chunk_size);
-  uint32_t want = std::max(min_batch, (chunk_count + kTargetBatches - 1) / kTargetBatches);
+  uint32_t want = std::max({min_batch, kMinBatchChunks, (chunk_count + kTargetBatches - 1) / kTargetBatches});
 
   // Test-only override: forces compress and decompress to pick different
   // batch sizes (hence different, misaligned TableGroup boundaries on the
@@ -173,11 +439,20 @@ Plan plan_batches(uint32_t chunk_count, uint32_t chunk_size, size_t dev_bytes_pe
     uint32_t forced = (uint32_t)std::strtoul(f, nullptr, 10);
     if (forced >= 1) want = forced;
   }
+  // Tuning-only override of the ring depth (1..kMaxSets).
+  int max_sets = kDefaultSets;
+  if (const char* f = std::getenv("GZP_FORCE_SETS")) {
+    max_sets = std::clamp((int)std::strtol(f, nullptr, 10), 1, kMaxSets);
+  }
 
   Plan p;
-  p.batch = std::min({want, mem_max, chunk_count});
-  p.batches = (int)((chunk_count + p.batch - 1) / p.batch);
-  p.sets = std::min(kMaxSets, p.batches);
+  for (int s = 1; s <= max_sets; ++s) {
+    uint32_t mem_max = (uint32_t)std::max<size_t>(1, budget / ((size_t)s * dev_bytes_per_chunk));
+    p.batch = std::min({want, mem_max, chunk_count});
+    p.batches = (int)((chunk_count + p.batch - 1) / p.batch);
+    p.sets = std::min(s, p.batches);
+    if (p.batches <= s) break;
+  }
   return p;
 }
 
@@ -189,39 +464,57 @@ uint64_t file_size(FILE* f) {
   return (uint64_t)sz;
 }
 
+void create_stream(cudaStream_t& stream, std::initializer_list<cudaEvent_t*> events) {
+  check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
+  for (cudaEvent_t* e : events) check_cuda(cudaEventCreateWithFlags(e, cudaEventDisableTiming), "cudaEventCreate");
+}
+
 // ---------------------------------------------------------------------------
 // Compress
 // ---------------------------------------------------------------------------
 
+// Per-chunk device scratch actually allocated for compress: the LzRans
+// scratch, which also receives the compacted output once the encode kernel
+// is done with it (see Compressor::launch), so it must hold at least one
+// output slot per chunk. That only binds for tiny chunk sizes.
+size_t compress_scratch_bytes(uint32_t chunk_size, uint32_t slot_stride) {
+  return std::max(scratch_bytes(chunk_size), (size_t)slot_stride);
+}
+
 struct CompressSet {
-  PinBuf<uint8_t> h_in, h_out;
   PinBuf<uint32_t> h_in_lens, h_sizes, h_offsets;
-  PinBuf<uint8_t> h_q; // this batch's quantised table (kQuantBytes), LzRans mode only
-  DevBuf<uint8_t> d_in, d_slots, d_packed, d_temp, d_scratch;
+  PinBuf<uint8_t> h_q; // this batch's quantised table (kQuantBytes)
+  DevBuf<uint8_t> d_in, d_slots, d_temp, d_scratch; // d_scratch doubles as the packed output
   DevBuf<uint32_t> d_htab; // LZ parse's match-finding table, one region per chunk; see hash_table_bytes()
   DevBuf<uint32_t> d_in_lens, d_start, d_sizes, d_offsets;
-  DevBuf<uint32_t> d_rans_cnt, d_rans_n_seq, d_rans_n_lit; // LzRans mode only
-  DevBuf<uint16_t> d_rans_freq, d_rans_cum;                // LzRans mode only
-  DevBuf<uint8_t> d_rans_q;                                // LzRans mode only
-  StreamEvents ev;
+  DevBuf<uint32_t> d_rans_cnt, d_rans_n_seq, d_rans_n_lit;
+  DevBuf<uint16_t> d_rans_freq, d_rans_cum;
+  DevBuf<uint8_t> d_rans_q;
+  cudaStream_t stream = nullptr;
+  cudaEvent_t h2d_done = nullptr, meta = nullptr;
   uint32_t n = 0, first = 0;
-  bool in_flight = false, d2h_enqueued = false;
+  int batch = -1;
+  bool used = false, d2h_pending = false;
 
+  ~CompressSet() {
+    for (cudaEvent_t e : {h2d_done, meta}) {
+      if (e) cudaEventDestroy(e);
+    }
+    if (stream) cudaStreamDestroy(stream);
+  }
   bool alloc(uint32_t batch, uint32_t chunk_size, uint32_t slot_stride, size_t temp_bytes) {
-    return h_in.alloc((size_t)batch * chunk_size) && h_out.alloc((size_t)batch * slot_stride) &&
-           h_in_lens.alloc(batch) && h_sizes.alloc(batch) && h_offsets.alloc(batch + 1) &&
+    return h_in_lens.alloc(batch) && h_sizes.alloc(batch) && h_offsets.alloc(batch + 1) &&
            h_q.alloc(kQuantBytes) && d_in.alloc((size_t)batch * chunk_size) &&
-           d_slots.alloc((size_t)batch * slot_stride) && d_packed.alloc((size_t)batch * slot_stride) &&
-           d_temp.alloc(temp_bytes) && d_scratch.alloc((size_t)batch * scratch_bytes(chunk_size)) &&
+           d_slots.alloc((size_t)batch * slot_stride) && d_temp.alloc(temp_bytes) &&
+           d_scratch.alloc((size_t)batch * compress_scratch_bytes(chunk_size, slot_stride)) &&
            d_htab.alloc((size_t)batch * (hash_table_bytes(chunk_size) / sizeof(uint32_t))) &&
            d_in_lens.alloc(batch) && d_start.alloc(batch) && d_sizes.alloc(batch) && d_offsets.alloc(batch + 1) &&
            d_rans_cnt.alloc(kQuantBytes) && d_rans_n_seq.alloc(batch) && d_rans_n_lit.alloc(batch) &&
            d_rans_freq.alloc(kQuantBytes) && d_rans_cum.alloc(kQuantBytes) && d_rans_q.alloc(kQuantBytes);
   }
   void release() {
-    h_in.release(); h_out.release(); h_in_lens.release(); h_sizes.release(); h_offsets.release(); h_q.release();
-    d_in.release(); d_slots.release(); d_packed.release(); d_temp.release(); d_scratch.release();
-    d_htab.release();
+    h_in_lens.release(); h_sizes.release(); h_offsets.release(); h_q.release();
+    d_in.release(); d_slots.release(); d_temp.release(); d_scratch.release(); d_htab.release();
     d_in_lens.release(); d_start.release(); d_sizes.release(); d_offsets.release();
     d_rans_cnt.release(); d_rans_n_seq.release(); d_rans_n_lit.release(); d_rans_freq.release();
     d_rans_cum.release(); d_rans_q.release();
@@ -237,63 +530,122 @@ struct Compressor {
   size_t temp_bytes;
   std::vector<ChunkEntry> entries;
   std::vector<TableGroup> groups; // one per batch
-  std::vector<CompressSet> sets;
+  std::unique_ptr<CompressSet[]> sets;
   Plan plan;
+  InRing in_ring;
+  Writer writer;
   uint64_t payload_offset = 0;
   uint32_t next_chunk = 0;
+  FILE* lit_dump = nullptr; // GZP_DUMP_LITS=<path>, see dump_literals
 
   void allocate() {
-    size_t dev_per_chunk = (size_t)chunk_size + 2 * (size_t)slot_stride + scratch_bytes(chunk_size) +
-                            hash_table_bytes(chunk_size) + 6 * sizeof(uint32_t) + 2 * sizeof(uint16_t) +
-                            sizeof(uint8_t);
+    size_t dev_per_chunk = (size_t)chunk_size + (size_t)slot_stride +
+                           compress_scratch_bytes(chunk_size, slot_stride) + hash_table_bytes(chunk_size) +
+                           6 * sizeof(uint32_t);
     plan = plan_batches(chunk_count, chunk_size, dev_per_chunk);
-    sets.resize(plan.sets);
-    for (auto& s : sets) s.ev.create();
-    // Retry with a smaller batch if the GPU (or pinned host memory under
-    // WSL2) can't give us what cudaMemGetInfo suggested.
+    sets.reset(new CompressSet[plan.sets]);
+    for (int i = 0; i < plan.sets; ++i) create_stream(sets[i].stream, {&sets[i].h2d_done, &sets[i].meta});
+    // Retry with a smaller batch if the GPU can't give us what
+    // cudaMemGetInfo suggested.
     for (;;) {
       temp_bytes = compaction_temp_bytes(plan.batch);
       bool ok = true;
-      for (auto& s : sets) {
-        if (!s.alloc(plan.batch, chunk_size, slot_stride, temp_bytes)) {
-          ok = false;
-          break;
-        }
-      }
+      for (int i = 0; i < plan.sets && ok; ++i) ok = sets[i].alloc(plan.batch, chunk_size, slot_stride, temp_bytes);
       if (ok) break;
-      for (auto& s : sets) s.release();
+      for (int i = 0; i < plan.sets; ++i) sets[i].release();
       if (plan.batch == 1) die("out of GPU or pinned host memory even at 1 chunk per batch");
       plan.batch = std::max<uint32_t>(1, plan.batch / 2);
     }
     plan.batches = (int)((chunk_count + plan.batch - 1) / plan.batch);
+    if (!in_ring.init(kInStages) || !writer.init(out, kOutStages)) die("out of pinned host memory");
     g_stats.batches = plan.batches;
     g_stats.sets = plan.sets;
     g_stats.batch_chunks = plan.batch;
   }
 
-  void enqueue_d2h(CompressSet& s) {
-    // Needs the packed total, which only exists once the scan has run.
-    check_cuda(cudaEventSynchronize(s.ev.meta), "wait for chunk sizes");
-    uint32_t total = s.h_offsets.p[s.n];
-    check_cuda(cudaEventRecord(s.ev.d2h0, s.ev.stream), "cudaEventRecord");
-    check_cuda(cudaMemcpyAsync(s.h_out.p, s.d_packed.p, total, cudaMemcpyDeviceToHost, s.ev.stream),
-               "D2H packed output");
-    check_cuda(cudaEventRecord(s.ev.d2h1, s.ev.stream), "cudaEventRecord");
-    g_stats.d2h_bytes += total;
-    s.d2h_enqueued = true;
+  // Debug aid for evaluating literal models offline: with
+  // GZP_DUMP_LITS=<path>, appends each chunk's parsed literal stream to that
+  // file as a u32 length followed by the bytes. Called between the encode
+  // kernel and the compaction that overwrites scratch; it synchronises the
+  // stream, so it serialises the pipeline and must not be used while
+  // benchmarking.
+  void dump_literals(CompressSet& s) {
+    if (!lit_dump) return;
+    check_cuda(cudaStreamSynchronize(s.stream), "dump literals sync");
+    std::vector<uint32_t> n_lit(s.n);
+    check_cuda(cudaMemcpy(n_lit.data(), s.d_rans_n_lit.p, s.n * sizeof(uint32_t), cudaMemcpyDeviceToHost),
+               "dump n_lit");
+    std::vector<uint8_t> buf;
+    for (uint32_t c = 0; c < s.n; ++c) {
+      uint32_t k = s.h_in_lens.p[c] <= 1 ? 0 : n_lit[c]; // in_len <= 1 chunks never ran the parse
+      buf.resize(k);
+      if (k) {
+        const uint8_t* src = s.d_scratch.p + (size_t)c * scratch_bytes(chunk_size) + scratch_lits_offset(chunk_size);
+        check_cuda(cudaMemcpy(buf.data(), src, k, cudaMemcpyDeviceToHost), "dump lits");
+      }
+      std::fwrite(&k, sizeof(k), 1, lit_dump);
+      std::fwrite(buf.data(), 1, k, lit_dump);
+    }
   }
 
-  void finish(CompressSet& s) {
-    if (!s.in_flight) return;
-    if (!s.d2h_enqueued) enqueue_d2h(s);
-    check_cuda(cudaEventSynchronize(s.ev.d2h1), "wait for batch");
-    g_stats.add_span(g_stats.h2d_s, s.ev.h2d0, s.ev.h2d1);
-    g_stats.add_span(g_stats.kernel_s, s.ev.k0, s.ev.k1);
-    g_stats.add_span(g_stats.d2h_s, s.ev.d2h0, s.ev.d2h1);
+  // Reads batch b's input into s and starts its upload.
+  void upload(CompressSet& s, int b) {
+    uint32_t n = std::min(plan.batch, chunk_count - next_chunk);
+    s.n = n;
+    s.first = next_chunk;
+    s.batch = b;
+    // h_in_lens is about to be rewritten: the previous batch's upload of it
+    // (long since finished in practice) must be complete.
+    if (s.used) check_cuda(cudaEventSynchronize(s.h2d_done), "wait for set");
+    s.used = true;
+    for (uint32_t c = 0; c < n; ++c) {
+      uint64_t start = (uint64_t)(s.first + c) * chunk_size;
+      s.h_in_lens.p[c] = (uint32_t)std::min<uint64_t>(chunk_size, total_size - start);
+    }
+    // Chunks are contiguous both in the file and in d_in (only the file's
+    // last chunk can be short), so the whole batch is one read.
+    uint64_t bytes = std::min<uint64_t>((uint64_t)n * chunk_size, total_size - (uint64_t)s.first * chunk_size);
+    next_chunk += n;
 
-    double t = now_s();
+    g_stats.mark(b, kH2d0, s.stream);
+    in_ring.upload(in, s.d_in.p, bytes, s.stream, "short read on input file");
+    check_cuda(cudaMemcpyAsync(s.d_in_lens.p, s.h_in_lens.p, n * sizeof(uint32_t), cudaMemcpyHostToDevice, s.stream),
+               "H2D lens");
+    check_cuda(cudaEventRecord(s.h2d_done, s.stream), "cudaEventRecord");
+    g_stats.mark(b, kH2d1, s.stream);
+  }
+
+  void launch(CompressSet& s) {
+    cudaStream_t st = s.stream;
+    uint32_t n = s.n;
+    g_stats.mark(s.batch, kK0, st);
+    launch_compress(s.d_in.p, chunk_size, n, s.d_in_lens.p, s.d_slots.p, slot_stride, s.d_start.p, s.d_sizes.p,
+                    s.d_scratch.p, s.d_htab.p, s.rans_bufs(), st);
+    check_cuda(cudaGetLastError(), "compress_kernel launch");
+    dump_literals(s);
+    // The encode kernel is done with scratch (same stream), so the packed
+    // output reuses it; see compress_scratch_bytes.
+    check_cuda(launch_compact(s.d_slots.p, slot_stride, s.d_start.p, s.d_sizes.p, n, s.d_offsets.p, s.d_scratch.p,
+                              s.d_temp.p, temp_bytes, st),
+               "compaction");
+    g_stats.mark(s.batch, kK1, st);
+
+    check_cuda(cudaMemcpyAsync(s.h_sizes.p, s.d_sizes.p, n * sizeof(uint32_t), cudaMemcpyDeviceToHost, st),
+               "D2H sizes");
+    check_cuda(cudaMemcpyAsync(s.h_offsets.p, s.d_offsets.p, (n + 1) * sizeof(uint32_t),
+                               cudaMemcpyDeviceToHost, st),
+               "D2H offsets");
+    check_cuda(cudaMemcpyAsync(s.h_q.p, s.d_rans_q.p, kQuantBytes, cudaMemcpyDeviceToHost, st), "D2H q");
+    check_cuda(cudaEventRecord(s.meta, st), "cudaEventRecord");
+    s.d2h_pending = true;
+  }
+
+  // Waits for s's chunk sizes, records its entries and table group, and
+  // queues its packed output for the writer. Batches must come through
+  // here in order: the payload is written in the order it is queued.
+  void enqueue_d2h(CompressSet& s) {
+    check_cuda(cudaEventSynchronize(s.meta), "wait for chunk sizes");
     uint32_t total = s.h_offsets.p[s.n];
-    if (std::fwrite(s.h_out.p, 1, total, out) != total) die("write failed");
     for (uint32_t c = 0; c < s.n; ++c) {
       uint32_t csize = s.h_sizes.p[c];
       entries[s.first + c] = ChunkEntry{payload_offset, csize, s.h_in_lens.p[c]};
@@ -304,72 +656,36 @@ struct Compressor {
     g.chunk_count = s.n;
     std::memcpy(g.q, s.h_q.p, kQuantBytes);
     groups.push_back(g);
-    g_stats.fwrite_s += now_s() - t;
-    s.in_flight = false;
-    s.d2h_enqueued = false;
-  }
 
-  void launch(CompressSet& s) {
-    uint32_t n = std::min(plan.batch, chunk_count - next_chunk);
-    s.n = n;
-    s.first = next_chunk;
-
-    double t = now_s();
-    for (uint32_t c = 0; c < n; ++c) {
-      size_t want = chunk_size;
-      if (s.first + c == chunk_count - 1) want = (size_t)(total_size - (uint64_t)(s.first + c) * chunk_size);
-      if (std::fread(s.h_in.p + (size_t)c * chunk_size, 1, want, in) != want) die("short read on input file");
-      s.h_in_lens.p[c] = (uint32_t)want;
-    }
-    g_stats.fread_s += now_s() - t;
-    next_chunk += n;
-
-    cudaStream_t st = s.ev.stream;
-    check_cuda(cudaEventRecord(s.ev.h2d0, st), "cudaEventRecord");
-    check_cuda(cudaMemcpyAsync(s.d_in.p, s.h_in.p, (size_t)n * chunk_size, cudaMemcpyHostToDevice, st),
-               "H2D input");
-    check_cuda(cudaMemcpyAsync(s.d_in_lens.p, s.h_in_lens.p, n * sizeof(uint32_t), cudaMemcpyHostToDevice, st),
-               "H2D lens");
-    check_cuda(cudaEventRecord(s.ev.h2d1, st), "cudaEventRecord");
-    g_stats.h2d_bytes += (uint64_t)n * chunk_size;
-
-    check_cuda(cudaEventRecord(s.ev.k0, st), "cudaEventRecord");
-    launch_compress(s.d_in.p, chunk_size, n, s.d_in_lens.p, s.d_slots.p, slot_stride, s.d_start.p, s.d_sizes.p,
-                    s.d_scratch.p, s.d_htab.p, s.rans_bufs(), st);
-    check_cuda(cudaGetLastError(), "compress_kernel launch");
-    check_cuda(launch_compact(s.d_slots.p, slot_stride, s.d_start.p, s.d_sizes.p, n, s.d_offsets.p, s.d_packed.p,
-                              s.d_temp.p, temp_bytes, st),
-               "compaction");
-    check_cuda(cudaEventRecord(s.ev.k1, st), "cudaEventRecord");
-
-    check_cuda(cudaMemcpyAsync(s.h_sizes.p, s.d_sizes.p, n * sizeof(uint32_t), cudaMemcpyDeviceToHost, st),
-               "D2H sizes");
-    check_cuda(cudaMemcpyAsync(s.h_offsets.p, s.d_offsets.p, (n + 1) * sizeof(uint32_t),
-                               cudaMemcpyDeviceToHost, st),
-               "D2H offsets");
-    check_cuda(cudaMemcpyAsync(s.h_q.p, s.d_rans_q.p, kQuantBytes, cudaMemcpyDeviceToHost, st), "D2H q");
-    check_cuda(cudaEventRecord(s.ev.meta, st), "cudaEventRecord");
-    s.in_flight = true;
-    s.d2h_enqueued = false;
+    g_stats.mark(s.batch, kD2h0, s.stream);
+    download(writer, s.d_scratch.p, total, s.stream, nullptr);
+    g_stats.mark(s.batch, kD2h1, s.stream);
+    s.d2h_pending = false;
   }
 
   void run() {
     for (int b = 0; b < plan.batches; ++b) {
       CompressSet& s = sets[b % plan.sets];
-      finish(s);
+      // Only with a single set: its previous batch must be queued for
+      // download before this one overwrites it. (Stream order then keeps
+      // the download ahead of the new upload and kernels.)
+      if (s.d2h_pending) enqueue_d2h(s);
+      upload(s, b);
       launch(s);
-      // Defer the previous batch's big download until now: its sizes are
+      // Defer the previous batch's download until now: its sizes are
       // almost certainly ready, and waiting for them no longer idles the
       // GPU because batch b is already queued.
       if (b > 0) {
         CompressSet& prev = sets[(b - 1) % plan.sets];
-        if (prev.in_flight && !prev.d2h_enqueued) enqueue_d2h(prev);
+        if (prev.d2h_pending) enqueue_d2h(prev);
       }
     }
-    for (int b = std::max(0, plan.batches - plan.sets); b < plan.batches; ++b) finish(sets[b % plan.sets]);
-    if (groups.size() != (size_t)plan.batches) {
-      die("internal error: table group count mismatch");
+    for (int b = std::max(0, plan.batches - plan.sets); b < plan.batches; ++b) {
+      CompressSet& s = sets[b % plan.sets];
+      if (s.d2h_pending && s.batch == b) enqueue_d2h(s);
     }
+    writer.finish();
+    if (groups.size() != (size_t)plan.batches) die("internal error: table group count mismatch");
   }
 };
 
@@ -406,19 +722,26 @@ void compress(const std::string& in_path, const std::string& out_path, uint32_t 
     cz.slot_stride = worst_case_size(chunk_size);
     cz.total_size = total_size;
     cz.entries.swap(entries);
+    if (const char* p = std::getenv("GZP_DUMP_LITS")) {
+      cz.lit_dump = std::fopen(p, "wb");
+      if (!cz.lit_dump) die(std::string("cannot open GZP_DUMP_LITS file: ") + p);
+    }
 
     double t = now_s();
     cz.allocate();
     g_stats.setup_s += now_s() - t;
+    g_stats.start_clock(cz.sets[0].stream);
 
     // Now that allocate() has fixed the batch size, reserve space for the
-    // group array: one TableGroup per batch.
+    // group array: one TableGroup per batch. The writer thread appends the
+    // payload after it.
     header.table_group_count = (uint32_t)cz.plan.batches;
     groups.resize(header.table_group_count);
     std::fwrite(groups.data(), sizeof(TableGroup), groups.size(), out);
 
     cz.run();
 
+    if (cz.lit_dump) std::fclose(cz.lit_dump);
     entries.swap(cz.entries);
     groups.swap(cz.groups);
     g_stats.bytes_in = total_size;
@@ -441,25 +764,29 @@ void compress(const std::string& in_path, const std::string& out_path, uint32_t 
 // ---------------------------------------------------------------------------
 
 struct DecompressSet {
-  PinBuf<uint8_t> h_in, h_out;
-  PinBuf<uint32_t> h_in_offsets, h_in_lens, h_out_lens, h_group_id, h_err;
+  PinBuf<uint32_t> h_in_offsets, h_in_lens, h_out_lens, h_group_id;
   DevBuf<uint8_t> d_in, d_out, d_scratch;
   DevBuf<uint32_t> d_in_offsets, d_in_lens, d_out_lens, d_group_id, d_err;
-  StreamEvents ev;
+  cudaStream_t stream = nullptr;
+  cudaEvent_t h2d_done = nullptr;
   uint32_t n = 0, first = 0;
-  bool in_flight = false;
+  int batch = -1;
+  bool used = false, d2h_pending = false;
 
+  ~DecompressSet() {
+    if (h2d_done) cudaEventDestroy(h2d_done);
+    if (stream) cudaStreamDestroy(stream);
+  }
   bool alloc(uint32_t batch, uint32_t chunk_size, uint32_t slot_stride) {
-    return h_in.alloc((size_t)batch * slot_stride) && h_out.alloc((size_t)batch * chunk_size) &&
-           h_in_offsets.alloc(batch) && h_in_lens.alloc(batch) && h_out_lens.alloc(batch) &&
-           h_group_id.alloc(batch) && h_err.alloc(1) && d_in.alloc((size_t)batch * slot_stride) &&
+    return h_in_offsets.alloc(batch) && h_in_lens.alloc(batch) && h_out_lens.alloc(batch) &&
+           h_group_id.alloc(batch) && d_in.alloc((size_t)batch * slot_stride) &&
            d_out.alloc((size_t)batch * chunk_size) && d_scratch.alloc((size_t)batch * scratch_bytes(chunk_size)) &&
            d_in_offsets.alloc(batch) && d_in_lens.alloc(batch) && d_out_lens.alloc(batch) &&
            d_group_id.alloc(batch) && d_err.alloc(1);
   }
   void release() {
-    h_in.release(); h_out.release(); h_in_offsets.release(); h_in_lens.release(); h_out_lens.release();
-    h_group_id.release(); h_err.release(); d_in.release(); d_out.release(); d_scratch.release();
+    h_in_offsets.release(); h_in_lens.release(); h_out_lens.release(); h_group_id.release();
+    d_in.release(); d_out.release(); d_scratch.release();
     d_in_offsets.release(); d_in_lens.release(); d_out_lens.release(); d_group_id.release(); d_err.release();
   }
 };
@@ -474,8 +801,11 @@ struct Decompressor {
   std::vector<TableGroup> groups;
   std::vector<uint32_t> chunk_group; // header.chunk_count entries, from `groups`
   DevBuf<uint8_t> d_group_tables;    // groups.size() * rans_group_table_bytes(), expanded once
-  std::vector<DecompressSet> sets;
+  std::unique_ptr<DecompressSet[]> sets;
+  PinBuf<uint32_t> h_err; // one flag per batch, checked by the writer before writing it
   Plan plan;
+  InRing in_ring;
+  Writer writer;
   uint32_t next_chunk = 0;
 
   // Builds chunk_group[] from groups[] and expands every group's table
@@ -514,63 +844,35 @@ struct Decompressor {
     size_t dev_per_chunk =
         (size_t)header.chunk_size + (size_t)slot_stride + scratch_bytes(header.chunk_size) + 4 * sizeof(uint32_t);
     plan = plan_batches(header.chunk_count, header.chunk_size, dev_per_chunk);
-    sets.resize(plan.sets);
-    for (auto& s : sets) s.ev.create();
+    sets.reset(new DecompressSet[plan.sets]);
+    for (int i = 0; i < plan.sets; ++i) create_stream(sets[i].stream, {&sets[i].h2d_done});
     for (;;) {
       bool ok = true;
-      for (auto& s : sets) {
-        if (!s.alloc(plan.batch, header.chunk_size, slot_stride)) {
-          ok = false;
-          break;
-        }
-      }
+      for (int i = 0; i < plan.sets && ok; ++i) ok = sets[i].alloc(plan.batch, header.chunk_size, slot_stride);
       if (ok) break;
-      for (auto& s : sets) s.release();
+      for (int i = 0; i < plan.sets; ++i) sets[i].release();
       if (plan.batch == 1) die("out of GPU or pinned host memory even at 1 chunk per batch");
       plan.batch = std::max<uint32_t>(1, plan.batch / 2);
     }
     plan.batches = (int)((header.chunk_count + plan.batch - 1) / plan.batch);
+    if (!h_err.alloc(plan.batches) || !in_ring.init(kInStages) || !writer.init(out, kOutStages)) {
+      die("out of pinned host memory");
+    }
     g_stats.batches = plan.batches;
     g_stats.sets = plan.sets;
     g_stats.batch_chunks = plan.batch;
   }
 
-  void finish(DecompressSet& s) {
-    if (!s.in_flight) return;
-    check_cuda(cudaEventSynchronize(s.ev.d2h1), "wait for batch");
-    g_stats.add_span(g_stats.h2d_s, s.ev.h2d0, s.ev.h2d1);
-    g_stats.add_span(g_stats.kernel_s, s.ev.k0, s.ev.k1);
-    g_stats.add_span(g_stats.d2h_s, s.ev.d2h0, s.ev.d2h1);
-    if (*s.h_err.p) die("corrupt input: malformed chunk data");
-
-    double t = now_s();
-    // Every chunk but the file's last is full-size, so a batch's output is
-    // one contiguous run in h_out; fall back to per-chunk writes otherwise.
-    bool contiguous = true;
-    uint64_t total = 0;
-    for (uint32_t c = 0; c < s.n; ++c) {
-      if (c + 1 < s.n && s.h_out_lens.p[c] != header.chunk_size) contiguous = false;
-      total += s.h_out_lens.p[c];
-    }
-    if (contiguous) {
-      if (std::fwrite(s.h_out.p, 1, total, out) != total) die("write failed");
-    } else {
-      for (uint32_t c = 0; c < s.n; ++c) {
-        uint32_t len = s.h_out_lens.p[c];
-        if (std::fwrite(s.h_out.p + (size_t)c * header.chunk_size, 1, len, out) != len) die("write failed");
-      }
-    }
-    g_stats.fwrite_s += now_s() - t;
-    s.in_flight = false;
-  }
-
-  void launch(DecompressSet& s) {
+  void upload(DecompressSet& s, int b) {
     uint32_t n = std::min(plan.batch, header.chunk_count - next_chunk);
     s.n = n;
     s.first = next_chunk;
+    s.batch = b;
+    if (s.used) check_cuda(cudaEventSynchronize(s.h2d_done), "wait for set");
+    s.used = true;
 
     // The writer lays chunks out back to back in file order, so a batch's
-    // payload is one contiguous range we can read with a single fread.
+    // payload is one contiguous range we can read in one pass.
     uint64_t base = entries[s.first].offset;
     uint64_t expect = base;
     for (uint32_t c = 0; c < n; ++c) {
@@ -585,16 +887,12 @@ struct Decompressor {
       s.h_group_id.p[c] = chunk_group.empty() ? 0 : chunk_group[s.first + c];
     }
     uint64_t total_in = expect - base;
-
-    double t = now_s();
-    if (std::fseek(in, payload_start + (long)base, SEEK_SET) != 0) die("seek failed");
-    if (std::fread(s.h_in.p, 1, total_in, in) != total_in) die("short read on compressed payload");
-    g_stats.fread_s += now_s() - t;
     next_chunk += n;
 
-    cudaStream_t st = s.ev.stream;
-    check_cuda(cudaEventRecord(s.ev.h2d0, st), "cudaEventRecord");
-    check_cuda(cudaMemcpyAsync(s.d_in.p, s.h_in.p, total_in, cudaMemcpyHostToDevice, st), "H2D input");
+    cudaStream_t st = s.stream;
+    g_stats.mark(b, kH2d0, st);
+    if (std::fseek(in, payload_start + (long)base, SEEK_SET) != 0) die("seek failed");
+    in_ring.upload(in, s.d_in.p, total_in, st, "short read on compressed payload");
     check_cuda(cudaMemcpyAsync(s.d_in_offsets.p, s.h_in_offsets.p, n * sizeof(uint32_t), cudaMemcpyHostToDevice, st),
                "H2D offsets");
     check_cuda(cudaMemcpyAsync(s.d_in_lens.p, s.h_in_lens.p, n * sizeof(uint32_t), cudaMemcpyHostToDevice, st),
@@ -603,32 +901,52 @@ struct Decompressor {
                "H2D out_lens");
     check_cuda(cudaMemcpyAsync(s.d_group_id.p, s.h_group_id.p, n * sizeof(uint32_t), cudaMemcpyHostToDevice, st),
                "H2D group_id");
-    check_cuda(cudaEventRecord(s.ev.h2d1, st), "cudaEventRecord");
-    g_stats.h2d_bytes += total_in;
-
-    check_cuda(cudaMemsetAsync(s.d_err.p, 0, sizeof(uint32_t), st), "clear error flag");
-    check_cuda(cudaEventRecord(s.ev.k0, st), "cudaEventRecord");
-    launch_decompress(s.d_in.p, s.d_in_offsets.p, n, s.d_in_lens.p, s.d_out.p, header.chunk_size,
-                       s.d_out_lens.p, s.d_scratch.p, d_group_tables.p, s.d_group_id.p, s.d_err.p, st);
-    check_cuda(cudaGetLastError(), "decompress_kernel launch");
-    check_cuda(cudaEventRecord(s.ev.k1, st), "cudaEventRecord");
-
-    size_t out_bytes = (size_t)(n - 1) * header.chunk_size + s.h_out_lens.p[n - 1];
-    check_cuda(cudaEventRecord(s.ev.d2h0, st), "cudaEventRecord");
-    check_cuda(cudaMemcpyAsync(s.h_out.p, s.d_out.p, out_bytes, cudaMemcpyDeviceToHost, st), "D2H output");
-    check_cuda(cudaMemcpyAsync(s.h_err.p, s.d_err.p, sizeof(uint32_t), cudaMemcpyDeviceToHost, st), "D2H err");
-    check_cuda(cudaEventRecord(s.ev.d2h1, st), "cudaEventRecord");
-    g_stats.d2h_bytes += out_bytes;
-    s.in_flight = true;
+    check_cuda(cudaEventRecord(s.h2d_done, st), "cudaEventRecord");
+    g_stats.mark(b, kH2d1, st);
   }
 
+  void launch(DecompressSet& s) {
+    cudaStream_t st = s.stream;
+    check_cuda(cudaMemsetAsync(s.d_err.p, 0, sizeof(uint32_t), st), "clear error flag");
+    g_stats.mark(s.batch, kK0, st);
+    launch_decompress(s.d_in.p, s.d_in_offsets.p, s.n, s.d_in_lens.p, s.d_out.p, header.chunk_size,
+                      s.d_out_lens.p, s.d_scratch.p, d_group_tables.p, s.d_group_id.p, s.d_err.p, st);
+    check_cuda(cudaGetLastError(), "decompress_kernel launch");
+    g_stats.mark(s.batch, kK1, st);
+    // Downloaded ahead of the output on the same stream, so the writer can
+    // check it before writing any of this batch.
+    check_cuda(cudaMemcpyAsync(h_err.p + s.batch, s.d_err.p, sizeof(uint32_t), cudaMemcpyDeviceToHost, st),
+               "D2H err");
+    s.d2h_pending = true;
+  }
+
+  // Queues s's output for the writer; batches must come through in order.
+  void enqueue_d2h(DecompressSet& s) {
+    uint64_t out_bytes = (uint64_t)(s.n - 1) * header.chunk_size + s.h_out_lens.p[s.n - 1];
+    g_stats.mark(s.batch, kD2h0, s.stream);
+    download(writer, s.d_out.p, out_bytes, s.stream, h_err.p + s.batch);
+    g_stats.mark(s.batch, kD2h1, s.stream);
+    s.d2h_pending = false;
+  }
+
+  // Same shape as Compressor::run: batch b-1's output is queued after batch
+  // b is launched, so the writer drains it while b's kernels run.
   void run() {
     for (int b = 0; b < plan.batches; ++b) {
       DecompressSet& s = sets[b % plan.sets];
-      finish(s);
+      if (s.d2h_pending) enqueue_d2h(s);
+      upload(s, b);
       launch(s);
+      if (b > 0) {
+        DecompressSet& prev = sets[(b - 1) % plan.sets];
+        if (prev.d2h_pending) enqueue_d2h(prev);
+      }
     }
-    for (int b = std::max(0, plan.batches - plan.sets); b < plan.batches; ++b) finish(sets[b % plan.sets]);
+    for (int b = std::max(0, plan.batches - plan.sets); b < plan.batches; ++b) {
+      DecompressSet& s = sets[b % plan.sets];
+      if (s.d2h_pending && s.batch == b) enqueue_d2h(s);
+    }
+    writer.finish();
   }
 };
 
@@ -686,8 +1004,9 @@ void decompress(const std::string& in_path, const std::string& out_path) {
 
     double t = now_s();
     dz.allocate();
-    dz.prepare_group_tables(dz.sets[0].ev.stream);
+    dz.prepare_group_tables(dz.sets[0].stream);
     g_stats.setup_s += now_s() - t;
+    g_stats.start_clock(dz.sets[0].stream);
 
     dz.run();
     g_stats.bytes_in = file_size(in);
@@ -701,10 +1020,10 @@ void decompress(const std::string& in_path, const std::string& out_path) {
 void usage() {
   std::fprintf(stderr,
                "usage:\n"
-               "  gzp c <input> <output> [chunk_size] [--profile speed|balance|ratio]   compress\n"
-               "  gzp d <input> <output>                                                decompress\n"
-               "chunk_size and --profile are mutually exclusive; the bare default (neither\n"
-               "given) is unchanged from before --profile existed.\n");
+               "  gzp c <input> <output> [chunk_size | --profile speed|balance|ratio]   compress\n"
+               "  gzp d <input> <output>                                               decompress\n"
+               "chunk_size and --profile are mutually exclusive; with neither, chunk_size is %u.\n",
+               kDefaultChunkSize);
   std::exit(1);
 }
 
@@ -722,15 +1041,21 @@ int main(int argc, char** argv) {
     uint32_t chunk_size = kDefaultChunkSize;
     for (int i = 4; i < argc; ++i) {
       std::string a = argv[i];
-      if (a == "--profile" && i + 1 < argc) {
+      if (a == "--profile") {
+        if (i + 1 >= argc) die("--profile needs a value (speed, balance, or ratio)");
         std::string p = argv[++i];
         if (p == "speed") chunk_size = kProfileSpeedChunkSize;
         else if (p == "balance") chunk_size = kProfileBalanceChunkSize;
         else if (p == "ratio") chunk_size = kProfileRatioChunkSize;
         else die("unknown --profile: " + p + " (expected speed, balance, or ratio)");
+        if (have_profile) die("--profile given more than once");
         have_profile = true;
       } else {
-        chunk_size = (uint32_t)std::strtoul(a.c_str(), nullptr, 10);
+        char* end = nullptr;
+        unsigned long v = std::strtoul(a.c_str(), &end, 10);
+        if (a.empty() || a[0] == '-' || *end != '\0') die("unrecognised argument: " + a);
+        if (have_chunk_size) die("chunk_size given more than once");
+        chunk_size = v > kMaxChunkSize ? kMaxChunkSize + 1 : (uint32_t)v;
         have_chunk_size = true;
       }
     }
@@ -740,6 +1065,7 @@ int main(int argc, char** argv) {
     }
     compress(in_path, out_path, chunk_size);
   } else if (mode == "d") {
+    if (argc != 4) usage();
     decompress(in_path, out_path);
   } else {
     usage();

@@ -24,6 +24,10 @@ set_target_properties(gzp PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON
 )
 
+# main.cu's output writer thread.
+find_package(Threads REQUIRED)
+target_link_libraries(gzp PRIVATE Threads::Threads)
+
 target_compile_options(gzp PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-O3>
   $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>

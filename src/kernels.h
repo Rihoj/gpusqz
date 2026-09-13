@@ -49,18 +49,30 @@ __host__ __device__ inline size_t hash_table_bytes(uint32_t chunk_size) {
   return ((size_t)1 << hash_table_bits(chunk_size)) * kHashBucketWays * sizeof(uint32_t);
 }
 
-// Per-chunk device scratch used by the LzRans paths: a 12-byte record per
-// sequence, then one repeat-offset-code byte per sequence
+// Per-chunk device scratch used by the LzRans paths: an 8-byte record per
+// sequence (SeqRec, lz_warp.cuh, which static_asserts its size against
+// kSeqRecBytes -- that header includes this one, not the other way
+// around), then one repeat-offset-code byte per sequence
 // (compute_repeat_codes(), rans.cuh), then the literals -- each section
-// 16-byte aligned. Must agree with chunk_scratch() in kernels.cu (which
-// uses sizeof(SeqRec) directly; this copy exists only because lz_warp.cuh,
-// where SeqRec is defined, includes this header, not the other way
-// around).
+// 16-byte aligned. chunk_scratch() in kernels.cu carves it up with the
+// helpers below.
+//
+// Compress also reuses the batch's scratch as the destination of the
+// output compaction (launch_compact's d_packed): scratch is dead once the
+// encode kernel has run, and it is always at least one output slot per
+// chunk (see scratch_holds_packed below).
+constexpr size_t kSeqRecBytes = 8;
+__host__ __device__ inline size_t scratch_seqs_bytes(uint32_t chunk_size) {
+  return (kSeqRecBytes * max_sequences(chunk_size) + 15) & ~(size_t)15;
+}
+__host__ __device__ inline size_t scratch_rep_bytes(uint32_t chunk_size) {
+  return ((size_t)max_sequences(chunk_size) + 15) & ~(size_t)15;
+}
+__host__ __device__ inline size_t scratch_lits_offset(uint32_t chunk_size) {
+  return scratch_seqs_bytes(chunk_size) + scratch_rep_bytes(chunk_size);
+}
 __host__ __device__ inline size_t scratch_bytes(uint32_t chunk_size) {
-  size_t seqs = ((size_t)12 * max_sequences(chunk_size) + 15) & ~(size_t)15;
-  size_t rep = ((size_t)max_sequences(chunk_size) + 15) & ~(size_t)15;
-  size_t lits = ((size_t)chunk_size + 15) & ~(size_t)15;
-  return seqs + rep + lits;
+  return scratch_lits_offset(chunk_size) + (((size_t)chunk_size + 15) & ~(size_t)15);
 }
 
 // Per-batch buffers for the LzRans pipeline, all sized independently of
