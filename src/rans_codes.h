@@ -31,6 +31,13 @@ constexpr int kSmallSyms = 32; // lit_len / match_len / offset alphabets (29, 28
 // off_code() at floor_log2(1<<20) = 20, comfortably below this.
 constexpr uint32_t kOffRepBase = kSmallSyms - 3;
 static_assert(kOffRepBase > 20, "repeat-offset codes must exceed any real off_code() for kMaxChunkSize");
+// Largest lit_len / match_len value len_code() can represent: code
+// 12 + floor(log2 v) must stay below kSmallSyms, so v < 2^(kSmallSyms-12)
+// = 2^20. One real value exceeds it: a kMaxChunkSize (2^20) chunk with no
+// match at all is a single literal run of exactly 2^20. The encoder
+// detects that and stores such a chunk as Lz tokens instead (whose
+// 255-extension lengths are unbounded); see rans_encode_warp.
+constexpr uint32_t kMaxLenValue = (1u << (kSmallSyms - 12)) - 1;
 constexpr int kRansStates = 32;
 constexpr int kQuantBytes = kLitSyms + 3 * kSmallSyms;
 // Payload header after the chunk flag: n_seq, n_lit, states. The quantised

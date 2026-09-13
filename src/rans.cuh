@@ -200,8 +200,14 @@ __device__ inline void accumulate_hist(const SeqRec* seqs, uint32_t n_seq, const
   for (uint32_t i = lane; i < n_seq; i += 32) {
     SeqRec r = seqs[i];
     uint32_t c, nb, b;
-    len_code(r.lit_len, c, nb, b);
-    atomicAdd(&batch_cnt[kLlBase + c], 1u);
+    // A literal run too long for the ll alphabet (only possible for a
+    // match-free kMaxChunkSize chunk, see kMaxLenValue) would index past
+    // the ll table into the ml one. That chunk never uses rANS, so just
+    // leave its run out of the histogram.
+    if (r.lit_len <= kMaxLenValue) {
+      len_code(r.lit_len, c, nb, b);
+      atomicAdd(&batch_cnt[kLlBase + c], 1u);
+    }
     len_code(r.ml ? (uint32_t)r.ml - (kMinMatch - 1) : 0, c, nb, b);
     atomicAdd(&batch_cnt[kMlBase + c], 1u);
     if (r.ml) {
@@ -294,6 +300,13 @@ __device__ inline bool rans_encode_warp(const SeqRec* seqs, uint32_t n_seq, cons
   const uint16_t* wlimit = slot_end - max_stream / 2;
   uint16_t* wp = slot_end;
   uint32_t x = kRansL;
+
+  // Match lengths are always <= kMaxLenValue (a match starts at p >= 1), but
+  // a match-free kMaxChunkSize chunk is one literal run of 2^20, one past
+  // what the ll alphabet can code. Such a chunk falls back to Lz tokens.
+  bool too_long = false;
+  for (uint32_t i = lane; i < n_seq; i += 32) too_long |= seqs[i].lit_len > kMaxLenValue;
+  if (__any_sync(kFullMask, too_long)) return false;
 
   for (int g = (int)((n_lit + 31) / 32) - 1; g >= 0; --g) {
     uint32_t idx = g * 32 + lane;

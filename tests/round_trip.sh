@@ -166,6 +166,35 @@ if [ "$EXTREMES" -eq 1 ]; then
   mismatch_file="$(make_case mismatch_batch_src $((5 * 1024 * 1024)) text)"
   run_case_mismatched_batch "small_enc_large_dec" "$mismatch_file" 64 4000
   run_case_mismatched_batch "large_enc_small_dec" "$mismatch_file" 4000 64
+
+  # A De Bruijn sequence B(32,4) is exactly 2^20 bytes in which every 4-byte
+  # string occurs once, so the LZ parse finds no match and a 1MB chunk is a
+  # single literal run of 2^20 -- one past what the rANS length alphabet can
+  # code (kMaxLenValue) -- while its skewed 32-letter alphabet still makes
+  # entropy coding look worthwhile. This once produced undecodable output.
+  if command -v python3 >/dev/null; then
+    python3 - "$TMP/debruijn_1mb.in" <<'EOF'
+import sys
+k, n = 32, 4
+a, seq = [0] * k * n, []
+def db(t, p):
+    if t > n:
+        if n % p == 0:
+            seq.extend(a[1:p + 1])
+    else:
+        a[t] = a[t - p]
+        db(t + 1, p)
+        for j in range(a[t - p] + 1, k):
+            a[t] = j
+            db(t + 1, t)
+db(1, 1)
+alpha = b"etaoinshrdlcumwfgypbvkjxqzETAOIN"
+open(sys.argv[1], "wb").write(bytes(alpha[s] for s in seq))
+EOF
+    run_case 1048576 "debruijn_1mb" "$TMP/debruijn_1mb.in"
+  else
+    echo "SKIP debruijn_1mb (python3 not found)"
+  fi
 fi
 
 if [ "${BIG:-0}" = "1" ]; then
