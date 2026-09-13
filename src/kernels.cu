@@ -39,18 +39,13 @@ __device__ __forceinline__ void chunk_scratch(uint8_t* scratch, uint32_t c, uint
 // since they never reach the encode kernel. Others are parsed into scratch
 // and contribute to the batch histogram; n_seq[c]/n_lit[c] record how much
 // of scratch is valid so the encode kernel doesn't need to re-parse.
-// htab is dynamic shared memory: kWarpsPerBlock == 1, so the whole
-// per-block allocation (sized by the launcher via pick_hash_bits()) is
-// this one warp's table.
 __global__ void GZP_LAUNCH_BOUNDS
 parse_hist_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, const uint32_t* in_lens,
                   uint8_t* out, uint32_t out_slot_stride, uint32_t* out_start, uint32_t* out_sizes,
-                  uint8_t* scratch, uint32_t* n_seq_arr, uint32_t* n_lit_arr, uint32_t* batch_cnt,
-                  int hash_bits) {
-  extern __shared__ uint32_t htab[];
-  static_assert(kWarpsPerBlock == 1, "dynamic htab assumes the whole block's smem is one warp's table");
-  int lane = threadIdx.x & 31;
-  uint32_t c = blockIdx.x;
+                  uint8_t* scratch, uint32_t* n_seq_arr, uint32_t* n_lit_arr, uint32_t* batch_cnt) {
+  __shared__ uint32_t htab[kWarpsPerBlock][kHashWords];
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  uint32_t c = blockIdx.x * kWarpsPerBlock + warp;
   if (c >= chunk_count) return;
 
   const uint8_t* chunk_in = in + (size_t)c * chunk_size;
@@ -74,7 +69,7 @@ parse_hist_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, 
   uint8_t* lits;
   chunk_scratch(scratch, c, chunk_size, seqs, rep_code, lits);
   SeqEmitter em{chunk_in, seqs, lits};
-  lz_parse_warp(chunk_in, in_len, htab, hash_bits, em);
+  lz_parse_warp(chunk_in, in_len, htab[warp], em);
   compute_repeat_codes(seqs, em.n_seq, rep_code);
   accumulate_hist(seqs, em.n_seq, rep_code, lits, em.n_lit, batch_cnt);
   if (lane == 0) {
@@ -207,38 +202,18 @@ __global__ void expand_group_tables_kernel(const uint8_t* q_all, uint32_t group_
 // Host-callable launchers
 // ---------------------------------------------------------------------------
 
-// The parse kernel's hash table is dynamic shared memory so its size can
-// scale with chunk_size (see pick_hash_bits() in lz_warp.cuh) past the
-// 48KB default static limit; that requires both raising this kernel's
-// opt-in dynamic-shared-memory ceiling and knowing what the device
-// actually allows, both queried/set once and cached.
-static size_t max_parse_smem_bytes() {
-  static size_t bytes = 0;
-  if (bytes == 0) {
-    int device = 0;
-    cudaGetDevice(&device);
-    int optin = 0;
-    cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-    cudaFuncSetAttribute(parse_hist_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, optin);
-    bytes = (size_t)optin;
-  }
-  return bytes;
-}
-
 void launch_compress(const uint8_t* d_in, uint32_t chunk_size, uint32_t chunk_count,
                       const uint32_t* d_in_lens, uint8_t* d_out, uint32_t out_slot_stride,
                       uint32_t* d_out_start, uint32_t* d_out_sizes, uint8_t* d_scratch,
                       const RansBatchBufs& d_rans, cudaStream_t stream) {
   uint32_t blocks = (chunk_count + kWarpsPerBlock - 1) / kWarpsPerBlock;
-  int hash_bits = pick_hash_bits(chunk_size, max_parse_smem_bytes());
-  size_t smem_bytes = hash_table_bytes(hash_bits);
   // Parse+histogram everything in the batch, build one shared table, then
   // encode. Sequential on `stream`, so each stage sees the previous one's
   // complete output.
   cudaMemsetAsync(d_rans.cnt, 0, kQuantBytes * sizeof(uint32_t), stream);
-  parse_hist_kernel<<<blocks, kBlockThreads, smem_bytes, stream>>>(
-      d_in, chunk_size, chunk_count, d_in_lens, d_out, out_slot_stride, d_out_start, d_out_sizes, d_scratch,
-      d_rans.n_seq, d_rans.n_lit, d_rans.cnt, hash_bits);
+  parse_hist_kernel<<<blocks, kBlockThreads, 0, stream>>>(d_in, chunk_size, chunk_count, d_in_lens, d_out,
+                                                          out_slot_stride, d_out_start, d_out_sizes, d_scratch,
+                                                          d_rans.n_seq, d_rans.n_lit, d_rans.cnt);
   build_table_kernel<<<1, 32, 0, stream>>>(d_rans.cnt, d_rans.q, d_rans.freq, d_rans.cum);
   rans_encode_kernel<<<blocks, kBlockThreads, 0, stream>>>(d_in, chunk_size, chunk_count, d_in_lens, d_out,
                                                            out_slot_stride, d_out_start, d_out_sizes, d_scratch,
