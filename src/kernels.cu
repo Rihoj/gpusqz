@@ -39,11 +39,13 @@ __device__ __forceinline__ void chunk_scratch(uint8_t* scratch, uint32_t c, uint
 // since they never reach the encode kernel. Others are parsed into scratch
 // and contribute to the batch histogram; n_seq[c]/n_lit[c] record how much
 // of scratch is valid so the encode kernel doesn't need to re-parse.
+// htab is chunk_count * hash_table_bytes(chunk_size) of global memory (see
+// kernels.h): chunk c's region starts at htab + c * hash_table_words.
 __global__ void GZP_LAUNCH_BOUNDS
 parse_hist_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, const uint32_t* in_lens,
                   uint8_t* out, uint32_t out_slot_stride, uint32_t* out_start, uint32_t* out_sizes,
-                  uint8_t* scratch, uint32_t* n_seq_arr, uint32_t* n_lit_arr, uint32_t* batch_cnt) {
-  __shared__ uint32_t htab[kWarpsPerBlock][kHashWords];
+                  uint8_t* scratch, uint32_t* htab, uint32_t hash_bits, uint32_t* n_seq_arr, uint32_t* n_lit_arr,
+                  uint32_t* batch_cnt) {
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   uint32_t c = blockIdx.x * kWarpsPerBlock + warp;
   if (c >= chunk_count) return;
@@ -68,8 +70,9 @@ parse_hist_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, 
   uint8_t* rep_code;
   uint8_t* lits;
   chunk_scratch(scratch, c, chunk_size, seqs, rep_code, lits);
+  uint32_t hash_words = (1u << hash_bits) * (uint32_t)kBucketWays;
   SeqEmitter em{chunk_in, seqs, lits};
-  lz_parse_warp(chunk_in, in_len, htab[warp], em);
+  lz_parse_warp(chunk_in, in_len, htab + (size_t)c * hash_words, (int)hash_bits, em);
   compute_repeat_codes(seqs, em.n_seq, rep_code);
   accumulate_hist(seqs, em.n_seq, rep_code, lits, em.n_lit, batch_cnt);
   if (lane == 0) {
@@ -204,16 +207,17 @@ __global__ void expand_group_tables_kernel(const uint8_t* q_all, uint32_t group_
 
 void launch_compress(const uint8_t* d_in, uint32_t chunk_size, uint32_t chunk_count,
                       const uint32_t* d_in_lens, uint8_t* d_out, uint32_t out_slot_stride,
-                      uint32_t* d_out_start, uint32_t* d_out_sizes, uint8_t* d_scratch,
+                      uint32_t* d_out_start, uint32_t* d_out_sizes, uint8_t* d_scratch, uint32_t* d_htab,
                       const RansBatchBufs& d_rans, cudaStream_t stream) {
   uint32_t blocks = (chunk_count + kWarpsPerBlock - 1) / kWarpsPerBlock;
+  uint32_t hash_bits = (uint32_t)hash_table_bits(chunk_size);
   // Parse+histogram everything in the batch, build one shared table, then
   // encode. Sequential on `stream`, so each stage sees the previous one's
   // complete output.
   cudaMemsetAsync(d_rans.cnt, 0, kQuantBytes * sizeof(uint32_t), stream);
   parse_hist_kernel<<<blocks, kBlockThreads, 0, stream>>>(d_in, chunk_size, chunk_count, d_in_lens, d_out,
                                                           out_slot_stride, d_out_start, d_out_sizes, d_scratch,
-                                                          d_rans.n_seq, d_rans.n_lit, d_rans.cnt);
+                                                          d_htab, hash_bits, d_rans.n_seq, d_rans.n_lit, d_rans.cnt);
   build_table_kernel<<<1, 32, 0, stream>>>(d_rans.cnt, d_rans.q, d_rans.freq, d_rans.cum);
   rans_encode_kernel<<<blocks, kBlockThreads, 0, stream>>>(d_in, chunk_size, chunk_count, d_in_lens, d_out,
                                                            out_slot_stride, d_out_start, d_out_sizes, d_scratch,

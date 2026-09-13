@@ -11,6 +11,44 @@ namespace gzp {
 // Every match covers at least kMinMatch bytes, plus one optional tail.
 __host__ __device__ inline uint32_t max_sequences(uint32_t chunk_size) { return chunk_size / kMinMatch + 1; }
 
+// Sizing for the LZ parse's per-chunk match-finding hash table (lz_warp.cuh).
+// This table now lives in *global* memory (one region per chunk, allocated
+// alongside the rest of compress's per-chunk scratch) rather than shared
+// memory, specifically so its size can scale with chunk_size without
+// touching the 48KB-per-block shared-memory threshold that caused a real
+// regression the last time this table was grown (see the comment in
+// lz_warp.cuh). kHashBucketWays here must match lz_warp.cuh's
+// kBucketWays -- duplicated for the same layering reason scratch_bytes()
+// duplicates SeqRec's size (lz_warp.cuh includes this header, not the
+// other way around).
+constexpr int kHashBucketWays = 4;
+// Only 3 chunk sizes actually get exercised in practice (the `speed`/
+// `balance`/`ratio` profile presets, format.h), so this is a measured
+// two-tier choice rather than a generic formula extrapolated to sizes
+// nothing has validated:
+// - <= 4x the default (up to and including `balance`'s 256KB): stays at
+//   2048 buckets, the original shared-memory-era table size. Growing
+//   `balance`'s table by even one step measured a real ~25-30%
+//   compress-kernel regression on varied real data (this table's now in
+//   global memory rather than shared, so that's a genuine bandwidth/
+//   latency cost, not the shared-memory occupancy or cache-partition
+//   costs a bigger *shared* table paid -- see lz_warp.cuh) for a ratio
+//   gain that didn't justify it there.
+// - above that (in practice, just `ratio`'s 1MB): 8192 buckets (4x).
+//   Measured a real, consistent ~2x compress-kernel cost on both a
+//   repetitive and a genuinely varied large corpus (not a corpus-
+//   dependent cliff like the shared-memory attempts), in exchange for
+//   gzp's biggest ratio win this session -- a trade `ratio`'s whole
+//   purpose is to prefer. Growing further wasn't tried; the two
+//   corpora above are what it should be validated against before
+//   moving this constant.
+__host__ __device__ inline int hash_table_bits(uint32_t chunk_size) {
+  return chunk_size <= 4 * kDefaultChunkSize ? 11 : 13;
+}
+__host__ __device__ inline size_t hash_table_bytes(uint32_t chunk_size) {
+  return ((size_t)1 << hash_table_bits(chunk_size)) * kHashBucketWays * sizeof(uint32_t);
+}
+
 // Per-chunk device scratch used by the LzRans paths: a 12-byte record per
 // sequence, then one repeat-offset-code byte per sequence
 // (compute_repeat_codes(), rans.cuh), then the literals -- each section
@@ -41,7 +79,11 @@ struct RansBatchBufs {
 // Chunk c's input lives at d_in + c*chunk_size with d_in_lens[c] valid
 // bytes. Its output (flag byte + payload) is written into the fixed slot
 // d_out + c*out_slot_stride starting at byte d_out_start[c], with total
-// size d_out_sizes[c]. d_scratch holds chunk_count * scratch_bytes().
+// size d_out_sizes[c]. d_scratch holds chunk_count * scratch_bytes();
+// d_htab holds chunk_count * hash_table_bytes(chunk_size) -- the LZ
+// parse's match-finding table, one region per chunk (see hash_table_bits
+// above for why this is a separate global-memory buffer rather than
+// living in d_scratch or shared memory).
 //
 // This is actually 3 kernel launches on `stream` (parse + histogram, build
 // the shared table, encode against it) rather than 1; d_rans is scratch
@@ -50,7 +92,7 @@ struct RansBatchBufs {
 // rANS encoding, or to Raw storage when neither beats the input.
 void launch_compress(const uint8_t* d_in, uint32_t chunk_size, uint32_t chunk_count,
                       const uint32_t* d_in_lens, uint8_t* d_out, uint32_t out_slot_stride,
-                      uint32_t* d_out_start, uint32_t* d_out_sizes, uint8_t* d_scratch,
+                      uint32_t* d_out_start, uint32_t* d_out_sizes, uint8_t* d_scratch, uint32_t* d_htab,
                       const RansBatchBufs& d_rans, cudaStream_t stream);
 
 // Chunk c's compressed data lives at d_in + d_in_offsets[c] with

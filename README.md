@@ -17,25 +17,27 @@ best of 5 runs (`REPEAT=5`) per column. Wall figures are whole-process
 (file I/O, PCIe copies, and for gzp ~0.15–0.3s of CUDA context
 creation); the kernel columns are GPU time only. **This corpus is 48
 repeats of one 5.4MB text block — see the caveat in *Benchmarking* about
-why a genuinely varied large file is a different, and in one case much
-worse, story.**
+why validating against a genuinely varied large file matters here.**
 
 | codec | compress MB/s (wall) | kernel MB/s | decompress MB/s (wall) | kernel MB/s | ratio |
 |---|---|---|---|---|---|
-| **gzp** (`--profile speed`, 64KB) | **417** | 742 | **676** | 3050 | 0.2775 |
-| gzip -1 | 152 | – | 269 | – | 0.2985 |
-| gzip -6 | 59 | – | 304 | – | 0.2457 |
-| zstd -1 (1 thread) | 547 | – | 1427 | – | 0.2724 |
-| zstd -3 (1 thread) | 417 | – | 1359 | – | 0.2426 |
+| **gzp** (`--profile speed`, 64KB) | **628** | 2458 | **643** | 2993 | 0.2775 |
+| gzip -1 | 145 | – | 262 | – | 0.2985 |
+| gzip -6 | 56 | – | 292 | – | 0.2457 |
+| zstd -1 (1 thread) | 538 | – | 1381 | – | 0.2724 |
+| zstd -3 (1 thread) | 408 | – | 1320 | – | 0.2426 |
 
-gzp beats `gzip -1` on both ratio and speed at every chunk size. Ratio
-(lower is better) is a mixed picture against zstd: at the default
-`speed` profile gzp is *larger* than `zstd -1` (0.2775 vs 0.2724); `zstd
--3` (0.2426) and `gzip -6` (0.2457) beat gzp at every profile, including
-`ratio`. zstd's hand-tuned encoder and decoder are also faster on both
-ends here. Earlier measurements taken while another process held ~90% of
-the GPU showed much lower and noisier numbers purely from contention —
-`REPEAT=<n>` (see *Benchmarking*) exists because of exactly that.
+gzp beats `gzip -1` on both ratio and speed at every chunk size, and now
+beats `zstd -1`'s compress speed too (its hand-tuned decoder is still
+faster). Ratio (lower is better) is a mixed picture against zstd: at the
+default `speed` profile gzp is *larger* than `zstd -1` (0.2775 vs
+0.2724); `zstd -3` (0.2426) and `gzip -6` (0.2457) beat every gzp
+profile, `ratio` included, though `ratio` (0.2500) is now clearly closer
+to them than it used to be (see below). Earlier measurements taken while
+another process held ~90% of the GPU showed much lower and noisier
+numbers purely from contention — `REPEAT=<n>` (see *Benchmarking*)
+exists because of exactly that, and it mattered more than usual while
+tuning the match-finding table below (see *Known limitations*).
 
 Chunk size trades ratio for speed — bigger chunks give the match finder
 more history to search, at the cost of fewer, coarser-grained units of
@@ -44,13 +46,16 @@ presets:
 
 | profile | chunk | ratio | compress kernel MB/s | decompress kernel MB/s |
 |---|---|---|---|---|
-| speed (default) | 64KB | 0.2775 | 742 | 3050 |
-| balance | 256KB | 0.2687 | 477 | 838 |
-| ratio | 1MB | **0.2662** | 217 | 226 |
+| speed (default) | 64KB | 0.2775 | 2458 | 2993 |
+| balance | 256KB | 0.2687 | 805 | 829 |
+| ratio | 1MB | **0.2500** | 214 | 205 |
 
 `balance` and `ratio` both beat `zstd -1`'s 0.2724 on this corpus, at a
-real compress/decompress-speed cost; neither beats `zstd -3`'s 0.2426 or
-`gzip -6`'s 0.2457.
+real compress/decompress-speed cost relative to zstd (not relative to
+gzp's own other profiles -- see *Known limitations* for why `ratio`
+here is barely slower than it used to be despite compressing noticeably
+better than before). Neither beats `zstd -3`'s 0.2426 or `gzip -6`'s
+0.2457.
 
 ## How it works
 
@@ -68,16 +73,25 @@ cannot damage another.
 ### LZ parse (`src/lz_warp.cuh`)
 
 The warp walks a chunk in 32-byte windows. Every lane hashes the 4 bytes
-at its own position, reads a 4-way bucket from a per-warp shared-memory
-hash table (2048 buckets, one u32 chunk-relative position per word — 32KB
-per warp, the whole default static shared-memory budget for one warp's
-table, since positions no longer fit in 16 bits once chunks can exceed
-64KB) and compares against all four candidates, capped at 32 bytes so
-per-lane work is bounded. One deterministic lane per bucket then inserts
-its position, evicting the oldest of the four; lanes that found nothing
-re-probe once more so repeats shorter than a window apart are caught
-immediately. This table's size is fixed regardless of chunk_size — see
-*Known limitations* for why growing it past 48KB was tried and reverted.
+at its own position, reads a 4-way bucket from this chunk's hash table
+(one u32 chunk-relative position per word, since positions no longer fit
+in 16 bits once chunks can exceed 64KB) and compares against all four
+candidates, capped at 32 bytes so per-lane work is bounded. One
+deterministic lane per bucket then inserts its position, evicting the
+oldest of the four; lanes that found nothing re-probe once more so
+repeats shorter than a window apart are caught immediately.
+
+The table lives in **global memory**, one region per chunk (sized by
+`hash_table_bits()`, `kernels.h`), rather than shared memory — after two
+earlier attempts at growing a *shared*-memory version both measured real
+regressions instead (see *Known limitations*), moving it to global
+memory sidestepped both problems and, unexpectedly, made the smaller
+chunk profiles faster too: freeing the shared memory this kernel used to
+reserve let more of its (tiny, 32-thread) blocks run concurrently per
+SM, more than paying for global memory's higher per-access latency at
+the table sizes `speed`/`balance` use. `ratio`'s bigger chunks get a 4x
+bigger table (see *Known limitations*) for a real ratio win at a real,
+but now much smaller and non-corpus-dependent, speed cost.
 
 The window's matches are selected warp-uniformly from a ballot mask with
 a lazy lookahead of up to `kLazySteps` positions (take position *i+1*'s
@@ -197,15 +211,15 @@ silently fell back to sm_52 instead of detecting the GPU.)
 occupancy testing — see the comment above it in `CMakeLists.txt` for
 why a bare `--maxrregcount` can't do this (both kernels already carry
 an explicit `__launch_bounds__`, which takes precedence). The parse
-kernel's match-finding table uses 32KB of the 48KB default static
-shared-memory budget for one warp (see *LZ parse*), leaving no room for
-a second block, so it's shared-memory-bound at 1 warp/SM regardless of
-this flag; measured against decompress too (52 registers/thread, no
-spills per `nvcc -Xptxas -v`) with `GZP_MIN_BLOCKS_PER_SM=4` and saw no
-measurable change — it's apparently already at whatever ceiling the
-hardware's max-blocks-per-SM limit imposes on 32-thread blocks, not a
-register one, so this knob is mostly useful as a regression check that a future
-change hasn't pushed either kernel into register spilling.
+kernel's match-finding table now lives in global memory (see *LZ
+parse*), so it uses no shared memory at all; measured (36 registers/
+thread for parse, 52 for decompress, no spills per `nvcc -Xptxas -v`)
+with `GZP_MIN_BLOCKS_PER_SM=4` and saw no measurable change on either
+kernel — both are apparently already at whatever ceiling the hardware's
+max-blocks-per-SM limit imposes on small (32-thread) blocks, not a
+register or shared-memory one, so this knob is mostly useful as a
+regression check that a future change hasn't pushed either kernel into
+register spilling.
 
 ## Usage
 
@@ -291,36 +305,58 @@ for this purpose, since that is exactly the shape that hid the bug.)
   on this WSL2 machine; on a 94MB file that is half the wall time. It
   amortises on larger inputs and is outside gzp's control.
 - **Ratio vs zstd.** gzp's rANS codes literals with an order-0 model and
-  its parser is a hash match finder with a fixed-capacity table plus a
+  its parser is a hash match finder with a global-memory table plus a
   short lazy lookahead (see *LZ parse*); `zstd -1` beats gzp's `speed`
   profile (0.2724 vs 0.2775 on this corpus) and `zstd -3`/`gzip -6` beat
-  every gzp profile, `ratio` included. Bigger chunks (`balance`, `ratio`)
-  give the parser more history to search and close/reverse the gap with
-  `zstd -1` specifically, at a real compress/decompress speed cost (see
-  *Results*). A real optimal parser (rather than greedy-plus-lookahead),
-  a context-mixing literal model, and a safely-grown match-finding table
-  (see the next item) would all improve the ratio further.
-- **The match-finding hash table's capacity doesn't scale with chunk
-  size**, so a 1MB chunk gets the same "recently seen positions" recall
-  as a 64KB one, spread over 16x more data. This was tried and reverted:
-  growing the table past 48KB requires requesting more than 48KB of
-  dynamic shared memory per launch, and doing that measurably changes
-  something about the SM's cache behaviour for the *whole* kernel launch,
-  not just the table. On the repetitive 283MB corpus above that cost was
-  invisible (compress kernel MB/s barely moved for a real ratio gain);
-  on a genuinely varied 1GB file built from real, non-repeated
-  `/usr/include` headers, the exact same code and growth path nearly
-  halved the `ratio` profile's compress-kernel throughput (349 -> ~190
-  MB/s) for the same small ratio gain. Confirmed the trigger is the
-  bytes actually requested at launch, not just raising the kernel's
-  ceiling via `cudaFuncSetAttribute` (raising the ceiling to the
-  device's full 99KB opt-in but still launching with 32KB requested
-  measured identically to never raising it). A future attempt should
-  stay under 48KB — e.g. a ~3072-bucket table, which needs a
-  modulo-based hash instead of the current shift-based one since 3072
-  isn't a power of two — and must be validated against a genuinely
-  varied large file, not just a repetitive one (see the caveat in
-  *Benchmarking*).
+  every gzp profile, `ratio` included, though `ratio`'s gap to them
+  closed noticeably this round (see *Results*). A real optimal parser
+  (rather than greedy-plus-lookahead) and a context-mixing literal model
+  would improve the ratio further at every profile.
+- **The match-finding hash table's capacity took two failed attempts
+  and a redesign to actually scale with chunk size**, worth recording in
+  full since the failures were informative:
+  1. *Dynamic shared memory, up to 64KB.* Requesting more than 48KB of
+     shared memory at launch measurably changes something about the SM's
+     cache behaviour for the *whole* kernel, not just the table. On the
+     repetitive 283MB corpus above that cost was invisible (compress
+     kernel MB/s barely moved for a real ratio gain); on the genuinely
+     varied 1GB file below, the exact same code and growth path nearly
+     halved the `ratio` profile's compress-kernel throughput. Confirmed
+     the trigger is the bytes actually requested at launch, not merely
+     raising the kernel's ceiling via `cudaFuncSetAttribute`.
+  2. *A bigger table fully inside the 48KB static default* (4096
+     buckets, 3-way instead of 4-way, no opt-in involved at all). Still
+     cost real throughput on both corpora (~38-52%, for only a ~1-4%
+     ratio gain) -- growing *any* static shared memory a 1-warp-per-block
+     kernel uses reduces how many of its blocks fit per SM, a normal,
+     unrelated occupancy cost. A modulo-hashed 3072-bucket variant tried
+     first regressed ratio *and* speed, tracked down to the multiplicative
+     hash constant being designed for its high bits (used by the
+     shift-based hash) rather than its low bits (what `%` on a
+     non-power-of-two reads); re-shifting before the modulo recovered the
+     ratio but not the speed, since integer modulo itself is expensive
+     per lane per window.
+  3. **Global memory** (what's shipped): moving the table off shared
+     memory entirely sidesteps both costs and, measured cleanly (GPU
+     otherwise idle -- see the note on contention below), made `speed`
+     and `balance` 1.5-3.6x *faster* at an unchanged ratio (freeing the
+     shared memory this kernel used to reserve let more of its blocks
+     run per SM), and let `ratio` grow to a 4x bigger table (8192
+     buckets) for its best ratio yet (0.2500 on the 283MB corpus, 0.2329
+     on the 1GB one -- 6-7% smaller either way) at only a ~3-8% compress-
+     kernel cost, consistent across both corpora rather than the
+     cliff attempts 1 and 2 hit. `hash_table_bits()` (`kernels.h`) is a
+     measured two-tier choice (unchanged up to `balance`'s 256KB, 4x
+     bigger above it), not a general formula, since only 3 chunk sizes
+     are actually exercised.
+  One genuine gotcha hit while measuring attempt 3: global memory's
+  higher per-access latency is far more sensitive to a *concurrent* GPU
+  process than shared memory was -- the same benchmark run under ~40%
+  contention from another process measured `ratio`'s compress kernel at
+  roughly half its actual (contention-free) speed, which would have been
+  wrongly reported as a regression had `REPEAT=<n>` not been re-run once
+  the GPU cleared. Always check `nvidia-smi` before trusting a global-
+  memory-table benchmark number.
 - **compute_repeat_codes' encode-side pass is serial, not
   warp-parallel.** Resolving repeat-offset codes (see *rANS stage*)
   needs the exact sequence-order state the decoder will reconstruct, so

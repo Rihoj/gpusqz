@@ -198,6 +198,7 @@ struct CompressSet {
   PinBuf<uint32_t> h_in_lens, h_sizes, h_offsets;
   PinBuf<uint8_t> h_q; // this batch's quantised table (kQuantBytes), LzRans mode only
   DevBuf<uint8_t> d_in, d_slots, d_packed, d_temp, d_scratch;
+  DevBuf<uint32_t> d_htab; // LZ parse's match-finding table, one region per chunk; see hash_table_bytes()
   DevBuf<uint32_t> d_in_lens, d_start, d_sizes, d_offsets;
   DevBuf<uint32_t> d_rans_cnt, d_rans_n_seq, d_rans_n_lit; // LzRans mode only
   DevBuf<uint16_t> d_rans_freq, d_rans_cum;                // LzRans mode only
@@ -212,6 +213,7 @@ struct CompressSet {
            h_q.alloc(kQuantBytes) && d_in.alloc((size_t)batch * chunk_size) &&
            d_slots.alloc((size_t)batch * slot_stride) && d_packed.alloc((size_t)batch * slot_stride) &&
            d_temp.alloc(temp_bytes) && d_scratch.alloc((size_t)batch * scratch_bytes(chunk_size)) &&
+           d_htab.alloc((size_t)batch * (hash_table_bytes(chunk_size) / sizeof(uint32_t))) &&
            d_in_lens.alloc(batch) && d_start.alloc(batch) && d_sizes.alloc(batch) && d_offsets.alloc(batch + 1) &&
            d_rans_cnt.alloc(kQuantBytes) && d_rans_n_seq.alloc(batch) && d_rans_n_lit.alloc(batch) &&
            d_rans_freq.alloc(kQuantBytes) && d_rans_cum.alloc(kQuantBytes) && d_rans_q.alloc(kQuantBytes);
@@ -219,6 +221,7 @@ struct CompressSet {
   void release() {
     h_in.release(); h_out.release(); h_in_lens.release(); h_sizes.release(); h_offsets.release(); h_q.release();
     d_in.release(); d_slots.release(); d_packed.release(); d_temp.release(); d_scratch.release();
+    d_htab.release();
     d_in_lens.release(); d_start.release(); d_sizes.release(); d_offsets.release();
     d_rans_cnt.release(); d_rans_n_seq.release(); d_rans_n_lit.release(); d_rans_freq.release();
     d_rans_cum.release(); d_rans_q.release();
@@ -241,7 +244,8 @@ struct Compressor {
 
   void allocate() {
     size_t dev_per_chunk = (size_t)chunk_size + 2 * (size_t)slot_stride + scratch_bytes(chunk_size) +
-                            6 * sizeof(uint32_t) + 2 * sizeof(uint16_t) + sizeof(uint8_t);
+                            hash_table_bytes(chunk_size) + 6 * sizeof(uint32_t) + 2 * sizeof(uint16_t) +
+                            sizeof(uint8_t);
     plan = plan_batches(chunk_count, chunk_size, dev_per_chunk);
     sets.resize(plan.sets);
     for (auto& s : sets) s.ev.create();
@@ -331,7 +335,7 @@ struct Compressor {
 
     check_cuda(cudaEventRecord(s.ev.k0, st), "cudaEventRecord");
     launch_compress(s.d_in.p, chunk_size, n, s.d_in_lens.p, s.d_slots.p, slot_stride, s.d_start.p, s.d_sizes.p,
-                    s.d_scratch.p, s.rans_bufs(), st);
+                    s.d_scratch.p, s.d_htab.p, s.rans_bufs(), st);
     check_cuda(cudaGetLastError(), "compress_kernel launch");
     check_cuda(launch_compact(s.d_slots.p, slot_stride, s.d_start.p, s.d_sizes.p, n, s.d_offsets.p, s.d_packed.p,
                               s.d_temp.p, temp_bytes, st),

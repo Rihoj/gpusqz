@@ -26,37 +26,41 @@ constexpr int kProbe = 32; // per-lane match-length cap before cooperative exten
 // 4-way set-associative hash table, one u32 chunk-relative position per
 // word (chunk_size can exceed 65536, so positions no longer fit in 16 bits
 // and can't be packed 2-per-word the way an earlier, 64KB-chunk-only
-// design did). 2048 buckets needs the whole 48KB static shared-memory
-// budget for just one warp's table, so blocks hold one warp each.
-// Measured against 8-way/256-bucket (same total words, more candidates
-// per bucket instead of more buckets) at the same word count: that was
-// worse on both ratio and speed, so more distinct buckets matters more
-// than deeper chains per bucket for this workload.
+// design did). Measured against 8-way/256-bucket (same total words, more
+// candidates per bucket instead of more buckets) at the same word count:
+// that was worse on both ratio and speed, so more distinct buckets
+// matters more than deeper chains per bucket for this workload.
 //
-// This was briefly grown further (dynamic shared memory, up to 64KB, for
-// chunk sizes above the default 64KB) and reverted: growing past 48KB
-// requires opting into a higher per-launch dynamic-shared-memory request,
-// and doing that measurably changes something about the SM's cache
-// behaviour for the *whole* kernel, not just the table -- on a 283MB
-// corpus built by repeating one 5.4MB text block 48x, that cost was
-// hidden (compress kernel MB/s barely moved), but on a genuinely varied
-// 1GB real-file corpus with the same code, the SAME growth to 64KB
-// nearly halved compress kernel throughput (349 -> ~190 MB/s at the 1MB
-// `ratio` profile) despite an unchanged, small ~4% ratio gain to show for
-// it. Confirmed the trigger is the actual bytes requested at launch, not
-// merely raising the kernel's ceiling via cudaFuncSetAttribute (a build
-// that raised the ceiling to 99KB but still launched with only 32KB
-// requested measured identically to never raising it at all) -- so this
-// specific 48KB line is a real, hardware-level threshold on this GPU, not
-// an artifact of the raise-the-ceiling call itself. A future attempt at
-// growing this table should stay under 48KB (e.g. a ~3072-bucket table,
-// which needs a modulo-based hash instead of the shift-based one below
-// since 3072 isn't a power of two) and be validated against a genuinely
-// varied large file, not just a repetitive one.
-constexpr int kHashBits = 11;
-constexpr int kHashSize = 1 << kHashBits; // number of buckets
-constexpr int kBucketWays = 4;
-constexpr int kHashWords = kHashSize * kBucketWays; // u32 words backing the table, 1 position each
+// This table lives in *global* memory now, one region per chunk (sized by
+// hash_table_bits()/hash_table_bytes() in kernels.h), not shared memory --
+// after two failed attempts at growing a shared-memory version:
+//  1. Dynamic shared memory past the 48KB-per-block static limit, up to
+//     64KB. Requesting more than 48KB of shared memory at launch measurably
+//     changes something about the SM's cache behaviour for the *whole*
+//     kernel, not just the table: on a 283MB corpus built by repeating one
+//     5.4MB text block 48x that cost was hidden (compress kernel MB/s
+//     barely moved), but on a genuinely varied 1GB real-file corpus the
+//     SAME growth to 64KB nearly halved compress kernel throughput (349 ->
+//     ~190 MB/s at the 1MB `ratio` profile) for an unchanged, small ~4%
+//     ratio gain. Confirmed the trigger is the bytes actually requested at
+//     launch, not merely raising the kernel's ceiling via
+//     cudaFuncSetAttribute (raising the ceiling to the device's 99KB
+//     opt-in but still launching with 32KB requested measured identically
+//     to never raising it at all).
+//  2. Staying at or under 48KB total (4096 buckets, 3-way instead of
+//     4-way, still fully static, no opt-in involved) still cost real
+//     throughput -- growing shared memory *at all*, even within the
+//     no-opt-in default, reduces how many of this 1-warp-per-block
+//     kernel's blocks fit per SM (basic CUDA occupancy, unrelated to the
+//     opt-in-triggered anomaly above). Measured ~38-52% slower across both
+//     corpora for a ~1-4% ratio gain -- a worse trade than doing nothing.
+// Moving the table out of shared memory entirely sidesteps both costs
+// (this kernel now uses none for the table), at the cost of global-memory
+// latency per probe/insert instead of shared-memory latency -- see
+// hash_table_bits() in kernels.h for the size/growth policy and the
+// README for how this measured against both a repetitive and a varied
+// corpus.
+constexpr int kBucketWays = kHashBucketWays; // kernels.h; must match here since it sizes this table
 constexpr int kWarpsPerBlock = 1;
 // How many positions ahead the lazy-match heuristic in lz_parse_warp will
 // look before committing to a match (see there). 1 was the original
@@ -81,9 +85,9 @@ __device__ __forceinline__ uint32_t load4(const uint8_t* p) {
   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-__device__ __forceinline__ uint32_t hash_at(const uint8_t* p) {
+__device__ __forceinline__ uint32_t hash_at(const uint8_t* p, int hash_bits) {
   uint32_t v = kMinMatch == 4 ? load4(p) : ((uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16));
-  return (v * 2654435761u) >> (32 - kHashBits);
+  return (v * 2654435761u) >> (32 - hash_bits);
 }
 
 __device__ __forceinline__ uint32_t match_len(const uint8_t* in, uint32_t a, uint32_t b, uint32_t max_len) {
@@ -201,8 +205,9 @@ __device__ inline bool tokens_from_seqs(const uint8_t* in, const SeqRec* seqs, u
 
 // Parses in[0..n) into sequences, calling emit(lit_start, lit_len, off, ml)
 // for each match (and once more with ml = 0 for any trailing literals).
-// htab is this warp's kHashWords-word shared-memory table (kHashSize
-// 4-way buckets). Returns false as soon as emit does.
+// htab is this chunk's (1 << hash_bits) * kBucketWays-word global-memory
+// table (see hash_table_bits(), kernels.h). Returns false as soon as emit
+// does.
 //
 // The warp walks the chunk in 32-byte windows. Every lane hashes its own
 // position, probes the four candidates in its bucket (capped at kProbe
@@ -213,9 +218,10 @@ __device__ inline bool tokens_from_seqs(const uint8_t* in, const SeqRec* seqs, u
 // has read; a repeat that starts and recurs inside the same 32 bytes is
 // picked up from the next window on.
 template <class Emit>
-__device__ inline bool lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* htab, Emit& emit) {
+__device__ inline bool lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* htab, int hash_bits, Emit& emit) {
   int lane = threadIdx.x & 31;
-  for (int i = lane; i < kHashWords; i += 32) htab[i] = 0xFFFFFFFFu;
+  uint32_t hash_words = (1u << hash_bits) * (uint32_t)kBucketWays;
+  for (uint32_t i = lane; i < hash_words; i += 32) htab[i] = 0xFFFFFFFFu;
   __syncwarp();
 
   uint32_t lit_start = 0;
@@ -227,7 +233,7 @@ __device__ inline bool lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* ht
     uint32_t bucket[kBucketWays]; // only read after being populated below, when valid
     uint32_t best_len = 0, best_off = 0;
     if (valid) {
-      h = hash_at(in + p);
+      h = hash_at(in + p, hash_bits);
 #pragma unroll
       for (int w = 0; w < kBucketWays; ++w) bucket[w] = htab[kBucketWays * h + w];
       uint32_t max_len = min((uint32_t)kProbe, n - p);
