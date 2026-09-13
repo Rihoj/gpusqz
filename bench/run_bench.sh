@@ -1,24 +1,27 @@
 #!/usr/bin/env bash
 # Compares gzp (GPU) against CPU compressors on one file.
 #
-#   bench/run_bench.sh <file> [chunk_size]
+#   bench/run_bench.sh <file> [chunk_size | --profile speed|balance|ratio]
 #
 # Wall times cover the whole process (file I/O, host<->device copies and,
-# for gzp, ~0.15-0.3s of CUDA context creation on WSL2), so they favour
-# large inputs. The "kernel" column is GPU time only, from cudaEvents, and
-# is what the codec itself sustains once the fixed costs are paid. CPU
-# tools run single-threaded.
+# for gzp, ~0.2s of CUDA context creation and allocation on WSL2), so they
+# favour large inputs. The "kernel" column is GPU time only, from
+# cudaEvents -- the wall-clock time during which any gzp kernel was running
+# (GZP_VERBOSE's "kbusy") -- and is what the codec itself sustains once
+# the fixed costs are paid. CPU tools run single-threaded.
 #
 # Env:
 #   REPEAT=<n>   run each codec n times (default 1) and report the best
 #                (highest-throughput) run per column, since on a shared
 #                GPU a single run's wall time can be dominated by another
 #                process's contention rather than by gzp itself.
+#   CPU=0        skip the CPU compressors (gzp only).
 set -euo pipefail
 
 GZP="${GZP:-./build/gzp}"
-FILE="${1:?usage: run_bench.sh <file> [chunk_size]}"
-CHUNK="${2:-}"
+FILE="${1:?usage: run_bench.sh <file> [chunk_size | --profile speed|balance|ratio]}"
+shift
+GZP_ARGS=("$@")
 REPEAT="${REPEAT:-1}"
 SIZE=$(stat -c%s "$FILE")
 TMP="$(mktemp -d)"
@@ -28,7 +31,7 @@ echo "Input: $FILE ($SIZE bytes)$([ "$REPEAT" -gt 1 ] && echo ", best of $REPEAT
 printf "%-22s %10s %10s %10s %10s %8s\n" "codec" "comp MB/s" "kern MB/s" "dec MB/s" "kern MB/s" "ratio"
 
 mbps() { awk -v b="$1" -v s="$2" 'BEGIN { if (s > 0) printf "%.0f", b / 1e6 / s; else printf "0" }'; }
-kern() { grep -E "^\s*kernel" "$1" | awk '{gsub(/\(/, "", $3); printf "%.0f", $3}'; }
+kern() { grep -E "^\s*kbusy" "$1" | awk '{gsub(/\(/, "", $3); printf "%.0f", $3}'; }
 # Prints the largest of its arguments (highest MB/s = least GPU/host
 # contention that run) — "-" is skipped since CPU tools have no kernel MB/s.
 best() {
@@ -46,7 +49,7 @@ run_gzp() {
   for ((i = 0; i < REPEAT; i++)); do
     local t0 t1 t2
     t0=$(date +%s.%N)
-    GZP_VERBOSE=1 "$GZP" c "$FILE" "$TMP/out.gzp" ${CHUNK:+$CHUNK} 2>"$TMP/c.log"
+    GZP_VERBOSE=1 "$GZP" c "$FILE" "$TMP/out.gzp" ${GZP_ARGS[@]+"${GZP_ARGS[@]}"} 2>"$TMP/c.log"
     t1=$(date +%s.%N)
     GZP_VERBOSE=1 "$GZP" d "$TMP/out.gzp" "$TMP/out.dec" 2>"$TMP/d.log"
     t2=$(date +%s.%N)
@@ -82,7 +85,8 @@ run_cpu() {
     "$(echo "scale=4; $csize / $SIZE" | bc)"
 }
 
-run_gzp "gzp (GPU)"
+run_gzp "gzp ${GZP_ARGS[*]:-(default)}"
+[ "${CPU:-1}" = "0" ] && exit 0
 run_cpu "gzip -1" "gzip -1 -c" "gzip -d -c"
 run_cpu "gzip -6" "gzip -6 -c" "gzip -d -c"
 if command -v zstd >/dev/null; then

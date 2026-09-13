@@ -43,11 +43,11 @@ target_compile_options(gzp PRIVATE
 #   cmake -S . -B build-b2 -DGZP_MIN_BLOCKS_PER_SM=2 && cmake --build build-b2
 #   bash bench/run_bench.sh <file>   # vs. a build with this unset
 # and check `nvcc -Xptxas -v` for registers/spills alongside GZP_VERBOSE
-# kernel MB/s. Note: as measured, both kernels are shared-memory-bound
-# (compress: 32KB/block caps 3 blocks/SM; decompress: ~23KB/block caps 4)
-# at register counts well below where registers alone would bind, so this
-# knob is unlikely to change occupancy until GZP_MIN_BLOCKS_PER_SM asks
-# for more blocks than the smem footprint allows in the first place.
+# kernel MB/s. None of the per-chunk kernels use shared memory any more
+# (the match-finding table moved to global memory), and at 38 (parse), 64
+# (encode) and 58 (decode) registers per thread with no spills, their
+# one-warp blocks are limited by the per-SM block count rather than by
+# registers, so this knob is mainly a regression check.
 set(GZP_MIN_BLOCKS_PER_SM "" CACHE STRING "minBlocksPerSM for __launch_bounds__ on gzp's kernels (empty = compiler default)")
 if(GZP_MIN_BLOCKS_PER_SM)
   target_compile_definitions(gzp PRIVATE GZP_MIN_BLOCKS_PER_SM=${GZP_MIN_BLOCKS_PER_SM})
