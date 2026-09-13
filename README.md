@@ -19,7 +19,8 @@ creation and allocation); the kernel columns are the wall-clock time any
 gzp kernel was running. Ratio is output/input, so **lower is better**.
 
 **Measurement conditions.** The GPU was otherwise idle (~1GB used by the
-desktop, 0–2% utilisation), so gzp's batch budget was its full 4GB. On
+desktop, 0–2% utilisation), and gzp's batch budget was 4GB (the default
+at the time; it is now 80% of free GPU memory, see *Usage*). On
 the 283MB corpus about half of gzp's wall time is the ~0.2s fixed startup
 cost, which varies by ±15% between runs, so its wall figures there move
 by that much from run to run; the kernel figures and the 1GB corpus are
@@ -224,8 +225,9 @@ Two measurements drove that design:
   flight are roughly one batch, and a bigger batch beats more sets.
 
 Batch size comes from free VRAM, since the GPU may be shared: at least
-1024 chunks and 32MB of input, within half of free VRAM up to 4GB (or an
-explicit `--gpu-mem` budget). A
+1024 chunks and 32MB of input, within 80% of the free VRAM (or an
+explicit `--gpu-mem` budget). That memory is allocated once, at startup,
+and held until gzp exits, so another process can't take it mid-run. A
 file that fits in one or two batches gets the whole budget. Allocation
 retries with a halved batch on failure. Compressed output is compacted
 on the GPU (a CUB scan plus a pack kernel, writing into the batch's
@@ -253,6 +255,30 @@ come after the payload rather than in the directory. The decoder checks
 that the payload runs exactly from the end of the directory to
 `tables_offset` and that the table section ends the file.
 
+## Installing
+
+Pre-built packages come from the `build` GitHub workflow
+(`.github/workflows/build.yml`): every push to `main` produces them as
+workflow artifacts, and a `v*` tag publishes them as a GitHub release.
+
+| platform | package | contents |
+|---|---|---|
+| Ubuntu 22.04+, Debian 12+ | `gzp_<version>_amd64.deb` | `gzp`, `gzp_refdec` |
+| RHEL/Rocky/Alma 8+, Fedora | `gzp-<version>-1.x86_64.rpm` | `gzp`, `gzp_refdec` |
+| Windows 10/11 x64 | `gzp-<version>-win64.zip` | `gzp.exe`, `gzp_refdec.exe`, MSVC runtime DLLs |
+| macOS 11+ (Apple silicon and Intel) | `gzp-refdec-<version>-Darwin.tar.gz` | `gzp_refdec` only |
+
+`gzp` needs an NVIDIA GPU of compute capability 7.0 (Volta) or newer and
+an NVIDIA driver that supports CUDA 12; the CUDA runtime is linked into
+the binary, so no CUDA toolkit is needed to run it. The packages contain
+native GPU code for Volta through Blackwell, plus PTX that newer GPUs can
+compile at load time.
+
+**macOS gets only the decoder.** NVIDIA dropped CUDA on macOS, and Apple
+hardware has no NVIDIA GPU, so the compressor cannot be built or run
+there. `gzp_refdec <in.gzp> <out>` decompresses files made by `gzp` on
+another machine, on the CPU.
+
 ## Building
 
 Requires CUDA 12.8+ and CMake 3.20+. Targets sm_120 (RTX 5060 Ti /
@@ -264,7 +290,12 @@ cmake --build build -j
 ```
 
 (`CMAKE_CUDA_ARCHITECTURES=native` is not used because under WSL it
-silently fell back to sm_52 instead of detecting the GPU.)
+silently fell back to sm_52 instead of detecting the GPU.) Release builds
+pass every generation: see `CUDA_ARCHS` in the workflow.
+
+`-DGZP_BUILD_GPU=OFF` builds only `gzp_refdec`, with no CUDA toolkit
+needed; that is how the macOS package is made. `cpack -G DEB`, `RPM`,
+`ZIP` or `TGZ` in the build directory produces the packages above.
 
 `GZP_MIN_BLOCKS_PER_SM=<n>` (a CMake cache var, not a runtime flag) sets
 `__launch_bounds__`'s `minBlocksPerSM` hint on the per-chunk kernels, for
@@ -290,8 +321,8 @@ buys.
 
 `--gpu-mem SIZE` (or `GZP_GPU_MEM`) sets how much GPU memory gzp may use
 for its batch buffers: a number with a K, M, G or T suffix, or a bare
-number of MiB. By default gzp takes the smaller of half the free GPU
-memory and 4G; an explicit value may use all but 256MiB of the free
+number of MiB. By default gzp takes 80% of the GPU memory free when it
+starts; an explicit value may use all but 256MiB of the free
 memory and is reduced, with a note, if it asks for more. Host RAM use
 does not depend on it: gzp pins a fixed ~96MB of staging buffers.
 
@@ -308,6 +339,7 @@ Environment variables, all optional:
 ## Testing
 
 ```
+ctest --test-dir build                   # everything below; -LE gpu skips what needs a GPU
 bash tests/round_trip.sh                 # default chunk size, literal-context and --profile cases
 bash tests/round_trip.sh --extremes      # chunk sizes 1, 16, 4K, 8K, 32K, 65535, 65536,
                                           # 1048575, 1048576 (kMaxChunkSize), mismatched
@@ -321,6 +353,14 @@ path apart from the alphabet and table definitions in `rans_codes.h`, so
 a symmetric bug in the GPU encoder and decoder can't hide. That matters
 here because `compute-sanitizer` in CUDA 12.8 does not support this GPU,
 so memcheck was not available during development.
+
+`ctest` also runs, on every platform and without a GPU, the CPU decoder
+against committed fixtures in `tests/fixtures`: small files compressed by
+the GPU build that cover raw, token and rANS chunks, all three
+literal-context rules and several table groups, plus corrupt files that
+must be rejected. That is what CI checks, since GitHub's runners have no
+GPU. After any change to the file format, regenerate them on a GPU
+machine with `tests/fixtures/make_fixtures.sh` and commit the result.
 
 Notable cases:
 
@@ -408,14 +448,18 @@ size while keeping the content non-repeating. The 1GB corpus in
   sensitive to a *concurrent* GPU process than shared memory was. Under
   ~40% contention, the `ratio` compress kernel measured at half its
   actual speed.
-- **The default 4GB GPU-memory cap is already enough.** It limits a 1GB
-  file at the 1MB `ratio` profile to batches of ~350 chunks, since each
-  needs ~6MB of device memory. Raising it with `--gpu-mem` to 6–12G fits
-  the whole file in one batch but measured the same kernel throughput
-  (~1550 MB/s, the GPU is saturated) and slightly lower wall throughput
-  (no copy/compute overlap with a single batch). Lowering it does cost:
-  2G measured 900 MB/s. So `--gpu-mem` is mainly for keeping gzp small on
-  a shared GPU.
+- **A bigger GPU-memory budget doesn't make `ratio` faster.** Each 1MB
+  chunk needs ~6MB of device memory. With the old 4GB default, a 1GB file
+  ran as three batches of ~350 chunks; the current 80%-of-free default
+  fits it in one batch on an idle 16GB GPU. Both measured the same kernel
+  throughput (~1550 MB/s, the GPU is saturated) and wall throughput within
+  run-to-run noise (851 vs 869 MB/s compress). Going much lower does cost:
+  a 2G budget measured 900 MB/s of kernel throughput.
+- **No exclusive GPU access.** gzp holds its batch memory for the whole
+  run, but it can't stop other processes from using the rest of the GPU's
+  memory or its compute; exclusive use needs the system-wide compute mode
+  (`nvidia-smi -c EXCLUSIVE_PROCESS`, administrator rights, not available
+  under WSL2).
 - **Literal-context choice is per batch, estimated from the histogram.**
   It is exact about which chunks can't use rANS, but not about which
   chunks will lose to plain tokens later, so a batch can occasionally

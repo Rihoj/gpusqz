@@ -11,6 +11,7 @@
 #include <vector>
 #include <string>
 
+#include "file_io.h"
 #include "format.h"
 #include "rans_codes.h"
 
@@ -318,13 +319,13 @@ int main(int argc, char** argv) {
       std::fread(groups.data(), sizeof(TableGroup), h.table_group_count, in) != h.table_group_count) {
     fail("truncated table group directory");
   }
-  long payload_start = std::ftell(in);
+  uint64_t payload_start = file_tell(in);
   // The table section: each group's quantised counts, in group order, at
   // tables_offset (after the payload). Each group has its own
   // literal-context rule and so its own size.
   std::vector<Tables> tables;
   tables.reserve(h.table_group_count);
-  if (std::fseek(in, (long)h.tables_offset, SEEK_SET) != 0) fail("bad tables_offset");
+  if (!file_seek(in, h.tables_offset)) fail("bad tables_offset");
   for (const TableGroup& g : groups) {
     if (!lit_shift_valid(g.lit_ctx_shift)) fail("bad lit_ctx_shift");
     std::vector<uint8_t> q(group_quant_bytes(g));
@@ -352,7 +353,7 @@ int main(int argc, char** argv) {
     const ChunkEntry& e = entries[c];
     if (e.original_size > h.chunk_size || e.compressed_size < 1) fail("bad chunk entry");
     cbuf.resize(e.compressed_size);
-    if (std::fseek(in, payload_start + (long)e.offset, SEEK_SET) != 0) fail("seek failed");
+    if (!file_seek(in, payload_start + e.offset)) fail("seek failed");
     if (std::fread(cbuf.data(), 1, e.compressed_size, in) != e.compressed_size) fail("short payload read");
 
     bool ok = false;

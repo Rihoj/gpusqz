@@ -1,0 +1,991 @@
+# gzp — a GPU file compressor
+
+`gzp` compresses and decompresses files on an NVIDIA GPU with CUDA. Each
+chunk of the input (64KB by default, up to 1MB) is handled by one warp: an
+LZ parse where all 32 lanes search for matches together, followed by a
+32-way interleaved rANS entropy coder with order-1 literal contexts. It's
+a from-scratch, educational implementation — not a drop-in replacement for
+zstd — but at its default setting it compresses 1.4–2.5x faster than
+single-threaded `zstd -1` at about the same ratio, and its `ratio`
+profile lands within 0.5% of `zstd -3`'s output size while compressing
+1.3–2.2x faster (see *Results*; zstd still decompresses faster).
+
+## Results
+
+RTX 5060 Ti (16GB) under WSL2, CPU tools single-threaded, best of 3–5 runs
+per column (`REPEAT=<n>`, see *Benchmarking*). Wall figures are
+whole-process (file I/O, PCIe copies, and for gzp ~0.2s of CUDA context
+creation and allocation); the kernel columns are the wall-clock time any
+gzp kernel was running. Ratio is output/input, so **lower is better**.
+
+**Measurement conditions.** The GPU was otherwise idle (~1GB used by the
+desktop, 0–2% utilisation), so gzp's batch budget was its full 4GB. On
+the 283MB corpus about half of gzp's wall time is the ~0.2s fixed startup
+cost, which varies by ±15% between runs, so its wall figures there move
+by that much from run to run; the kernel figures and the 1GB corpus are
+the steadier comparison. An earlier set of runs with another process
+holding 11.5GB of VRAM gave kernel figures and ratios within 1% of these.
+
+Varied 1GB corpus (every distinct `/usr/include` header, concatenated
+without repetition; see *Benchmarking*):
+
+| codec | compress MB/s (wall) | kernel MB/s | decompress MB/s (wall) | kernel MB/s | ratio |
+|---|---|---|---|---|---|
+| **gzp** (default, `speed`, 64KB) | **1297** | 2983 | 1130 | 4567 | 0.2526 |
+| gzp `--profile balance` (256KB) | 989 | 1847 | 1267 | 3353 | 0.2387 |
+| gzp `--profile ratio` (1MB) | 873 | 1552 | 1176 | 1906 | 0.2255 |
+| gzip -1 | 145 | – | 250 | – | 0.2836 |
+| gzip -6 | 56 | – | 278 | – | 0.2306 |
+| zstd -1 (1 thread) | 516 | – | **1434** | – | 0.2518 |
+| zstd -3 (1 thread) | 401 | – | 1335 | – | **0.2245** |
+
+Repetitive 283MB corpus (one 5.4MB block of headers repeated 48 times — a
+friendlier shape for a match finder, see the caveat in *Benchmarking*):
+
+| codec | compress MB/s (wall) | kernel MB/s | decompress MB/s (wall) | kernel MB/s | ratio |
+|---|---|---|---|---|---|
+| **gzp** (default, `speed`, 64KB) | **664** | 2390 | 718 | 3805 | 0.2673 |
+| gzp `--profile balance` (256KB) | 552 | 1746 | 715 | 3414 | 0.2547 |
+| gzp `--profile ratio` (1MB) | 487 | 1232 | 657 | 1515 | **0.2423** |
+| gzip -1 | 140 | – | 249 | – | 0.2985 |
+| gzip -6 | 53 | – | 273 | – | 0.2457 |
+| zstd -1 (1 thread) | 482 | – | **1328** | – | 0.2724 |
+| zstd -3 (1 thread) | 373 | – | 1188 | – | 0.2426 |
+
+Against the CPU tools:
+
+- **Default profile vs `zstd -1`.** gzp compresses 1.4x (283MB) to 2.5x
+  (1GB) faster. Its output is 1.9% smaller on the repetitive corpus and
+  0.3% larger on the varied one. `zstd -1` decompresses faster: 1.85x on
+  the smaller file, where gzp's fixed startup cost weighs more, and 1.3x
+  on the 1GB file.
+- **`ratio` profile vs `zstd -3`.** gzp compresses 1.3–2.2x faster. Its
+  output is 0.1% smaller on the repetitive corpus and 0.5% larger on the
+  varied one. `zstd -3` decompresses 1.1–1.8x faster.
+- **vs `gzip`.** Every gzp profile beats `gzip -1` on both ratio and
+  speed. The `ratio` profile also beats `gzip -6`'s ratio on both corpora
+  while compressing 9–16x faster; `balance` does not beat `gzip -6`.
+
+The gzp wall figures on the 1GB corpus are bounded by file I/O more than
+by the GPU: under WSL2, decompression spends most of its time in
+`fwrite` (see *Known limitations*), and the kernels run 1.6–4x faster
+than the wall-clock rate.
+
+### What changed in this round
+
+Same machine, idle GPU, best of 3, previous version (d5073da) against
+this one, run back to back:
+
+| corpus | profile | compress wall | compress kernel | decompress wall | decompress kernel | ratio |
+|---|---|---|---|---|---|---|
+| 1GB varied | speed | 1295 → 1279 | 2912 → 2980 | 1258 → 1466 | 3573 → 4595 | 0.2621 → 0.2526 |
+| 1GB varied | balance | 721 → 1008 | 1066 → 1851 | 1231 → 1314 | 1283 → 3357 | 0.2517 → 0.2387 |
+| 1GB varied | ratio | 265 → 871 | 301 → 1550 | 858 → 1206 | 326 → 1917 | 0.2329 → 0.2255 |
+| 283MB repetitive | speed | 614 → 647 | 2474 → 2382 | 707 → 769 | 3054 → 3804 | 0.2775 → 0.2673 |
+| 283MB repetitive | balance | 409 → 579 | 809 → 1737 | 679 → 746 | 837 → 3416 | 0.2687 → 0.2547 |
+| 283MB repetitive | ratio | 171 → 499 | 216 → 1233 | 425 → 703 | 206 → 1515 | 0.2500 → 0.2423 |
+
+(MB/s). The four changes behind it, in order of impact:
+
+1. **Batches sized for occupancy.** One warp parses one chunk, and a
+   warp's parse is latency-bound at a few MB/s, so throughput follows the
+   number of chunks in flight. The old planner split every file into eight
+   batches under a 1GB budget, which gave the 1MB `ratio` profile 32
+   chunks — 32 warps on a 36-SM GPU — per batch. Batches now aim for at
+   least 1024 chunks under a 4GB budget. This alone made the `ratio`
+   kernels ~6x faster.
+2. **Small fixed pinned staging instead of pinned batch buffers**, plus a
+   writer thread. Big batches made pinned host memory the new bottleneck:
+   `cudaHostAlloc` costs ~0.3–0.4s per GB under WSL2. See *Host
+   pipeline*.
+3. **Order-1 literal contexts** chosen per batch: 1–4% smaller output.
+   See *rANS stage*.
+4. **Bigger match-finder tables** for `balance` and `ratio`, which had
+   only been measured with ~32 warps in flight: 2–3% smaller at those
+   profiles. See *Known limitations*.
+
+## How it works
+
+### Chunks and warps
+
+The input is split into independent, fixed-size chunks (64KB by default,
+up to 1MB — see `--profile` in *Usage*). One warp — 32 lanes — compresses
+or decompresses one chunk. A warp's LZ parse is bound by the latency of
+its dependent, random hash-table and history reads, not by bandwidth, so
+the GPU's throughput is roughly the number of chunks in flight times a
+few MB/s each; batches are sized to keep at least ~1000 in flight (see
+*Host pipeline*). There are no cross-chunk references: any chunk can be
+decoded on its own, and a corrupt chunk cannot damage another.
+
+### LZ parse (`src/lz_warp.cuh`)
+
+The warp walks a chunk in 32-byte windows. Every lane hashes the 4 bytes
+at its own position, reads a 4-way bucket from this chunk's hash table
+(one u32 chunk-relative position per word) and compares against all four
+candidates, capped at 32 bytes so per-lane work is bounded. One
+deterministic lane per bucket then inserts its position, evicting the
+oldest of the four; lanes that found nothing re-probe once more so
+repeats shorter than a window apart are caught immediately.
+
+The table lives in **global memory**, one region per chunk, sized per
+profile by `hash_table_bits()` (`kernels.h`): 2048 buckets at `speed`,
+4096 at `balance`, 32768 at `ratio`. Two earlier attempts at a bigger
+*shared*-memory table both regressed (see *Known limitations*); global
+memory avoids those costs, and freeing the shared memory let more of the
+kernel's one-warp blocks run per SM.
+
+The window's matches are selected warp-uniformly from a ballot mask with
+a lazy lookahead of up to `kLazySteps` (2) positions — take position
+*i+1*'s match instead if it's clearly longer, then *i+2* — which zstd calls
+"lazy2". Matches that hit the 32-byte probe cap are extended
+cooperatively, 32 bytes per step, so long runs never serialise on one
+lane.
+
+The parse emits sequences — a literal run followed by a match `(offset,
+length)` — into scratch for the entropy stage below, packed 8 bytes per
+sequence (three 21-bit fields). Per chunk, the encoder keeps whichever of
+the rANS-coded result or a plain LZ4-style token stream comes out
+smaller, and falls back to raw storage if neither beats the input.
+
+### rANS stage (`src/rans.cuh`, `src/rans_codes.h`)
+
+Literals, literal-run lengths, match lengths and offsets are coded with
+rANS. Length and offset alphabets are zstd-style log2 buckets with raw
+extra bits (written straight into the rANS state, so there is no side
+stream) — except the offset alphabet's top 3 codes, which are
+**repeat-offset codes**: "reuse the 1st/2nd/3rd most-recently-used
+distinct match offset", zstd-style. The encoder resolves them in one
+forward serial pass over the parsed sequences (`compute_repeat_codes()`),
+and the decoder replays the same state machine per group of 32 sequences
+with a register-only shuffle walk.
+
+**Literals use order-1 contexts.** Each literal is coded with a table
+chosen by the literal before it: its high nibble (16 tables), all of it
+(256 tables), or nothing (1 table, order-0). For the decoder to know the
+previous literal, each of the 32 lanes owns one contiguous run of the
+chunk's literal stream rather than every 32nd literal, and the first
+literal of each run uses context 0. Runs are 4-byte aligned, so the
+decoder stores 4 literals at a time.
+
+**Tables are shared per batch** (a "table group", see *Container format*):
+compression runs three kernels per batch. The first parses every chunk
+into scratch while atomically accumulating one full order-1 histogram
+for the batch. The second, one 256-thread block, folds that histogram to
+16 and 1 contexts and keeps whichever rule minimises the estimated
+literal bits under the tables the encoder would actually build, plus 256
+table bytes per context. On large text batches that is nearly always all
+256 contexts (~66KB of tables per batch), while incompressible or
+literal-poor batches keep one table and pay nothing extra. The third
+encodes every chunk against that table. A chunk whose plain token stream
+is shorter than a rANS header can never end up rANS-coded, so it stays
+out of the histogram and skips the rANS attempt.
+
+The GPU-specific part is the interleaving: 32 rANS states, one per lane,
+share **one** stream of 16-bit words. All lanes step in lockstep; the
+lanes that need to renormalise on a step write (or read) their word
+contiguously in lane order, located with a ballot and a popcount. With a
+2^16 state floor and 16-bit words, each step moves at most one word per
+lane, which is what makes the encoder's and decoder's per-step word
+counts line up exactly without storing any per-lane offsets. The encoder
+runs in reverse and writes backward from the end of its output slot; the
+decoder reads forward.
+
+### Decoding
+
+Token decoding is warp-cooperative: 32 lanes copy each literal run and
+each match, with overlapping matches handled by indexing `k mod offset`
+into already-written history so no serial path is needed. rANS decoding
+runs the same 32-lane lockstep as the encoder into scratch — literals
+through a per-context slot-to-symbol table, lengths and offsets through a
+coarse 128-entry index plus a short scan — then the same reconstruction
+loop rebuilds the chunk. Every table group's tables are expanded once, up
+front, into a global buffer that each chunk finds through its group id.
+Malformed input sets an error flag that the host turns into an error
+rather than garbage output.
+
+### Host pipeline (`src/main.cu`)
+
+Batches live only in device memory, in a ring of two buffer sets, each
+with its own CUDA stream. File data moves through twelve fixed 8MB
+pinned staging buffers instead of pinned batch-sized ones: the main
+thread `fread`s into an input stage and copies it up asynchronously, and
+a writer thread drains output stages that the main thread fills with
+asynchronous downloads. So batch *i+1*'s read and upload overlap batch
+*i*'s kernels, and batch *i−1*'s download and file write overlap both.
+
+Two measurements drove that design:
+
+- **Pinned memory is expensive to create under WSL2.** `cudaHostAlloc`
+  measured ~0.3–0.4s per GB, plus ~0.1s per GB to free at exit, against
+  ~3ms per GB for `cudaMalloc`. The old ring pinned three sets of
+  batch-sized buffers, about 1.5GB for a big `ratio` batch.
+- **Batches on different streams barely overlap on the GPU.** The next
+  batch is usually still being read while one runs, so the chunks in
+  flight are roughly one batch, and a bigger batch beats more sets.
+
+Batch size comes from free VRAM, since the GPU may be shared: at least
+1024 chunks and 32MB of input, within half of free VRAM up to 4GB (or an
+explicit `--gpu-mem` budget). A
+file that fits in one or two batches gets the whole budget. Allocation
+retries with a halved batch on failure. Compressed output is compacted
+on the GPU (a CUB scan plus a pack kernel, writing into the batch's
+now-dead scratch), so the download moves only compressed bytes.
+
+### Container format (`src/format.h`)
+
+```
+FileHeader    { magic, version=5, chunk_size, original_size, chunk_count,
+                table_group_count, tables_offset }
+ChunkEntry[]  { offset, compressed_size, original_size }     -- one per chunk
+TableGroup[]  { start_chunk, chunk_count, lit_ctx_shift }    -- one per compression batch
+payload       -- each chunk: [flag: Raw | Lz | LzRans] [data]
+tables        -- at tables_offset: each group's quantised counts, in group order
+```
+
+`TableGroup` entries cover `[0, chunk_count)` contiguously and in order;
+chunk *c*'s rANS tables are those of the group whose range contains *c* —
+always exactly one host compression batch's worth of chunks, decided at
+compress time and independent of whatever batch size decompression later
+chooses. Each group's counts are 96 bytes for the three small alphabets
+plus 256 per literal context, so their size depends on the group's
+`lit_ctx_shift` (8, 4 or 0 for 1, 16 or 256 contexts). That is why they
+come after the payload rather than in the directory. The decoder checks
+that the payload runs exactly from the end of the directory to
+`tables_offset` and that the table section ends the file.
+
+## Building
+
+Requires CUDA 12.8+ and CMake 3.20+. Targets sm_120 (RTX 5060 Ti /
+Blackwell) by default; override for other hardware:
+
+```
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release [-DCMAKE_CUDA_ARCHITECTURES=<arch>]
+cmake --build build -j
+```
+
+(`CMAKE_CUDA_ARCHITECTURES=native` is not used because under WSL it
+silently fell back to sm_52 instead of detecting the GPU.)
+
+`GZP_MIN_BLOCKS_PER_SM=<n>` (a CMake cache var, not a runtime flag) sets
+`__launch_bounds__`'s `minBlocksPerSM` hint on the per-chunk kernels, for
+A/B occupancy testing — see the comment above it in `CMakeLists.txt`. None
+of those kernels use shared memory, and at 38 (parse), 64 (encode) and 58
+(decode) registers per thread with no spills (`nvcc -Xptxas -v`), their
+one-warp blocks are limited by the per-SM block count rather than by
+registers, so this knob is mainly a regression check against future
+register spilling.
+
+## Usage
+
+```
+./build/gzp c <input> <output> [chunk_size]                # compress (default chunk_size 65536)
+./build/gzp c <input> <output> --profile speed|balance|ratio  # ...or pick a chunk-size preset
+./build/gzp d <input> <output>                              # decompress
+./build/gzp c|d ... --gpu-mem 8G                            # GPU memory for batch buffers
+```
+
+`chunk_size` and `--profile` are mutually exclusive, and unrecognised
+arguments are rejected. See *Results* for what each profile costs and
+buys.
+
+`--gpu-mem SIZE` (or `GZP_GPU_MEM`) sets how much GPU memory gzp may use
+for its batch buffers: a number with a K, M, G or T suffix, or a bare
+number of MiB. By default gzp takes the smaller of half the free GPU
+memory and 4G; an explicit value may use all but 256MiB of the free
+memory and is reduced, with a note, if it asks for more. Host RAM use
+does not depend on it: gzp pins a fixed ~96MB of staging buffers.
+
+Environment variables, all optional:
+
+| variable | effect |
+|---|---|
+| `GZP_VERBOSE=1` | Per-stage timing on stderr: setup, fread, copies, kernel time (summed and wall-clock union), fwrite, staging stalls. |
+| `GZP_FORCE_BATCH=<n>` | Force chunks per batch (testing; see *Testing*). |
+| `GZP_FORCE_SETS=<1-3>` | Force the device buffer-set count (tuning). |
+| `GZP_FORCE_LIT_SHIFT=<0\|4\|8>` | Force every batch's literal-context rule (testing and tuning). |
+| `GZP_DUMP_LITS=<path>` | Dump each chunk's parsed literal stream, for evaluating literal models offline. Serialises the pipeline. |
+
+## Testing
+
+```
+bash tests/round_trip.sh                 # default chunk size, literal-context and --profile cases
+bash tests/round_trip.sh --extremes      # chunk sizes 1, 16, 4K, 8K, 32K, 65535, 65536,
+                                          # 1048575, 1048576 (kMaxChunkSize), mismatched
+                                          # batch sizes, and a match-free 1MB chunk
+BIG=1 bash tests/round_trip.sh           # + 300MB random and 300MB text (multi-batch)
+```
+
+Every case is round-tripped on the GPU *and* decoded by
+`tests/ref_decode.cpp`, a CPU decoder that shares no code with the GPU
+path apart from the alphabet and table definitions in `rans_codes.h`, so
+a symmetric bug in the GPU encoder and decoder can't hide. That matters
+here because `compute-sanitizer` in CUDA 12.8 does not support this GPU,
+so memcheck was not available during development.
+
+Notable cases:
+
+- **Literal contexts.** Literal-heavy base64 and source-text inputs run
+  at every forced literal-context rule, since the automatic choice would
+  pick order-0 for most small test files.
+- **Mismatched batches.** `GZP_FORCE_BATCH` exists because a
+  `TableGroup`'s boundaries are fixed at compress time, but decompression
+  picks its own batch size independently. The extremes suite compresses
+  and decompresses with deliberately different batch sizes, in both
+  directions, including with 256-context tables.
+- **A match-free 1MB chunk.** The extremes suite includes a 2^20-byte De
+  Bruijn sequence B(32,4), in which no 4-byte string repeats. It once
+  produced undecodable output, because a single literal run of exactly
+  2^20 is one past what the rANS length alphabet can code; such a chunk
+  now falls back to plain tokens.
+
+## Benchmarking
+
+```
+find /usr/include -name '*.h' | head -400 | xargs cat > corpus.txt
+for i in $(seq 48); do cat corpus.txt; done > corpus_283mb.txt
+REPEAT=5 bash bench/run_bench.sh corpus_283mb.txt                     # gzp default vs gzip/zstd
+CPU=0 REPEAT=5 bash bench/run_bench.sh corpus_283mb.txt --profile ratio  # one gzp profile only
+```
+
+The script reports wall and kernel MB/s for gzp and compares against
+`gzip -1/-6` and single-threaded `zstd -1/-3` when available. On a shared
+GPU a single wall-clock measurement can be dominated by another process,
+so `REPEAT=<n>` runs each codec n times and reports the best run per
+column. Check `nvidia-smi` first: another process's memory shrinks gzp's
+batches, and its compute slows gzp's global-memory-latency-bound parse.
+
+**The 283MB recipe repeats one 5.4MB block 48x, which is not a neutral
+choice of large file.** It once hid a real regression: a match-finding
+table change that measured as basically free on it nearly halved
+compress-kernel throughput on a genuinely varied file (see *Known
+limitations*). Measure LZ-parse or table changes on a varied file too:
+
+```
+find /usr/include -name '*.h' | xargs cat > corpus_varied.txt   # all distinct
+bash bench/run_bench.sh corpus_varied.txt
+```
+
+(Repeat `find`/`xargs cat` against more directories to reach a target
+size while keeping the content non-repeating. The 1GB corpus in
+*Results* was built that way.)
+
+## Known limitations and next steps
+
+- **Fixed startup cost.** CUDA context creation and allocation take
+  ~0.2s on this WSL2 machine, over half of the wall time on the 283MB
+  corpus. It amortises on larger inputs and is mostly outside gzp's
+  control.
+- **Decompression is `fwrite`-bound under WSL2.** Writing 1GB measured
+  0.5–1.2s depending on page-cache state, while the decompress kernel
+  needs ~0.25s, so the writer thread is almost always the bottleneck.
+  gzp would need a faster filesystem path to go further, not a faster
+  kernel.
+- **Ratio vs zstd.** zstd's parser is more sophisticated than gzp's hash
+  match finder with a two-step lazy lookahead: `zstd -3`'s output is ~0.5%
+  smaller than gzp's `ratio` profile on the varied corpus. An optimal parser, or
+  a match finder with longer chains, would be the next ratio lever. A
+  third lazy step and a 64-byte probe cap were measured and did nothing
+  useful (see the comments at `kLazySteps` and `kProbe`).
+- **The match-finding table took several rounds to size.** The history,
+  kept because each failure was informative:
+  1. *Dynamic shared memory up to 64KB.* Requesting more than 48KB of
+     shared memory at launch changed the SM's cache behaviour for the
+     *whole* kernel. That cost was invisible on the repetitive corpus
+     and nearly halved `ratio` compress throughput on the varied one.
+  2. *A bigger table within the 48KB static limit.* This still cost
+     38–52% of throughput for a 1–4% ratio gain, because more shared
+     memory per one-warp block means fewer blocks per SM.
+  3. *Global memory* sidestepped both and made `speed`/`balance` 1.5–3.6x
+     faster by freeing shared memory for occupancy.
+  4. *Re-tuned under occupancy-sized batches (this round).* The earlier
+     "a bigger global table costs ~2x" had been measured with ~32 warps
+     in flight, where every extra miss was exposed. With ~1000 in
+     flight, `ratio`'s table grew 4x for 2.2% smaller output at 3–4%
+     kernel cost and no wall-clock cost, and `balance`'s 2x for 2.9% at
+     ~11% of wall throughput. `speed` stays at 2048 buckets: 4096 would
+     save 1.6% for ~12% of wall throughput.
+  One gotcha from those measurements: global-memory latency is far more
+  sensitive to a *concurrent* GPU process than shared memory was. Under
+  ~40% contention, the `ratio` compress kernel measured at half its
+  actual speed.
+- **The default 4GB GPU-memory cap is already enough.** It limits a 1GB
+  file at the 1MB `ratio` profile to batches of ~350 chunks, since each
+  needs ~6MB of device memory. Raising it with `--gpu-mem` to 6–12G fits
+  the whole file in one batch but measured the same kernel throughput
+  (~1550 MB/s, the GPU is saturated) and slightly lower wall throughput
+  (no copy/compute overlap with a single batch). Lowering it does cost:
+  2G measured 900 MB/s. So `--gpu-mem` is mainly for keeping gzp small on
+  a shared GPU.
+- **Literal-context choice is per batch, estimated from the histogram.**
+  It is exact about which chunks can't use rANS, but not about which
+  chunks will lose to plain tokens later, so a batch can occasionally
+  carry 16 or 256 tables that few of its chunks use. The cost is bounded
+  by the table bytes (4KB or 66KB per batch).
+- **Expanded decode tables use ~1.3MB of device memory per table group**
+  at 256 contexts, all expanded up front. That is ~10MB for a 1GB file at
+  the default profile, but would grow to gigabytes for a file of many
+  terabytes; expanding each decode batch's groups on demand would fix
+  it.
+- **No integrity check.** Structural corruption (bad offsets, sizes,
+  truncation, invalid rANS streams) is detected, but the format has no
+  checksum, so a corrupted literal or table byte that still decodes
+  consistently produces wrong output silently.
+- **`compute_repeat_codes`' encode-side pass is serial**, one lane per
+  chunk. Disabling it costs only a few percent of compress-kernel
+  throughput on text. Struct-like binary data with recurring strides
+  should gain more from repeat offsets than prose does.
+- **No multi-GPU, no streaming API** — it's a file-in, file-out CLI, and
+  output must be seekable (the header is patched at the end).
+- Match offsets are 32-bit, but chunks are capped at 1MB by policy
+  (`kMaxChunkSize` in `src/format.h`) rather than by the wire format.
+- **NPUs aren't a fit.** Recent CPUs' neural accelerators are dense
+  matrix-multiply engines with no data-dependent branching or random
+  gathers, which is all LZ matching and rANS consist of, and WSL2 does not
+  expose them anyway.
+#include "kernels.h"
+#include "lz_warp.cuh"
+#include "rans.cuh"
+#include "format.h"
+
+#include <cub/device/device_scan.cuh>
+
+namespace gzp {
+
+constexpr int kBlockThreads = kWarpsPerBlock * 32;
+
+// GZP_MIN_BLOCKS_PER_SM (set via CMake's GZP_MIN_BLOCKS_PER_SM cache var)
+// forces ptxas to keep register usage low enough for that many blocks per
+// SM, for A/B occupancy testing. Left unset, __launch_bounds__ takes only
+// the thread-count argument and ptxas picks registers freely.
+#ifdef GZP_MIN_BLOCKS_PER_SM
+#define GZP_LAUNCH_BOUNDS __launch_bounds__(kBlockThreads, GZP_MIN_BLOCKS_PER_SM)
+#else
+#define GZP_LAUNCH_BOUNDS __launch_bounds__(kBlockThreads)
+#endif
+
+__device__ __forceinline__ void chunk_scratch(uint8_t* scratch, uint32_t c, uint32_t chunk_size, SeqRec*& seqs,
+                                              uint8_t*& rep_code, uint8_t*& lits) {
+  uint8_t* base = scratch + (size_t)c * scratch_bytes(chunk_size);
+  seqs = reinterpret_cast<SeqRec*>(base);
+  rep_code = base + scratch_seqs_bytes(chunk_size);
+  lits = base + scratch_lits_offset(chunk_size);
+}
+
+// Size of the plain token stream (ChunkFlag::Lz payload) for these
+// sequences; warp-collective, every lane gets the total.
+__device__ __forceinline__ uint32_t token_stream_bytes(const SeqRec* seqs, uint32_t n_seq) {
+  int lane = threadIdx.x & 31;
+  uint32_t tot = 0;
+  for (uint32_t i = lane; i < n_seq; i += 32) {
+    SeqRec r = seqs[i];
+    tot += seq_size(r.lit_len(), r.ml());
+  }
+  for (int o = 16; o > 0; o >>= 1) tot += __shfl_xor_sync(kFullMask, tot, o);
+  return tot;
+}
+
+// rANS is kept only if its payload (kRansHeaderBytes plus the stream) is no
+// bigger than the token stream, so a token stream shorter than the header
+// alone rules it out.
+__device__ __forceinline__ bool rans_may_win(uint32_t token_bytes) { return token_bytes >= (uint32_t)kRansHeaderBytes; }
+
+// ---------------------------------------------------------------------------
+// Compress: 3 kernels sharing one rANS table per batch. Each chunk still
+// individually falls back to a plain LZ token stream, then to Raw storage,
+// whichever is smallest — see rans_encode_kernel.
+// ---------------------------------------------------------------------------
+
+// One warp per chunk. in_len <= 1 chunks are finalized here directly (Raw)
+// since they never reach the encode kernel. Others are parsed into scratch
+// and contribute to the batch histogram; n_seq[c]/n_lit[c] record how much
+// of scratch is valid so the encode kernel doesn't need to re-parse.
+// htab is chunk_count * hash_table_bytes(chunk_size) of global memory (see
+// kernels.h): chunk c's region starts at htab + c * hash_table_words.
+__global__ void GZP_LAUNCH_BOUNDS
+parse_hist_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, const uint32_t* in_lens,
+                  uint8_t* out, uint32_t out_slot_stride, uint32_t* out_start, uint32_t* out_sizes,
+                  uint8_t* scratch, uint32_t* htab, uint32_t hash_bits, uint32_t* n_seq_arr, uint32_t* n_lit_arr,
+                  uint32_t* batch_cnt) {
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  uint32_t c = blockIdx.x * kWarpsPerBlock + warp;
+  if (c >= chunk_count) return;
+
+  const uint8_t* chunk_in = in + (size_t)c * chunk_size;
+  uint32_t in_len = in_lens[c];
+  uint8_t* slot = out + (size_t)c * out_slot_stride;
+
+  if (in_len <= 1) {
+    for (uint32_t k = lane; k < in_len; k += 32) slot[1 + k] = chunk_in[k];
+    if (lane == 0) {
+      slot[0] = (uint8_t)ChunkFlag::Raw;
+      out_start[c] = 0;
+      out_sizes[c] = 1 + in_len;
+      n_seq_arr[c] = 0;
+      n_lit_arr[c] = 0;
+    }
+    return;
+  }
+
+  SeqRec* seqs;
+  uint8_t* rep_code;
+  uint8_t* lits;
+  chunk_scratch(scratch, c, chunk_size, seqs, rep_code, lits);
+  uint32_t hash_words = (1u << hash_bits) * (uint32_t)kBucketWays;
+  SeqEmitter em{chunk_in, seqs, lits};
+  lz_parse_warp(chunk_in, in_len, htab + (size_t)c * hash_words, (int)hash_bits, em);
+  // A chunk that can never end up rANS-coded stays out of the batch
+  // histogram: its symbols would only skew the shared tables, and the
+  // literal-context choice, towards data that never uses them. That is a
+  // token stream shorter than a rANS header (rans_encode_kernel applies the
+  // same test), or a literal run too long for the length alphabet
+  // (rans_encode_warp's too_long, see kMaxLenValue).
+  bool too_long = false;
+  for (uint32_t i = lane; i < em.n_seq; i += 32) too_long |= seqs[i].lit_len() > kMaxLenValue;
+  if (__any_sync(kFullMask, too_long) || !rans_may_win(token_stream_bytes(seqs, em.n_seq))) {
+    if (lane == 0) {
+      n_seq_arr[c] = em.n_seq;
+      n_lit_arr[c] = em.n_lit;
+    }
+    return;
+  }
+  compute_repeat_codes(seqs, em.n_seq, rep_code);
+  // Always the full order-1 histogram; build_table_kernel folds it down
+  // to whichever context rule this batch ends up using.
+  accumulate_hist(seqs, em.n_seq, rep_code, lits, em.n_lit, kLitShiftByte, batch_cnt);
+  if (lane == 0) {
+    n_seq_arr[c] = em.n_seq;
+    n_lit_arr[c] = em.n_lit;
+  }
+}
+
+// Bits to code a 256-symbol histogram row with the table the encoder would
+// actually build from it (8-bit quantised, normalised to kProbScale, every
+// present symbol at least 1/kProbScale), rather than the exact-probability
+// entropy, which ignores what quantisation costs thinly populated contexts.
+__device__ float row_coded_bits(const uint32_t* row) {
+  uint8_t q[kLitSyms];
+  uint16_t f[kLitSyms], c[kLitSyms];
+  quantize_counts(row, kLitSyms, q);
+  if (!normalize_table(q, kLitSyms, f, c)) return 0.f;
+  float b = 0.f;
+  for (int s = 0; s < kLitSyms; ++s) {
+    if (row[s]) b += (float)row[s] * ((float)kProbBits - __log2f((float)f[s]));
+  }
+  return b;
+}
+
+// One block, launched once per batch. Picks this batch's literal-context
+// rule (rans_codes.h) from its full order-1 histogram, folds the histogram
+// down to that rule, then quantises+normalises it into freq/cum for the
+// encode kernel and q[] for the host to store in this batch's TableGroup.
+//
+// The rule minimises (estimated literal bits) + 8 * (256 table bytes per
+// context), each estimate being what the folded counts cost under the
+// tables they would get (row_coded_bits): order-1 on the whole previous
+// byte wins on large text batches, while incompressible or literal-poor
+// batches keep one table and pay nothing for the other 255. Chunks that
+// can't end up rANS-coded are already out of the histogram (see
+// parse_hist_kernel); counting them once made `yes`-style text pick 16
+// contexts that no chunk used, 0.8% larger. forced_shift >= 0 skips the choice
+// (GZP_FORCE_LIT_SHIFT, for tests). The cost sums run in a fixed order, so
+// the choice -- and so the output -- is deterministic.
+constexpr int kTableThreads = 256;
+__global__ void __launch_bounds__(kTableThreads)
+build_table_kernel(uint32_t* cnt, int forced_shift, uint32_t* shift_out, uint8_t* q_out, uint16_t* freq,
+                   uint16_t* cum) {
+  __shared__ uint32_t nib[16][kLitSyms]; // counts folded to 16 contexts (shift 4)
+  __shared__ uint32_t col[kLitSyms];     // folded to 1 context (shift 8)
+  __shared__ float part[3][kTableThreads];
+  __shared__ int chosen;
+  int t = threadIdx.x; // one literal symbol per thread while folding
+  uint32_t colsum = 0;
+  for (int c = 0; c < 16; ++c) {
+    uint32_t v = 0;
+    for (int r = 0; r < 16; ++r) v += cnt[lit_entry(c * 16 + r, t)];
+    nib[c][t] = v;
+    colsum += v;
+  }
+  col[t] = colsum;
+  __syncthreads();
+
+  if (forced_shift < 0) {
+    // part[k][t]: thread t's share of shift 8 / 4 / 0's cost, summed in a
+    // fixed order below.
+    part[0][t] = t == 0 ? row_coded_bits(col) : 0.f;
+    part[1][t] = t < 16 ? row_coded_bits(nib[t]) : 0.f;
+    part[2][t] = row_coded_bits(cnt + lit_entry(t, 0));
+    __syncthreads();
+    if (t == 0) {
+      const uint32_t shifts[3] = {kLitShiftOrder0, kLitShiftNibble, kLitShiftByte};
+      int best = 0;
+      float best_cost = 0.f;
+      for (int k = 0; k < 3; ++k) {
+        float c = 8.f * kLitSyms * lit_ctx_count(shifts[k]);
+        for (int i = 0; i < kTableThreads; ++i) c += part[k][i];
+        if (k == 0 || c < best_cost) {
+          best = k;
+          best_cost = c;
+        }
+      }
+      chosen = (int)shifts[best];
+    }
+  } else if (t == 0) {
+    chosen = forced_shift;
+  }
+  __syncthreads();
+
+  uint32_t shift = (uint32_t)chosen;
+  int n_ctx = lit_ctx_count(shift);
+  if (t == 0) *shift_out = shift;
+  // Every read of the full histogram is done; fold into its first rows.
+  if (shift == kLitShiftNibble) {
+    for (int c = 0; c < 16; ++c) cnt[lit_entry(c, t)] = nib[c][t];
+  } else if (shift == kLitShiftOrder0) {
+    cnt[lit_entry(0, t)] = col[t];
+  }
+  __syncthreads();
+  build_batch_table(cnt, n_ctx, q_out, freq, cum);
+}
+
+// One warp per chunk (skips in_len <= 1 chunks, already finalized). Tries
+// rANS against the batch's shared table, then plain tokens, then raw,
+// keeping whichever is smallest.
+__global__ void GZP_LAUNCH_BOUNDS
+rans_encode_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, const uint32_t* in_lens,
+                   uint8_t* out, uint32_t out_slot_stride, uint32_t* out_start, uint32_t* out_sizes,
+                   uint8_t* scratch, const uint32_t* n_seq_arr, const uint32_t* n_lit_arr,
+                   const uint32_t* lit_shift_p, const uint16_t* freq, const uint16_t* cum) {
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  uint32_t c = blockIdx.x * kWarpsPerBlock + warp;
+  if (c >= chunk_count) return;
+
+  uint32_t in_len = in_lens[c];
+  if (in_len <= 1) return; // already finalized by parse_hist_kernel
+
+  const uint8_t* chunk_in = in + (size_t)c * chunk_size;
+  uint8_t* slot = out + (size_t)c * out_slot_stride;
+  SeqRec* seqs;
+  uint8_t* rep_code;
+  uint8_t* lits;
+  chunk_scratch(scratch, c, chunk_size, seqs, rep_code, lits);
+  uint32_t n_seq = n_seq_arr[c], n_lit = n_lit_arr[c];
+  uint32_t lit_shift = *lit_shift_p; // chosen by build_table_kernel for this batch
+
+  uint32_t tok_total = token_stream_bytes(seqs, n_seq);
+
+  bool ok = false;
+  uint32_t start = 0, size = 0;
+  // Same test as parse_hist_kernel: such a chunk contributed nothing to the
+  // batch tables, so it must not try to use them either.
+  if (in_len > (uint32_t)kRansHeaderBytes + 1 && rans_may_win(tok_total)) {
+    ok = rans_encode_warp(seqs, n_seq, rep_code, lits, n_lit, lit_shift, freq, cum, slot, out_slot_stride, in_len,
+                          &start, &size);
+    if (ok && 1 + tok_total < size) ok = false;
+  }
+  if (!ok) {
+    uint32_t len = 0;
+    ok = tokens_from_seqs(chunk_in, seqs, n_seq, slot + 1, in_len - 1, &len);
+    if (ok) {
+      start = 0;
+      size = 1 + len;
+      if (lane == 0) slot[0] = (uint8_t)ChunkFlag::Lz;
+    }
+  }
+  if (!ok) {
+    for (uint32_t k = lane; k < in_len; k += 32) slot[1 + k] = chunk_in[k];
+    start = 0;
+    size = 1 + in_len;
+    if (lane == 0) slot[0] = (uint8_t)ChunkFlag::Raw;
+  }
+  if (lane == 0) {
+    out_start[c] = start;
+    out_sizes[c] = size;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Decompress (both Lz and LzRans chunks may appear in the same file).
+// ---------------------------------------------------------------------------
+
+// One warp per chunk. Chunk c's compressed data lives at in + in_offsets[c]
+// (in_lens[c] bytes, flag first); output goes to out + c*chunk_size,
+// out_lens[c] bytes. LzRans chunks read their tables from group g =
+// group_id[c]'s region at group_tables + group_off[g], expanded for its
+// literal-context rule group_shift[g]. Any malformed chunk sets *err.
+__global__ void GZP_LAUNCH_BOUNDS
+decompress_kernel(const uint8_t* in, const uint32_t* in_offsets, uint32_t chunk_count, const uint32_t* in_lens,
+                  uint8_t* out, uint32_t chunk_size, const uint32_t* out_lens, uint8_t* scratch,
+                  uint8_t* group_tables, const uint64_t* group_off, const uint32_t* group_shift,
+                  const uint32_t* group_id, uint32_t* err) {
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  uint32_t c = blockIdx.x * kWarpsPerBlock + warp;
+  if (c >= chunk_count) return;
+
+  const uint8_t* slot = in + in_offsets[c];
+  uint32_t len = in_lens[c];
+  uint8_t* chunk_out = out + (size_t)c * chunk_size;
+  uint32_t orig = out_lens[c];
+
+  bool ok = false;
+  if (len >= 1) {
+    ChunkFlag flag = (ChunkFlag)slot[0];
+    if (flag == ChunkFlag::Raw) {
+      ok = len == 1 + orig;
+      if (ok) {
+        for (uint32_t k = lane; k < orig; k += 32) chunk_out[k] = slot[1 + k];
+      }
+    } else if (flag == ChunkFlag::Lz) {
+      ok = lz_decode_warp(slot + 1, len - 1, chunk_out, orig);
+    } else if (flag == ChunkFlag::LzRans) {
+      SeqRec* seqs;
+      uint8_t* rep_code;
+      uint8_t* lits;
+      chunk_scratch(scratch, c, chunk_size, seqs, rep_code, lits); // rep_code unused: decode keeps its state in registers
+      uint32_t n_seq = 0, n_lit = 0;
+      uint32_t g = group_id[c], lit_shift = group_shift[g];
+      RansTableView gt = table_view(group_tables + group_off[g], lit_ctx_count(lit_shift));
+      ok = rans_decode_warp(slot + 1, len - 1, gt, lit_shift, seqs, max_sequences(chunk_size), lits, chunk_size,
+                            &n_seq, &n_lit);
+      if (ok) {
+        __syncwarp();
+        ok = lz_reconstruct_warp(seqs, n_seq, lits, n_lit, chunk_out, orig);
+      }
+    }
+  }
+  if (!ok && lane == 0) *err = 1;
+}
+
+// One block per group: group g's quantised counts start at q_all + q_off[g]
+// and expand into its region at out + table_off[g].
+__global__ void expand_group_tables_kernel(const uint8_t* q_all, const uint64_t* q_off, const uint64_t* table_off,
+                                           const uint32_t* shift, uint32_t group_count, uint8_t* out) {
+  uint32_t g = blockIdx.x;
+  if (g >= group_count) return;
+  expand_group_table(q_all + q_off[g], lit_ctx_count(shift[g]), out + table_off[g]);
+}
+
+// ---------------------------------------------------------------------------
+// Host-callable launchers
+// ---------------------------------------------------------------------------
+
+void launch_compress(const uint8_t* d_in, uint32_t chunk_size, uint32_t chunk_count,
+                      const uint32_t* d_in_lens, uint8_t* d_out, uint32_t out_slot_stride,
+                      uint32_t* d_out_start, uint32_t* d_out_sizes, uint8_t* d_scratch, uint32_t* d_htab,
+                      int forced_lit_shift, const RansBatchBufs& d_rans, cudaStream_t stream) {
+  uint32_t blocks = (chunk_count + kWarpsPerBlock - 1) / kWarpsPerBlock;
+  uint32_t hash_bits = (uint32_t)hash_table_bits(chunk_size);
+  // Parse+histogram everything in the batch, build one shared set of
+  // tables, then encode. Sequential on `stream`, so each stage sees the
+  // previous one's complete output.
+  cudaMemsetAsync(d_rans.cnt, 0, (size_t)kMaxQuantBytes * sizeof(uint32_t), stream);
+  parse_hist_kernel<<<blocks, kBlockThreads, 0, stream>>>(d_in, chunk_size, chunk_count, d_in_lens, d_out,
+                                                          out_slot_stride, d_out_start, d_out_sizes, d_scratch,
+                                                          d_htab, hash_bits, d_rans.n_seq, d_rans.n_lit, d_rans.cnt);
+  build_table_kernel<<<1, kTableThreads, 0, stream>>>(d_rans.cnt, forced_lit_shift, d_rans.lit_shift, d_rans.q,
+                                                      d_rans.freq, d_rans.cum);
+  rans_encode_kernel<<<blocks, kBlockThreads, 0, stream>>>(d_in, chunk_size, chunk_count, d_in_lens, d_out,
+                                                           out_slot_stride, d_out_start, d_out_sizes, d_scratch,
+                                                           d_rans.n_seq, d_rans.n_lit, d_rans.lit_shift, d_rans.freq,
+                                                           d_rans.cum);
+}
+
+void launch_decompress(const uint8_t* d_in, const uint32_t* d_in_offsets, uint32_t chunk_count,
+                        const uint32_t* d_in_lens, uint8_t* d_out, uint32_t chunk_size,
+                        const uint32_t* d_out_lens, uint8_t* d_scratch, uint8_t* d_group_tables,
+                        const uint64_t* d_group_off, const uint32_t* d_group_shift, const uint32_t* d_group_id,
+                        uint32_t* d_err, cudaStream_t stream) {
+  uint32_t blocks = (chunk_count + kWarpsPerBlock - 1) / kWarpsPerBlock;
+  decompress_kernel<<<blocks, kBlockThreads, 0, stream>>>(d_in, d_in_offsets, chunk_count, d_in_lens, d_out,
+                                                          chunk_size, d_out_lens, d_scratch, d_group_tables,
+                                                          d_group_off, d_group_shift, d_group_id, d_err);
+}
+
+size_t rans_group_table_bytes(uint32_t lit_shift) { return group_table_bytes(lit_ctx_count(lit_shift)); }
+
+void launch_expand_group_tables(const uint8_t* d_q, const uint64_t* d_q_off, const uint64_t* d_table_off,
+                                const uint32_t* d_shift, uint32_t group_count, uint8_t* d_tables,
+                                cudaStream_t stream) {
+  expand_group_tables_kernel<<<group_count, kTableThreads, 0, stream>>>(d_q, d_q_off, d_table_off, d_shift,
+                                                                        group_count, d_tables);
+}
+
+// One warp per chunk; byte copies because slot payloads have arbitrary
+// alignment. This is memory-bound and tiny next to the compress kernel.
+__global__ void compact_kernel(const uint8_t* slots, uint32_t slot_stride, const uint32_t* src_off,
+                               const uint32_t* sizes, const uint32_t* offsets, uint32_t n, uint8_t* packed) {
+  uint32_t c = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  uint32_t lane = threadIdx.x & 31;
+  if (c >= n) return;
+  const uint8_t* src = slots + (size_t)c * slot_stride + src_off[c];
+  uint8_t* dst = packed + offsets[c];
+  uint32_t sz = sizes[c];
+  for (uint32_t k = lane; k < sz; k += 32) dst[k] = src[k];
+}
+
+size_t compaction_temp_bytes(uint32_t max_chunks) {
+  size_t bytes = 0;
+  cub::DeviceScan::InclusiveSum(nullptr, bytes, (const uint32_t*)nullptr, (uint32_t*)nullptr,
+                                (int)max_chunks);
+  return bytes;
+}
+
+cudaError_t launch_compact(const uint8_t* d_slots, uint32_t slot_stride, const uint32_t* d_src_off,
+                           const uint32_t* d_sizes, uint32_t n, uint32_t* d_offsets, uint8_t* d_packed,
+                           void* d_temp, size_t temp_bytes, cudaStream_t stream) {
+  cudaError_t err = cudaMemsetAsync(d_offsets, 0, sizeof(uint32_t), stream);
+  if (err != cudaSuccess) return err;
+  err = cub::DeviceScan::InclusiveSum(d_temp, temp_bytes, d_sizes, d_offsets + 1, (int)n, stream);
+  if (err != cudaSuccess) return err;
+  constexpr int kThreads = 128;
+  uint32_t blocks = (n * 32 + kThreads - 1) / kThreads;
+  compact_kernel<<<blocks, kThreads, 0, stream>>>(d_slots, slot_stride, d_src_off, d_sizes, d_offsets, n, d_packed);
+  return cudaGetLastError();
+}
+
+} // namespace gzp
+// gzp: a small GPU-accelerated file compressor.
+//
+// Design: the input is split into fixed-size, independent chunks. Each
+// chunk is LZ-compressed (or stored raw if that doesn't help) by one CUDA
+// warp. See README.md for the format and the tradeoffs.
+//
+// Host side, batches of chunks live only in device memory (a ring of up to
+// kMaxSets device buffer sets, each with its own stream). File data moves
+// through a small, fixed pool of pinned staging buffers instead: the main
+// thread freads into an input stage and copies it up asynchronously, and a
+// writer thread drains output stages the main thread fills with
+// asynchronous downloads. So batch i+1's read and upload overlap batch i's
+// kernels, and batch i-1's download and file write overlap both.
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cctype>
+#include <cstring>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+#include <cuda_runtime.h>
+
+#include "file_io.h"
+#include "format.h"
+#include "kernels.h"
+
+using namespace gzp;
+
+namespace {
+
+// Device buffer sets in the ring (see plan_batches). Two measured best: a
+// third only buys concurrent D2H/H2D copies, which PCIe at ~13GB/s doesn't
+// need, and costs a third of each batch's size.
+constexpr int kDefaultSets = 2;
+constexpr int kMaxSets = 3; // upper bound for GZP_FORCE_SETS
+
+// Batch sizing (see plan_batches). Every chunk is one warp, and each warp's
+// LZ parse is latency-bound: it sustains only a few MB/s on its own, so
+// kernel throughput is almost exactly proportional to how many chunks are
+// in flight at once. A batch therefore wants at least kMinBatchChunks
+// chunks (and at least kMinBatchBytes of input) whenever the file and the
+// memory budget allow it; kTargetBatches only matters for files so large
+// that even that many chunks would still leave more than kTargetBatches
+// batches. The earlier policy (one-eighth of the file per batch, 1GB
+// budget) left the 1MB `ratio` profile with 32 chunks per batch -- 32 warps
+// on a 36-SM GPU -- and was ~6x slower on that profile for that reason
+// alone.
+constexpr uint32_t kTargetBatches = 8;
+constexpr uint32_t kMinBatchChunks = 1024;
+constexpr size_t kMinBatchBytes = 32u << 20;
+// GPU memory for batch buffers. By default gzp takes the smaller of half
+// the free VRAM (the GPU may be shared) and kDefaultBudgetCap; --gpu-mem /
+// GZP_GPU_MEM replace that with an explicit budget, limited only to all but
+// kGpuMemReserve of the free VRAM. The cap matters most for the 1MB
+// `ratio` profile, whose chunks need ~6MB of device memory each, so 4GB
+// holds only ~350 of them per batch at two buffer sets.
+constexpr size_t kDefaultBudgetCap = 4ull << 30;
+constexpr size_t kGpuMemReserve = 256ull << 20;
+size_t g_gpu_mem = 0; // explicit budget in bytes, 0 = automatic
+
+// Pinned staging. Pinning is the expensive part of host allocation under
+// WSL2 (cudaHostAlloc measured ~0.3-0.4s per GB, plus ~0.1s per GB to free
+// at exit, versus ~3ms per GB for cudaMalloc), so batches are sized by
+// device memory alone and host transfers go through this many fixed-size
+// stages, whatever the batch size.
+constexpr size_t kStageBytes = 8u << 20;
+constexpr int kInStages = 4;
+constexpr int kOutStages = 8;
+constexpr size_t kStdioBuf = 4u << 20;
+
+[[noreturn]] void die(const std::string& msg) {
+  std::fprintf(stderr, "gzp: %s\n", msg.c_str());
+  std::exit(1);
+}
+
+void check_cuda(cudaError_t err, const char* what) {
+  if (err != cudaSuccess) {
+    die(std::string(what) + ": " + cudaGetErrorString(err));
+  }
+}
+
+double now_s() {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// GZP_VERBOSE=1 prints per-stage timing so we can tell whether a run is
+// bound by file I/O, PCIe copies, or the kernel. GPU stages are measured
+// with per-batch cudaEvents on their own streams, so they stay meaningful
+// when stages overlap; their sums can legitimately exceed wall time.
+enum Mark { kH2d0, kH2d1, kK0, kK1, kD2h0, kD2h1, kMarks };
+
+struct Stats {
+  bool enabled = [] {
+    const char* v = std::getenv("GZP_VERBOSE");
+    return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
+  }();
+  double setup_s = 0, fread_s = 0, fwrite_s = 0, in_wait_s = 0, out_wait_s = 0;
+  uint64_t h2d_bytes = 0, d2h_bytes = 0, bytes_in = 0, bytes_out = 0;
+  int batches = 0, sets = 0;
+  uint32_t batch_chunks = 0;
+  // `origin` is recorded before any batch is queued; each batch's marks are
+  // measured against it so overlapping kernel spans can be unioned.
+  cudaEvent_t origin = nullptr;
+  std::vector<std::array<cudaEvent_t, kMarks>> marks;
+
+  void start_clock(cudaStream_t stream) {
+    if (!enabled) return;
+    check_cuda(cudaEventCreate(&origin), "cudaEventCreate");
+    check_cuda(cudaEventRecord(origin, stream), "cudaEventRecord");
+  }
+  void mark(int batch, Mark m, cudaStream_t stream) {
+    if (!enabled) return;
+    if ((size_t)batch >= marks.size()) marks.resize(batch + 1);
+    cudaEvent_t& e = marks[batch][m];
+    if (!e) check_cuda(cudaEventCreate(&e), "cudaEventCreate");
+    check_cuda(cudaEventRecord(e, stream), "cudaEventRecord");
+  }
+  // Call once all GPU work has finished.
+  void report(const char* mode, double wall_s) {
+    if (!enabled) return;
+    check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
+    double h2d_s = 0, kernel_s = 0, d2h_s = 0;
+    std::vector<std::pair<float, float>> spans;
+    auto at = [&](cudaEvent_t e) {
+      float ms = 0;
+      check_cuda(cudaEventElapsedTime(&ms, origin, e), "cudaEventElapsedTime");
+      return ms;
+    };
+    for (auto& m : marks) {
+      if (m[kH2d0] && m[kH2d1]) h2d_s += (at(m[kH2d1]) - at(m[kH2d0])) / 1000.0;
+      if (m[kK0] && m[kK1]) {
+        spans.emplace_back(at(m[kK0]), at(m[kK1]));
+        kernel_s += (spans.back().second - spans.back().first) / 1000.0;
+      }
+      if (m[kD2h0] && m[kD2h1]) d2h_s += (at(m[kD2h1]) - at(m[kD2h0])) / 1000.0;
+    }
+    // Batches on different streams can run concurrently, so the sum of
+    // spans overstates GPU time once they

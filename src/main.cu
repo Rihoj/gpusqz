@@ -28,6 +28,7 @@
 #include <vector>
 #include <cuda_runtime.h>
 
+#include "file_io.h"
 #include "format.h"
 #include "kernels.h"
 
@@ -55,13 +56,15 @@ constexpr int kMaxSets = 3; // upper bound for GZP_FORCE_SETS
 constexpr uint32_t kTargetBatches = 8;
 constexpr uint32_t kMinBatchChunks = 1024;
 constexpr size_t kMinBatchBytes = 32u << 20;
-// GPU memory for batch buffers. By default gzp takes the smaller of half
-// the free VRAM (the GPU may be shared) and kDefaultBudgetCap; --gpu-mem /
-// GZP_GPU_MEM replace that with an explicit budget, limited only to all but
-// kGpuMemReserve of the free VRAM. The cap matters most for the 1MB
-// `ratio` profile, whose chunks need ~6MB of device memory each, so 4GB
-// holds only ~350 of them per batch at two buffer sets.
-constexpr size_t kDefaultBudgetCap = 4ull << 30;
+// GPU memory for batch buffers. By default gzp may use kDefaultBudgetPercent
+// of the VRAM free when it starts; --gpu-mem / GZP_GPU_MEM replace that
+// with an explicit budget, limited only to all but kGpuMemReserve of the
+// free VRAM. Whatever gzp takes it allocates once, up front, and holds
+// until it exits, so no other process can claim it mid-run. The budget
+// matters most for the 1MB `ratio` profile, whose chunks need ~6MB of
+// device memory each; the smaller profiles' batches are bounded by
+// kMinBatchChunks/kTargetBatches first.
+constexpr size_t kDefaultBudgetPercent = 80;
 constexpr size_t kGpuMemReserve = 256ull << 20;
 size_t g_gpu_mem = 0; // explicit budget in bytes, 0 = automatic
 
@@ -434,7 +437,7 @@ struct Plan {
 Plan plan_batches(uint32_t chunk_count, uint32_t chunk_size, size_t dev_bytes_per_chunk) {
   size_t free_bytes = 0, total_bytes = 0;
   check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
-  size_t budget = std::min<size_t>(free_bytes / 2, kDefaultBudgetCap);
+  size_t budget = free_bytes / 100 * kDefaultBudgetPercent;
   if (g_gpu_mem) {
     size_t avail = free_bytes > kGpuMemReserve ? free_bytes - kGpuMemReserve : 0;
     budget = std::min(g_gpu_mem, avail);
@@ -474,11 +477,11 @@ Plan plan_batches(uint32_t chunk_count, uint32_t chunk_size, size_t dev_bytes_pe
 }
 
 uint64_t file_size(FILE* f) {
-  long cur = ftell(f);
-  fseek(f, 0, SEEK_END);
-  long sz = ftell(f);
-  fseek(f, cur, SEEK_SET);
-  return (uint64_t)sz;
+  uint64_t cur = file_tell(f);
+  file_seek(f, 0, SEEK_END);
+  uint64_t sz = file_tell(f);
+  file_seek(f, cur);
+  return sz;
 }
 
 void create_stream(cudaStream_t& stream, std::initializer_list<cudaEvent_t*> events) {
@@ -740,13 +743,13 @@ void compress(const std::string& in_path, const std::string& out_path, uint32_t 
   // at the end, same as the ChunkEntry and TableGroup arrays below.
   FileHeader header{kMagic, kVersion, chunk_size, total_size, chunk_count, 0, 0};
   std::fwrite(&header, sizeof(header), 1, out);
-  long entries_pos = ftell(out);
+  uint64_t entries_pos = file_tell(out);
   std::vector<ChunkEntry> entries(chunk_count);
   std::fwrite(entries.data(), sizeof(ChunkEntry), (size_t)chunk_count, out);
 
   std::vector<TableGroup> groups;
   std::vector<uint8_t> tables;
-  long groups_pos = ftell(out);
+  uint64_t groups_pos = file_tell(out);
 
   if (chunk_count > 0) {
     Compressor cz;
@@ -788,14 +791,14 @@ void compress(const std::string& in_path, const std::string& out_path, uint32_t 
 
   // The table section follows the payload (the writer thread is done, so
   // the stream position is the payload's end) and ends the file.
-  header.tables_offset = (uint64_t)ftell(out);
+  header.tables_offset = file_tell(out);
   if (!tables.empty() && std::fwrite(tables.data(), 1, tables.size(), out) != tables.size()) die("write failed");
 
-  std::fseek(out, 0, SEEK_SET);
+  file_seek(out, 0);
   std::fwrite(&header, sizeof(header), 1, out);
-  std::fseek(out, entries_pos, SEEK_SET);
+  file_seek(out, entries_pos);
   std::fwrite(entries.data(), sizeof(ChunkEntry), entries.size(), out);
-  std::fseek(out, groups_pos, SEEK_SET);
+  file_seek(out, groups_pos);
   std::fwrite(groups.data(), sizeof(TableGroup), groups.size(), out);
   std::fclose(in);
   if (std::fclose(out) != 0) die("write failed");
@@ -838,7 +841,7 @@ struct Decompressor {
   FILE* out;
   FileHeader header;
   uint32_t slot_stride;
-  long payload_start;
+  uint64_t payload_start;
   std::vector<ChunkEntry> entries;
   std::vector<TableGroup> groups;
   std::vector<uint8_t> tables;       // the file's table section: each group's quantised counts in order
@@ -955,7 +958,7 @@ struct Decompressor {
 
     cudaStream_t st = s.stream;
     g_stats.mark(b, kH2d0, st);
-    if (std::fseek(in, payload_start + (long)base, SEEK_SET) != 0) die("seek failed");
+    if (!file_seek(in, payload_start + base)) die("seek failed");
     in_ring.upload(in, s.d_in.p, total_in, st, "short read on compressed payload");
     check_cuda(cudaMemcpyAsync(s.d_in_offsets.p, s.h_in_offsets.p, n * sizeof(uint32_t), cudaMemcpyHostToDevice, st),
                "H2D offsets");
@@ -1052,7 +1055,7 @@ void decompress(const std::string& in_path, const std::string& out_path) {
     if (covered != header.chunk_count) die("corrupt table group directory: doesn't cover all chunks");
   }
 
-  long payload_start = ftell(in);
+  uint64_t payload_start = file_tell(in);
 
   // The payload runs from here to the table section, which ends the file.
   // Checking that the chunk table covers exactly that range keeps any batch
@@ -1060,12 +1063,12 @@ void decompress(const std::string& in_path, const std::string& out_path) {
   uint64_t payload_bytes = entries.empty() ? 0 : entries.back().offset + entries.back().compressed_size;
   uint64_t tables_bytes = 0;
   for (const TableGroup& g : groups) tables_bytes += group_quant_bytes(g);
-  if (header.tables_offset != (uint64_t)payload_start + payload_bytes ||
+  if (header.tables_offset != payload_start + payload_bytes ||
       header.tables_offset + tables_bytes != file_size(in)) {
     die("corrupt header: payload and table section don't match the file");
   }
   std::vector<uint8_t> tables(tables_bytes);
-  if (std::fseek(in, (long)header.tables_offset, SEEK_SET) != 0 ||
+  if (!file_seek(in, header.tables_offset) ||
       (tables_bytes && std::fread(tables.data(), 1, tables_bytes, in) != tables_bytes)) {
     die("truncated table section");
   }
@@ -1107,7 +1110,7 @@ void usage() {
                "  gzp d <input> <output> [--gpu-mem SIZE]\n"
                "chunk_size and --profile are mutually exclusive; with neither, chunk_size is %u.\n"
                "--gpu-mem caps the GPU memory used for batch buffers (e.g. 8G, 512M; a bare\n"
-               "number is MiB). Default: half the free GPU memory, at most 4G. Also GZP_GPU_MEM.\n",
+               "number is MiB). Default: 80%% of the free GPU memory. Also GZP_GPU_MEM.\n",
                kDefaultChunkSize);
   std::exit(1);
 }

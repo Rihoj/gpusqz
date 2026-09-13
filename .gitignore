@@ -1,5 +1,8 @@
 build/
+build-*/
 *.o
 *.gzp
 *.dec
 *.swp
+# Test fixtures are compressed files on purpose (see tests/fixtures/make_fixtures.sh).
+!tests/fixtures/*.gzp

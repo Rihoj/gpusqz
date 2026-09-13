@@ -1,0 +1,285 @@
+# Builds gzp for Linux (deb, rpm), Windows (zip) and macOS (tar.gz), runs
+# the tests that don't need a GPU, and on a v* tag publishes the packages
+# as a GitHub release.
+#
+# GitHub-hosted runners have no NVIDIA GPU, so CI compiles the CUDA code
+# and runs only the GPU-free tests (`ctest -LE gpu`): the CPU reference
+# decoder against committed fixtures made by the real GPU build
+# (tests/fixtures), and gzp's argument handling. The GPU round trip
+# (tests/round_trip.sh, ctest label "gpu") has to run on a machine with a
+# GPU before tagging a release.
+#
+# macOS gets only gzp_refdec, the CPU decoder: CUDA does not exist on
+# macOS, so the compressor cannot be built or run there.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # sm_70 (Volta) is the oldest GPU gzp can run on (it needs
+  # __match_any_sync). Native code for every generation up to Blackwell,
+  # plus sm_120 PTX so newer GPUs can JIT-compile it.
+  CUDA_ARCHS: "70-real;75-real;80-real;86-real;89-real;90-real;100-real;120"
+  # Volta is deprecated for offline compilation in CUDA 12.8 but still works.
+  CUDA_FLAGS: "-Wno-deprecated-gpu-targets"
+
+jobs:
+  linux-deb:
+    name: Linux (deb)
+    # Built on the oldest supported Ubuntu so the package's glibc/libstdc++
+    # requirements stay low (Ubuntu 22.04+, Debian 12+).
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA compiler
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cuda-nvcc-12-8 cuda-cudart-dev-12-8 cuda-cccl-12-8 cmake ninja-build dpkg-dev
+
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then v="${GITHUB_REF_NAME#v}"; else v=0.5.0; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc
+          -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS"
+          -DCMAKE_CUDA_FLAGS="$CUDA_FLAGS"
+          -DGZP_VERSION=${{ steps.version.outputs.version }}
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test (no GPU)
+        run: ctest --test-dir build -LE gpu --output-on-failure
+
+      - name: Package
+        working-directory: build
+        run: |
+          cpack -G DEB
+          dpkg-deb --info ./*.deb
+          dpkg-deb --contents ./*.deb
+
+      - name: Install and smoke-test the package
+        run: |
+          sudo apt-get install -y ./build/*.deb
+          gzp_refdec tests/fixtures/text__c4k_lit0.gzp /tmp/out
+          cmp /tmp/out tests/fixtures/text.orig
+          gzp 2>&1 | grep -q usage:
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gzp-linux-deb
+          path: build/*.deb
+          if-no-files-found: error
+
+  linux-rpm:
+    name: Linux (rpm)
+    # Built on EL8 (glibc 2.28) so the package installs on RHEL/Rocky/Alma
+    # 8 and 9 and on current Fedora.
+    runs-on: ubuntu-latest
+    container: rockylinux:8
+    steps:
+      - name: Install build tools and CUDA compiler
+        run: |
+          dnf install -y dnf-plugins-core
+          dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo
+          dnf install -y git gcc-c++ make cmake rpm-build \
+            cuda-nvcc-12-8 cuda-cudart-devel-12-8 cuda-cccl-12-8
+
+      - uses: actions/checkout@v4
+
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then v="${GITHUB_REF_NAME#v}"; else v=0.5.0; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc
+          -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS"
+          -DCMAKE_CUDA_FLAGS="$CUDA_FLAGS"
+          -DGZP_VERSION=${{ steps.version.outputs.version }}
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Test (no GPU)
+        run: ctest --test-dir build -LE gpu --output-on-failure
+
+      - name: Package
+        working-directory: build
+        run: |
+          cpack -G RPM
+          rpm -qip ./*.rpm
+          rpm -qlp ./*.rpm
+
+      - name: Install and smoke-test the package
+        run: |
+          dnf install -y ./build/*.rpm
+          gzp_refdec tests/fixtures/text__c4k_lit0.gzp /tmp/out
+          cmp /tmp/out tests/fixtures/text.orig
+          gzp 2>&1 | grep -q usage:
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gzp-linux-rpm
+          path: build/*.rpm
+          if-no-files-found: error
+
+  windows:
+    name: Windows (zip)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA compiler
+        shell: pwsh
+        run: |
+          $url = "https://developer.download.nvidia.com/compute/cuda/12.8.1/network_installers/cuda_12.8.1_windows_network.exe"
+          Invoke-WebRequest $url -OutFile cuda_installer.exe
+          $p = Start-Process -Wait -PassThru -FilePath .\cuda_installer.exe -ArgumentList "-s nvcc_12.8 cudart_12.8 thrust_12.8"
+          if ($p.ExitCode -ne 0) { throw "CUDA installer exited with $($p.ExitCode)" }
+          $cuda = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
+          if (-not (Test-Path "$cuda\bin\nvcc.exe")) { throw "nvcc.exe not found under $cuda" }
+          "CUDA_PATH=$cuda" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$cuda\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Set up MSVC environment
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" > nul && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') { "$($Matches[1])=$($Matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Append }
+          }
+
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then v="${GITHUB_REF_NAME#v}"; else v=0.5.0; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Configure
+        shell: pwsh
+        run: >
+          cmake -S . -B build -G "NMake Makefiles"
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CUDA_COMPILER="$env:CUDA_PATH/bin/nvcc.exe"
+          "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS"
+          "-DCMAKE_CUDA_FLAGS=$env:CUDA_FLAGS"
+          -DGZP_VERSION=${{ steps.version.outputs.version }}
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test (no GPU)
+        run: ctest --test-dir build -LE gpu --output-on-failure
+
+      - name: Package
+        working-directory: build
+        run: cpack -G ZIP
+
+      - name: Smoke-test the package
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem build\*.zip | Select-Object -First 1
+          Expand-Archive $zip.FullName -DestinationPath pkg
+          $bin = Get-ChildItem pkg -Recurse -Filter gzp_refdec.exe | Select-Object -First 1
+          & $bin.FullName tests\fixtures\text__c4k_lit0.gzp out.txt
+          if ($LASTEXITCODE -ne 0) { throw "gzp_refdec failed" }
+          if ((Get-FileHash out.txt).Hash -ne (Get-FileHash tests\fixtures\text.orig).Hash) { throw "decode mismatch" }
+          $gzp = Join-Path $bin.DirectoryName gzp.exe
+          $usage = & $gzp 2>&1 | Out-String
+          if ($usage -notmatch "usage:") { throw "gzp.exe did not print usage: $usage" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gzp-windows-zip
+          path: build/*.zip
+          if-no-files-found: error
+
+  macos:
+    name: macOS (decoder only, tar.gz)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then v="${GITHUB_REF_NAME#v}"; else v=0.5.0; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DGZP_BUILD_GPU=OFF
+          "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+          -DGZP_VERSION=${{ steps.version.outputs.version }}
+
+      - name: Build
+        run: cmake --build build -j "$(sysctl -n hw.ncpu)"
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Package
+        working-directory: build
+        run: |
+          cpack -G TGZ
+          tar tzf ./*.tar.gz
+          lipo -verify_arch gzp_refdec arm64 x86_64  # universal binary: Apple silicon and Intel
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gzp-macos-tgz
+          path: build/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux-deb, linux-rpm, windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l dist
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "gzp $GITHUB_REF_NAME" \
+            --generate-notes
