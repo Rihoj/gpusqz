@@ -88,6 +88,7 @@ parse_hist_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, 
     n_seq_arr[c] = em.n_seq;
     n_lit_arr[c] = em.n_lit;
   }
+  __syncwarp(); // the sequences and literals below were written by other lanes
   uint32_t token_bytes;
   if (!rans_eligible(seqs, em.n_seq, token_bytes)) return;
   compute_repeat_codes(seqs, em.n_seq, rep_code);
@@ -210,7 +211,10 @@ rans_encode_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count,
                           &start, &size);
     if (ok && 1 + tok_total < size) ok = false;
   }
+  // Each attempt below overwrites bytes other lanes wrote in the one
+  // before, so the lanes sync first.
   if (!ok) {
+    __syncwarp();
     uint32_t len = 0;
     ok = tokens_from_seqs(chunk_in, seqs, n_seq, slot + 1, in_len - 1, &len);
     if (ok) {
@@ -220,6 +224,7 @@ rans_encode_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count,
     }
   }
   if (!ok) {
+    __syncwarp();
     for (uint32_t k = lane; k < in_len; k += 32) slot[1 + k] = chunk_in[k];
     start = 0;
     size = 1 + in_len;

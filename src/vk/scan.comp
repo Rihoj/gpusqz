@@ -1,0 +1,37 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// out_offsets[0] = 0, out_offsets[i + 1] = out_offsets[i] + out_sizes[i]
+// for the batch's chunk_count chunks. One workgroup: each thread sums a
+// contiguous run, the run totals are scanned in shared memory, then each
+// thread writes its run's offsets.
+#include "common.glsl"
+#include "compress.glsl"
+
+const uint kThreads = 256;
+layout(local_size_x = 256) in;
+
+shared uint totals[kThreads];
+
+void main() {
+  uint t = gl_LocalInvocationIndex;
+  uint n = pc.chunk_count;
+  uint per = (n + kThreads - 1) / kThreads;
+  uint b = min(n, t * per), e = min(n, b + per);
+  uint sum = 0;
+  for (uint i = b; i < e; ++i) sum += out_sizes[i];
+  totals[t] = sum;
+  barrier();
+  // Inclusive Hillis-Steele scan of the run totals.
+  for (uint d = 1; d < kThreads; d <<= 1) {
+    uint v = t >= d ? totals[t - d] : 0;
+    barrier();
+    totals[t] += v;
+    barrier();
+  }
+  uint run = totals[t] - sum; // exclusive: everything before this run
+  if (t == 0) out_offsets[0] = 0;
+  for (uint i = b; i < e; ++i) {
+    run += out_sizes[i];
+    out_offsets[i + 1] = run;
+  }
+}

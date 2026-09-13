@@ -1,0 +1,20 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Packs each chunk's output (out_sizes[c] bytes from its slot, out_start[c]
+// bytes in) to inb + out_offsets[c]: the batch input is no longer needed,
+// and it has room for the packed output (see VkCompressSet). One workgroup
+// of 32 per chunk; byte copies because slot payloads have arbitrary
+// alignment.
+#include "common.glsl"
+#include "compress.glsl"
+
+layout(local_size_x = 32) in;
+
+void main() {
+  uint c = gl_WorkGroupID.x;
+  if (c >= pc.chunk_count) return;
+  uint src = c * pc.slot_stride + out_start[c];
+  uint dst = out_offsets[c];
+  uint sz = out_sizes[c];
+  for (uint k = gl_LocalInvocationIndex; k < sz; k += 32) inb[dst + k] = slots[src + k];
+}

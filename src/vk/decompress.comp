@@ -1,0 +1,285 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Port of kernels.cu's decompress_kernel with lz_warp.cuh's lz_decode_warp
+// and rans.cuh's rans_decode_warp / lz_reconstruct_warp: one lane group per
+// chunk. Any malformed chunk sets err[0].
+#include "common.glsl"
+#include "decompress.glsl"
+
+layout(local_size_x = 32) in;
+
+uint g_seq, g_lit, g_out; // g_lit counts words
+
+uint in_u32(uint p) {
+  return uint(inb[p]) | (uint(inb[p + 1]) << 8) | (uint(inb[p + 2]) << 16) | (uint(inb[p + 3]) << 24);
+}
+
+// ---- Lz tokens ----
+
+bool read_ext(uint in_end, inout uint ip, inout uint v) {
+  uint b;
+  do {
+    if (ip >= in_end) return false;
+    b = uint(inb[ip++]);
+    v += b;
+  } while (b == 255);
+  return true;
+}
+
+// Copies a match of ml bytes at backward distance off to outb[g_out + op].
+// Overlapping matches repeat the already written history, so lanes never
+// depend on each other's writes within one copy.
+void copy_match(uint op, uint off, uint ml) {
+  uint lane = lg_lane();
+  lg_sync(); // literals just written must be visible before a match reads them
+  uint dst = g_out + op, src = dst - off;
+  if (off >= ml) {
+    for (uint k = lane; k < ml; k += 32) outb[dst + k] = outb[src + k];
+  } else {
+    for (uint k = lane; k < ml; k += 32) outb[dst + k] = outb[src + k % off];
+  }
+  lg_sync();
+}
+
+// Decodes exactly `orig` bytes from inb[ip, in_end).
+bool lz_decode(uint ip, uint in_end, uint orig) {
+  uint lane = lg_lane();
+  uint op = 0;
+  while (op < orig) {
+    if (ip >= in_end) return false;
+    uint tok = uint(inb[ip++]);
+    uint lit = tok >> 4;
+    if (lit == 15 && !read_ext(in_end, ip, lit)) return false;
+    if (ip + lit > in_end || op + lit > orig) return false;
+    for (uint k = lane; k < lit; k += 32) outb[g_out + op + k] = inb[ip + k];
+    ip += lit;
+    op += lit;
+    if (op >= orig) break;
+
+    if (ip + 4 > in_end) return false;
+    uint off = in_u32(ip);
+    ip += 4;
+    uint ml = (tok & 15) + kMinMatch;
+    if ((tok & 15) == 15) {
+      uint e = 15;
+      if (!read_ext(in_end, ip, e)) return false;
+      ml = e + kMinMatch;
+    }
+    if (off == 0 || off > op || op + ml > orig) return false;
+    copy_match(op, off, ml);
+    op += ml;
+  }
+  return ip == in_end;
+}
+
+// ---- rANS ----
+
+bool dec_renorm(inout uint x, bool live, inout uint rp, uint rend) {
+  bool need = live && x < kRansL;
+  uint m = lg_ballot(need);
+  uint cnt = bitCount(m);
+  if (rp + 2 * cnt > rend) return false;
+  if (need) {
+    uint p = rp + 2 * bitCount(m & lanemask_lt());
+    x = (x << 16) | uint(inb[p]) | (uint(inb[p + 1]) << 8);
+  }
+  rp += 2 * cnt;
+  return true;
+}
+
+// The group's tables: literal rows and LUTs in gsym from g_sym, freq/cum
+// in gfc from g_fc.
+uint g_sym, g_fc, g_luts;
+
+// Small alphabets (base kLlBase / kMlBase / kOffBase, LUT index 0 / 1 / 2):
+// a lower-bound symbol from the coarse LUT, then a forward scan.
+uint dec_small(inout uint x, uint base, uint lut, inout bool bad) {
+  uint slot = x & (kProbScale - 1);
+  uint s = uint(gsym[g_luts + lut * kSmallLutSize + (slot >> (kProbBits - kSmallLutBits))]);
+  while (s + 1 < kSmallSyms && fc_cum(gfc[g_fc + base + s + 1]) <= slot) ++s;
+  uint v = gfc[g_fc + base + s];
+  bad = bad || fc_freq(v) == 0;
+  x = fc_freq(v) * (x >> kProbBits) + slot - fc_cum(v);
+  return s;
+}
+
+uint dec_lit(inout uint x, uint ctx, inout bool bad) {
+  uint slot = x & (kProbScale - 1);
+  uint s = uint(gsym[g_sym + (ctx << kProbBits) + slot]);
+  uint v = gfc[g_fc + lit_entry(ctx, s)];
+  bad = bad || fc_freq(v) == 0;
+  x = fc_freq(v) * (x >> kProbBits) + slot - fc_cum(v);
+  return s;
+}
+
+bool dec_bits16(inout uint x, bool live, uint nb, out uint o, inout uint rp, uint rend) {
+  bool on = live && nb != 0;
+  o = on ? (x & ((1u << nb) - 1)) : 0;
+  if (on) x >>= nb;
+  return dec_renorm(x, on, rp, rend);
+}
+
+bool dec_bits(inout uint x, bool live, uint nb, out uint o, inout uint rp, uint rend) {
+  uint hi_nb = nb > 16 ? nb - 16 : 0;
+  uint lo_nb = nb > 16 ? 16 : nb;
+  uint hi = 0, lo = 0;
+  o = 0;
+  if (!dec_bits16(x, live, hi_nb, hi, rp, rend)) return false;
+  if (!dec_bits16(x, live, lo_nb, lo, rp, rend)) return false;
+  o = (hi << 16) | lo;
+  return true;
+}
+
+// See rans_decode_warp: payload at inb[pl, pl + len).
+bool rans_decode(uint pl, uint len, uint lit_shift, uint max_seq, uint max_lit, out uint n_seq, out uint n_lit) {
+  uint lane = lg_lane();
+  n_seq = 0;
+  n_lit = 0;
+  if (len < kRansHeaderBytes) return false;
+  n_seq = in_u32(pl);
+  n_lit = in_u32(pl + 4);
+  if (n_seq > max_seq || n_lit > max_lit) return false;
+
+  uint x = in_u32(pl + 8 + 4 * lane);
+  uint rp = pl + kRansHeaderBytes;
+  uint rend = pl + len;
+  bool bad = false;
+  uvec3 rep = uvec3(0); // identical in every lane, advanced by the replay below
+
+  for (uint g = 0; g < (n_seq + 31) / 32; ++g) {
+    uint idx = g * 32 + lane;
+    bool act = idx < n_seq;
+    uint llc = 0, mlc = 0, oc = 0, llb = 0, mlb = 0, ob = 0;
+
+    if (act) llc = dec_small(x, kLlBase, 0, bad);
+    if (!dec_renorm(x, act, rp, rend)) return false;
+    if (!dec_bits(x, act, len_nb(llc), llb, rp, rend)) return false;
+
+    if (act) mlc = dec_small(x, kMlBase, 1, bad);
+    if (!dec_renorm(x, act, rp, rend)) return false;
+    if (!dec_bits(x, act, len_nb(mlc), mlb, rp, rend)) return false;
+
+    uint mlv = len_value(mlc, mlb);
+    uint ml = mlv != 0 ? mlv + (kMinMatch - 1) : 0;
+    bool has_off = act && ml != 0;
+    if (has_off) oc = dec_small(x, kOffBase, 2, bad);
+    if (!dec_renorm(x, has_off, rp, rend)) return false;
+    if (!dec_bits(x, has_off, off_nb(oc), ob, rp, rend)) return false;
+
+    // Resolve the group's offsets: every lane replays the recent-offset
+    // state over all 32 sequences in order, keeping its own lane's result.
+    // One shuffle per sequence: has_off (1 bit), oc (5) and ob (<= 20).
+    uint packed = has_off ? 1u | (oc << 1) | (ob << 6) : 0u;
+    uint off = 0;
+    for (uint j = 0; j < 32; ++j) {
+      uint pj = lg_shfl(packed, j);
+      uint jo = 0;
+      if ((pj & 1u) != 0) {
+        uint j_oc = (pj >> 1) & 31u;
+        if (j_oc >= kOffRepBase) {
+          jo = rep_get(rep, j_oc - kOffRepBase);
+          rep_use(rep, j_oc - kOffRepBase, jo);
+        } else {
+          jo = off_value(j_oc, pj >> 6);
+          rep_use(rep, kRepNew, jo);
+        }
+      }
+      if (j == lane) off = jo;
+    }
+
+    if (act) {
+      if (ml == 0 && idx != n_seq - 1) bad = true;
+      // Reject lengths/offsets beyond the chunk before packing them into
+      // 21-bit fields.
+      if (ml > max_lit || (has_off && off > max_lit)) bad = true;
+      seqs[g_seq + idx] = seq_pack(len_value(llc, llb), has_off ? off : 0, ml);
+    }
+    if (lg_any(bad)) return false;
+  }
+
+  // Literals: each lane decodes its own run in order, the previous literal
+  // giving the context.
+  // Runs are 4-aligned, so each lane stores whole words of its own run.
+  uint run_len = lit_run_len(n_lit);
+  uint run0 = lane * run_len;
+  uint prev = 0, pack = 0;
+  for (uint k = 0; k < run_len; ++k) {
+    uint idx = run0 + k;
+    bool act = idx < n_lit;
+    if (act) {
+      uint s = dec_lit(x, lit_ctx(prev, lit_shift), bad);
+      prev = s;
+      pack |= s << (8 * (k & 3));
+      if ((k & 3) == 3) {
+        lits[g_lit + (idx >> 2)] = pack;
+        pack = 0;
+      }
+    }
+    if (!dec_renorm(x, act, rp, rend)) return false;
+  }
+  if (run0 < n_lit && (min(n_lit, run0 + run_len) & 3) != 0) lits[g_lit + (min(n_lit, run0 + run_len) >> 2)] = pack;
+  if (lg_any(bad)) return false;
+  return rp == rend;
+}
+
+// Rebuilds the chunk from decoded sequences and literals.
+bool lz_reconstruct(uint n_seq, uint n_lit, uint orig) {
+  uint lane = lg_lane();
+  uint op = 0, lp = 0;
+  for (uint i = 0; i < n_seq; ++i) {
+    uvec2 r = seqs[g_seq + i];
+    uint ll = seq_ll(r);
+    if (lp + ll > n_lit || op + ll > orig) return false;
+    for (uint k = lane; k < ll; k += 32) {
+      uint i = lp + k;
+      outb[g_out + op + k] = uint8_t(lits[g_lit + (i >> 2)] >> (8 * (i & 3)));
+    }
+    op += ll;
+    lp += ll;
+    uint ml = seq_ml(r), off = seq_off(r);
+    if (ml != 0) {
+      if (off == 0 || off > op || op + ml > orig) return false;
+      copy_match(op, off, ml);
+      op += ml;
+    }
+  }
+  return op == orig && lp == n_lit;
+}
+
+void main() {
+  uint c = gl_WorkGroupID.x;
+  if (c >= pc.chunk_count) return;
+  uint lane = lg_lane();
+  uint slot = in_offsets[c];
+  uint len = in_lens[c];
+  g_out = c * pc.chunk_size;
+  uint orig = out_lens[c];
+
+  bool ok = false;
+  if (len >= 1) {
+    uint flag = uint(inb[slot]);
+    if (flag == kFlagRaw) {
+      ok = len == 1 + orig;
+      if (ok) {
+        for (uint k = lane; k < orig; k += 32) outb[g_out + k] = inb[slot + 1 + k];
+      }
+    } else if (flag == kFlagLz) {
+      ok = lz_decode(slot + 1, slot + len, orig);
+    } else if (flag == kFlagLzRans) {
+      g_seq = c * pc.max_seq;
+      g_lit = c * ((pc.chunk_size + 3) / 4);
+      uvec4 gi = ginfo[group_id[c]];
+      uint lit_shift = gi.w;
+      g_sym = gi.y;
+      g_luts = g_sym + (lit_ctx_count(lit_shift) << kProbBits);
+      g_fc = gi.z;
+      uint n_seq, n_lit;
+      ok = rans_decode(slot + 1, len - 1, lit_shift, pc.max_seq, pc.chunk_size, n_seq, n_lit);
+      if (ok) {
+        lg_sync();
+        ok = lz_reconstruct(n_seq, n_lit, orig);
+      }
+    }
+  }
+  if (!ok && lane == 0) err[0] = 1;
+}

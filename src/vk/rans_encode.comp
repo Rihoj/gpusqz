@@ -1,0 +1,228 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Port of kernels.cu's rans_encode_kernel (with rans.cuh's rans_encode_warp
+// and lz_warp.cuh's token writer): one lane group per chunk keeps the
+// smallest of rANS against the batch's tables, plain tokens, and raw.
+#include "common.glsl"
+#include "compress.glsl"
+
+layout(local_size_x = 32) in;
+
+uint g_in, g_seq, g_lit;
+
+void store_u32(uint p, uint v) {
+  slots[p] = uint8_t(v);
+  slots[p + 1] = uint8_t(v >> 8);
+  slots[p + 2] = uint8_t(v >> 16);
+  slots[p + 3] = uint8_t(v >> 24);
+}
+
+bool rans_eligible(uint n_seq, out uint token_bytes) {
+  uint tot = 0;
+  bool too_long = false;
+  for (uint i = lg_lane(); i < n_seq; i += 32) {
+    uvec2 r = seqs[g_seq + i];
+    tot += seq_size(seq_ll(r), seq_ml(r));
+    too_long = too_long || seq_ll(r) > kMaxLenValue;
+  }
+  tot = lg_sum(tot);
+  token_bytes = tot;
+  return !lg_any(too_long) && tot >= kRansHeaderBytes;
+}
+
+// ---- encoder steps (all lanes call; return false uniformly on overflow) ----
+// wp and wlimit are byte offsets into slots; words are 16 bits.
+
+bool enc_flush(inout uint x, bool need, inout uint wp, uint wlimit) {
+  uint m = lg_ballot(need);
+  uint cnt = bitCount(m);
+  if (wp - wlimit < 2 * cnt) return false;
+  wp -= 2 * cnt;
+  if (need) {
+    uint o = wp + 2 * bitCount(m & lanemask_lt());
+    slots[o] = uint8_t(x);
+    slots[o + 1] = uint8_t(x >> 8);
+    x >>= 16;
+  }
+  return true;
+}
+
+bool enc_put(inout uint x, bool live, uint fcv, inout uint wp, uint wlimit) {
+  uint f = fc_freq(fcv);
+  bool need = live && (x >> (16 + 16 - kProbBits)) >= f;
+  if (!enc_flush(x, need, wp, wlimit)) return false;
+  if (live) x = ((x / f) << kProbBits) + (x % f) + fc_cum(fcv);
+  return true;
+}
+
+bool enc_bits16(inout uint x, bool live, uint nb, uint bits, inout uint wp, uint wlimit) {
+  bool on = live && nb != 0;
+  bool need = on && x >= (1u << (32 - nb));
+  if (!enc_flush(x, need, wp, wlimit)) return false;
+  if (on) x = (x << nb) | bits;
+  return true;
+}
+
+bool enc_bits(inout uint x, bool live, uint nb, uint bits, inout uint wp, uint wlimit) {
+  uint lo_nb = nb > 16 ? 16 : nb;
+  uint hi_nb = nb > 16 ? nb - 16 : 0;
+  if (!enc_bits16(x, live, lo_nb, bits & 0xFFFFu, wp, wlimit)) return false;
+  return enc_bits16(x, live, hi_nb, bits >> 16, wp, wlimit);
+}
+
+// See rans_encode_warp. slot is the chunk's slot base.
+bool rans_encode(uint n_seq, uint n_lit, uint lit_shift, uint slot, uint in_len, out uint start, out uint size) {
+  uint lane = lg_lane();
+  start = 0;
+  size = 0;
+  uint max_stream = in_len - 1 - kRansHeaderBytes;
+  uint slot_end = slot + pc.slot_stride;
+  uint wlimit = slot_end - 2 * (max_stream / 2);
+  uint wp = slot_end;
+  uint x = kRansL;
+
+  uint run_len = lit_run_len(n_lit);
+  for (int t = int(run_len) - 1; t >= 0; --t) {
+    uint idx = lane * run_len + uint(t);
+    bool act = idx < n_lit;
+    uint e = 0;
+    if (act) {
+      uint prev = t != 0 ? uint(lits[g_lit + idx - 1]) : 0;
+      e = lit_entry(lit_ctx(prev, lit_shift), uint(lits[g_lit + idx]));
+    }
+    if (!enc_put(x, act, fc[e], wp, wlimit)) return false;
+  }
+  for (int g = int((n_seq + 31) / 32) - 1; g >= 0; --g) {
+    uint idx = uint(g) * 32 + lane;
+    bool act = idx < n_seq;
+    uvec2 r = uvec2(0);
+    if (act) r = seqs[g_seq + idx];
+    uint ml = seq_ml(r), off = seq_off(r);
+    uint llc, llnb, llb, mlc, mlnb, mlb, oc = 0, onb = 0, ob = 0;
+    len_code(seq_ll(r), llc, llnb, llb);
+    len_code(ml != 0 ? ml - (kMinMatch - 1) : 0, mlc, mlnb, mlb);
+    bool has_off = act && ml != 0;
+    if (has_off) {
+      uint rc = uint(rep_code[g_seq + idx]);
+      if (rc != 0) {
+        oc = kOffRepBase + (rc - 1);
+      } else {
+        off_code(off, oc, onb, ob);
+      }
+    }
+    if (!enc_bits(x, has_off, onb, ob, wp, wlimit)) return false;
+    if (!enc_put(x, has_off, fc[kOffBase + oc], wp, wlimit)) return false;
+    if (!enc_bits(x, act, mlnb, mlb, wp, wlimit)) return false;
+    if (!enc_put(x, act, fc[kMlBase + mlc], wp, wlimit)) return false;
+    if (!enc_bits(x, act, llnb, llb, wp, wlimit)) return false;
+    if (!enc_put(x, act, fc[kLlBase + llc], wp, wlimit)) return false;
+  }
+
+  uint hdr = wp - kRansHeaderBytes;
+  uint st = hdr - 1;
+  if (lane == 0) {
+    slots[st] = uint8_t(kFlagLzRans);
+    store_u32(hdr, n_seq);
+    store_u32(hdr + 4, n_lit);
+  }
+  store_u32(hdr + 8 + 4 * lane, x);
+  start = st - slot;
+  size = slot_end - st;
+  return true;
+}
+
+// ---- LZ4-style tokens (lz_warp.cuh's emit_seq / tokens_from_seqs) ----
+
+uint write_ext(uint p, uint v) {
+  uint r = v - 15;
+  while (r >= 255) {
+    slots[p++] = uint8_t(255);
+    r -= 255;
+  }
+  slots[p++] = uint8_t(r);
+  return p;
+}
+
+bool emit_seq(uint dst, uint cap, inout uint op, uint lit_start, uint lit_len, uint off, uint ml) {
+  uint size = seq_size(lit_len, ml);
+  if (op + size > cap) return false;
+  uint lane = lg_lane();
+  uint lit_pos = op + 1 + ext_bytes(lit_len);
+  if (lane == 0) {
+    uint mlc = ml != 0 ? ml - kMinMatch : 0;
+    slots[dst + op] = uint8_t(((lit_len >= 15 ? 15 : lit_len) << 4) | (mlc >= 15 ? 15 : mlc));
+    if (lit_len >= 15) write_ext(dst + op + 1, lit_len);
+    if (ml != 0) {
+      uint p = dst + lit_pos + lit_len;
+      slots[p] = uint8_t(off);
+      slots[p + 1] = uint8_t(off >> 8);
+      slots[p + 2] = uint8_t(off >> 16);
+      slots[p + 3] = uint8_t(off >> 24);
+      if (mlc >= 15) write_ext(p + 4, mlc);
+    }
+  }
+  for (uint k = lane; k < lit_len; k += 32) slots[dst + lit_pos + k] = inb[g_in + lit_start + k];
+  op += size;
+  return true;
+}
+
+bool tokens_from_seqs(uint n_seq, uint dst, uint cap, out uint out_len) {
+  uint op = 0, pos = 0;
+  out_len = 0;
+  for (uint i = 0; i < n_seq; ++i) {
+    uvec2 r = seqs[g_seq + i];
+    if (!emit_seq(dst, cap, op, pos, seq_ll(r), seq_off(r), seq_ml(r))) return false;
+    pos += seq_ll(r) + seq_ml(r);
+  }
+  out_len = op;
+  return true;
+}
+
+void main() {
+  uint c = gl_WorkGroupID.x;
+  if (c >= pc.chunk_count) return;
+  uint in_len = in_lens[c];
+  if (in_len <= 1) return; // already finalized by parse_hist
+  uint lane = lg_lane();
+  g_in = c * pc.chunk_size;
+  g_seq = c * pc.max_seq;
+  g_lit = c * pc.chunk_size;
+  uint slot = c * pc.slot_stride;
+  uint n_seq = n_seq_arr[c], n_lit = n_lit_arr[c];
+  uint lit_shift = lit_shift_buf[0];
+
+  uint tok_total;
+  bool eligible = rans_eligible(n_seq, tok_total);
+
+  bool ok = false;
+  uint start = 0, size = 0;
+  // An ineligible chunk contributed nothing to the batch tables, so it
+  // must not use them either.
+  if (eligible && in_len > kRansHeaderBytes + 1) {
+    ok = rans_encode(n_seq, n_lit, lit_shift, slot, in_len, start, size);
+    if (ok && 1 + tok_total < size) ok = false;
+  }
+  // Each attempt below overwrites bytes other lanes wrote in the one
+  // before, so the lanes sync first.
+  if (!ok) {
+    lg_sync();
+    uint len = 0;
+    ok = tokens_from_seqs(n_seq, slot + 1, in_len - 1, len);
+    if (ok) {
+      start = 0;
+      size = 1 + len;
+      if (lane == 0) slots[slot] = uint8_t(kFlagLz);
+    }
+  }
+  if (!ok) {
+    lg_sync();
+    for (uint k = lane; k < in_len; k += 32) slots[slot + 1 + k] = inb[g_in + k];
+    start = 0;
+    size = 1 + in_len;
+    if (lane == 0) slots[slot] = uint8_t(kFlagRaw);
+  }
+  if (lane == 0) {
+    out_start[c] = start;
+    out_sizes[c] = size;
+  }
+}

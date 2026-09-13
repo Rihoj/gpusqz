@@ -46,7 +46,8 @@ make_case() {
       local here
       here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
       while [ "$(stat -c%s "$f" 2>/dev/null || echo 0)" -lt "$size" ]; do
-        cat "$here"/src/* "$here"/tests/*.cpp "$here"/README.md >> "$f"
+        find "$here/src" -type f -exec cat {} + >> "$f"
+        cat "$here"/tests/*.cpp "$here"/README.md >> "$f"
       done
       truncate -s "$size" "$f" ;;
     empty) : > "$f" ;;
@@ -112,7 +113,7 @@ run_case_mismatched_batch() {
 }
 
 # Exercises --profile speed|balance|ratio (a convenience over chunk_size,
-# see main.cu) round-tripping correctly, plus its two error cases.
+# see main.cpp) round-tripping correctly, plus its two error cases.
 run_profile_cases() {
   local f comp dec
   f="$(make_case profile_src $((2 * 1024 * 1024)) text)"

@@ -1,0 +1,168 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Port of kernels.cu's build_table_kernel: one workgroup per batch picks
+// the literal-context rule from the full order-1 histogram, folds the
+// histogram to that rule, and builds the tables (fc for the encoder, q for
+// the file). Needs no lane-group operations.
+#include "common.glsl"
+#include "compress.glsl"
+
+const uint kThreads = 256;
+layout(local_size_x = 256) in;
+
+shared uint nib[16][kLitSyms]; // counts folded to 16 contexts (shift 4)
+shared uint col[kLitSyms];     // folded to 1 context (shift 8)
+shared float part[3][kThreads];
+shared uint chosen;
+
+// Per-invocation scratch for row_coded_bits.
+uint g_row[kLitSyms];
+uint g_q[kLitSyms];
+uint g_f[kLitSyms];
+
+// (cnt * 255 + mx / 2) / mx for cnt <= mx, in 32-bit math (no shaderInt64
+// needed): the quotient is at most 255, so find it bit by bit.
+uint scale_count(uint cnt, uint mx) {
+  uint nh, nl, carry;
+  umulExtended(cnt, 255u, nh, nl);
+  nl = uaddCarry(nl, mx / 2, carry);
+  nh += carry;
+  uint v = 0;
+  for (int bit = 7; bit >= 0; --bit) {
+    uint cand = v | (1u << bit), ph, pl;
+    umulExtended(cand, mx, ph, pl);
+    if (ph < nh || (ph == nh && pl <= nl)) v = cand;
+  }
+  return v;
+}
+
+// rans_codes.h's quantize_counts and normalize_table on g_row -> g_q -> g_f.
+void quantize_row(uint k) {
+  uint mx = 0;
+  for (uint s = 0; s < k; ++s) mx = max(mx, g_row[s]);
+  for (uint s = 0; s < k; ++s) g_q[s] = g_row[s] == 0 ? 0 : max(scale_count(g_row[s], mx), 1u);
+}
+
+bool normalize_row(uint k) {
+  uint total = 0;
+  for (uint s = 0; s < k; ++s) total += g_q[s];
+  if (total == 0) {
+    for (uint s = 0; s < k; ++s) g_f[s] = 0;
+    return false;
+  }
+  int sum = 0;
+  for (uint s = 0; s < k; ++s) {
+    uint f = 0;
+    if (g_q[s] != 0) f = max(((g_q[s] << kProbBits) + total / 2) / total, 1u);
+    g_f[s] = f;
+    sum += int(f);
+  }
+  int adj = int(kProbScale) - sum;
+  while (adj != 0) {
+    uint amax = 0;
+    for (uint s = 1; s < k; ++s) {
+      if (g_f[s] > g_f[amax]) amax = s;
+    }
+    if (adj > 0) {
+      g_f[amax] += uint(adj);
+      adj = 0;
+    } else {
+      if (g_f[amax] <= 1) return false;
+      g_f[amax]--;
+      adj++;
+    }
+  }
+  return true;
+}
+
+// Bits to code the row in g_row with the table the encoder would build.
+float row_coded_bits() {
+  quantize_row(kLitSyms);
+  if (!normalize_row(kLitSyms)) return 0.0;
+  float b = 0.0;
+  for (uint s = 0; s < kLitSyms; ++s) {
+    if (g_row[s] != 0) b += float(g_row[s]) * (float(kProbBits) - log2(float(g_f[s])));
+  }
+  return b;
+}
+
+// Quantises batch_cnt[base, base + k) into q_out and expands it into fc.
+void build_row(uint base, uint k) {
+  for (uint s = 0; s < k; ++s) g_row[s] = batch_cnt[base + s];
+  quantize_row(k);
+  normalize_row(k);
+  uint c = 0;
+  for (uint s = 0; s < k; ++s) {
+    q_out[base + s] = uint8_t(g_q[s]);
+    fc[base + s] = g_f[s] | (c << 16);
+    c += g_f[s];
+  }
+}
+
+void main() {
+  uint t = gl_LocalInvocationIndex; // one literal symbol per thread while folding
+  uint colsum = 0;
+  for (uint c = 0; c < 16; ++c) {
+    uint v = 0;
+    for (uint r = 0; r < 16; ++r) v += batch_cnt[lit_entry(c * 16 + r, t)];
+    nib[c][t] = v;
+    colsum += v;
+  }
+  col[t] = colsum;
+  barrier();
+
+  if (pc.forced_shift < 0) {
+    // part[k][t]: thread t's share of shift 8 / 4 / 0's cost, summed in a
+    // fixed order below.
+    if (t == 0) {
+      for (uint s = 0; s < kLitSyms; ++s) g_row[s] = col[s];
+      part[0][t] = row_coded_bits();
+    } else {
+      part[0][t] = 0.0;
+    }
+    if (t < 16) {
+      for (uint s = 0; s < kLitSyms; ++s) g_row[s] = nib[t][s];
+      part[1][t] = row_coded_bits();
+    } else {
+      part[1][t] = 0.0;
+    }
+    for (uint s = 0; s < kLitSyms; ++s) g_row[s] = batch_cnt[lit_entry(t, s)];
+    part[2][t] = row_coded_bits();
+    barrier();
+    if (t == 0) {
+      const uint shifts[3] = uint[3](kLitShiftOrder0, kLitShiftNibble, kLitShiftByte);
+      uint best = 0;
+      float best_cost = 0.0;
+      for (uint k = 0; k < 3; ++k) {
+        float c = 8.0 * float(kLitSyms * lit_ctx_count(shifts[k]));
+        for (uint i = 0; i < kThreads; ++i) c += part[k][i];
+        if (k == 0 || c < best_cost) {
+          best = k;
+          best_cost = c;
+        }
+      }
+      chosen = shifts[best];
+    }
+  } else if (t == 0) {
+    chosen = uint(pc.forced_shift);
+  }
+  barrier();
+
+  uint shift = chosen;
+  uint n_ctx = lit_ctx_count(shift);
+  if (t == 0) lit_shift_buf[0] = shift;
+  // Every read of the full histogram is done; fold into its first rows.
+  if (shift == kLitShiftNibble) {
+    for (uint c = 0; c < 16; ++c) batch_cnt[lit_entry(c, t)] = nib[c][t];
+  } else if (shift == kLitShiftOrder0) {
+    batch_cnt[lit_entry(0, t)] = col[t];
+  }
+  memoryBarrierBuffer();
+  barrier();
+  // One table per thread: the literal contexts, then the three small
+  // alphabets.
+  for (uint r = t; r < n_ctx + 3; r += kThreads) {
+    if (r < n_ctx) build_row(lit_entry(r, 0), kLitSyms);
+    else build_row((r - n_ctx) * kSmallSyms, kSmallSyms);
+  }
+}

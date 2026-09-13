@@ -1,0 +1,90 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Port of kernels.cu's expand_group_tables_kernel: one workgroup per group
+// expands its quantised counts (gq from q_off) into packed freq/cum, the
+// literal slot -> symbol rows, and the coarse LUTs (see decompress.glsl).
+// The tables must be zeroed first: unused contexts stay all-zero, and a
+// zero frequency is what flags a corrupt chunk decoding against one.
+#include "common.glsl"
+#include "decompress.glsl"
+
+const uint kThreads = 256;
+layout(local_size_x = 256) in;
+
+uint g_q[kLitSyms];
+uint g_f[kLitSyms];
+
+// rans_codes.h's normalize_table on g_q -> g_f.
+bool normalize_row(uint k) {
+  uint total = 0;
+  for (uint s = 0; s < k; ++s) total += g_q[s];
+  if (total == 0) {
+    for (uint s = 0; s < k; ++s) g_f[s] = 0;
+    return false;
+  }
+  int sum = 0;
+  for (uint s = 0; s < k; ++s) {
+    uint f = 0;
+    if (g_q[s] != 0) f = max(((g_q[s] << kProbBits) + total / 2) / total, 1u);
+    g_f[s] = f;
+    sum += int(f);
+  }
+  int adj = int(kProbScale) - sum;
+  while (adj != 0) {
+    uint amax = 0;
+    for (uint s = 1; s < k; ++s) {
+      if (g_f[s] > g_f[amax]) amax = s;
+    }
+    if (adj > 0) {
+      g_f[amax] += uint(adj);
+      adj = 0;
+    } else {
+      if (g_f[amax] <= 1) return false;
+      g_f[amax]--;
+      adj++;
+    }
+  }
+  return true;
+}
+
+void main() {
+  uint g = gl_WorkGroupID.x;
+  if (g >= pc.chunk_count) return; // chunk_count is the group count here
+  uint t = gl_LocalInvocationIndex;
+  uvec4 gi = ginfo[g];
+  uint q0 = gi.x, sym0 = gi.y, fc0 = gi.z;
+  uint n_ctx = lit_ctx_count(gi.w);
+
+  for (uint r = t; r < n_ctx + 3; r += kThreads) {
+    uint base = r < n_ctx ? lit_entry(r, 0) : (r - n_ctx) * kSmallSyms;
+    uint k = r < n_ctx ? kLitSyms : kSmallSyms;
+    for (uint s = 0; s < k; ++s) g_q[s] = uint(gq[q0 + base + s]);
+    if (!normalize_row(k)) continue; // all-zero row: stays zero
+    uint c = 0;
+    for (uint s = 0; s < k; ++s) {
+      gfc[fc0 + base + s] = g_f[s] | (c << 16);
+      c += g_f[s];
+    }
+  }
+  memoryBarrierBuffer();
+  barrier();
+
+  for (uint i = t; i < n_ctx * kLitSyms; i += kThreads) {
+    uint ctx = i / kLitSyms, s = i % kLitSyms;
+    uint v = gfc[fc0 + kLitBase + i];
+    uint row = sym0 + (ctx << kProbBits) + fc_cum(v);
+    for (uint k = 0; k < fc_freq(v); ++k) gsym[row + k] = uint8_t(s);
+  }
+  // Coarse LUTs: entry i is the largest symbol s with cum[s] <= i *
+  // (kProbScale >> kSmallLutBits).
+  uint luts = sym0 + (n_ctx << kProbBits);
+  for (uint i = t; i < 3 * kSmallLutSize; i += kThreads) {
+    uint a = i / kSmallLutSize, j = i % kSmallLutSize;
+    uint target = j << (kProbBits - kSmallLutBits);
+    uint s = 0;
+    for (uint k = 1; k < kSmallSyms; ++k) {
+      if (fc_cum(gfc[fc0 + a * kSmallSyms + k]) <= target) s = k;
+    }
+    gsym[luts + i] = uint8_t(s);
+  }
+}
