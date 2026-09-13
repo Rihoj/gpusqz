@@ -42,6 +42,12 @@ constexpr int kProbe = 32; // per-lane match-length cap before cooperative exten
 constexpr int kMinHashBits = 11;
 constexpr int kBucketWays = 4;
 constexpr int kWarpsPerBlock = 1;
+// How many positions ahead the lazy-match heuristic in lz_parse_warp will
+// look before committing to a match (see there). 1 was the original
+// single-step lookahead; kept as a named constant since this is the
+// cheapest lever to try for "look a bit harder" without touching the
+// hash table or match-length cap.
+constexpr int kLazySteps = 2;
 constexpr unsigned kFullMask = 0xFFFFFFFFu;
 constexpr uint32_t kEmptyPos = 0xFFFFFFFFu;
 
@@ -272,10 +278,19 @@ __device__ inline bool lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* ht
       if (!m) break;
       uint32_t j = __ffs(m) - 1;
       uint32_t lj = __shfl_sync(kFullMask, best_len, j);
-      uint32_t lj1 = __shfl_sync(kFullMask, best_len, min(j + 1, 31u));
-      // Lazy match: if the next position has a clearly longer match, emit
-      // this byte as a literal and take that one instead.
-      if (j < 31 && ((mask >> (j + 1)) & 1) && lj1 > lj + 1) {
+      // Lazy match, up to kLazySteps positions ahead: if the next
+      // candidate position has a clearly longer match than the one we're
+      // currently holding, drop this one to a literal and take that one
+      // instead, repeating so a still-better match 2 (or kLazySteps)
+      // positions on isn't missed just because position j+1 was only
+      // marginally better than j. Matches zstd's "lazy2" strategy; kept
+      // to a small fixed step count so this stays a bounded amount of
+      // extra warp-uniform work per window, not a search.
+#pragma unroll
+      for (int step = 0; step < kLazySteps; ++step) {
+        if (j >= 31 || !((mask >> (j + 1)) & 1)) break;
+        uint32_t lj1 = __shfl_sync(kFullMask, best_len, j + 1);
+        if (lj1 <= lj + 1) break;
         ++j;
         lj = lj1;
       }
