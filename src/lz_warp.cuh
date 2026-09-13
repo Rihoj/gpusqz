@@ -1,12 +1,12 @@
 // Warp-per-chunk LZ codec.
 //
 // Token format (ChunkFlag::Lz payload), LZ4-style:
-//   sequence := token literals* [offset:u16le match_ext*]
+//   sequence := token literals* [offset:u32le match_ext*]
 //   token    := (lit_len:4 << 4) | ml_code:4
 //   lit_len 15 and ml_code 15 are followed by extension bytes: 255s then a
 //   final byte < 255, all summed onto the base value.
 //   match length = ml_code + kMinMatch. Offset is the backward distance,
-//   1..65535, and must not reach before the chunk start.
+//   1..chunk_size, and must not reach before the chunk start.
 //   The last sequence may be literals only: the decoder stops as soon as
 //   the output is full, so no offset follows if literals complete it.
 //
@@ -23,28 +23,35 @@ namespace gzp {
 
 static_assert(kMinMatch == 3 || kMinMatch == 4, "hashing supports 3- or 4-byte minimum matches");
 constexpr int kProbe = 32; // per-lane match-length cap before cooperative extension
-// 4-way set-associative hash table: half as many buckets as the earlier
-// 2-way design, each holding twice the candidates, for the same total
-// shared memory (kHashWords u32 words = kHashSize buckets * 2 words/bucket,
-// 2 candidates/word). Measured to compress better than 2048 buckets x
-// 2-way at the same smem cost, without changing occupancy.
-constexpr int kHashBits = 10;
+// 4-way set-associative hash table, one u32 chunk-relative position per
+// word (chunk_size can exceed 65536, so positions no longer fit in 16 bits
+// and can't be packed 2-per-word the way an earlier, 64KB-chunk-only
+// design did). 2048 buckets — 4x an earlier 512-bucket table that fit 4
+// warps' worth of it per block — needs the whole 48KB static shared-memory
+// budget for just one warp's table, so blocks now hold one warp each.
+// Measured against 8-way/256-bucket (same total words, more candidates
+// per bucket instead of more buckets) at the SAME word count: that was
+// worse on both ratio and speed, so more distinct buckets matters more
+// than deeper chains per bucket for this workload. Growing the table
+// further would need dynamic (not static) shared memory to get past the
+// 48KB static limit — not done here, but the natural next lever.
+constexpr int kHashBits = 11;
 constexpr int kHashSize = 1 << kHashBits; // number of buckets
-constexpr int kHashWords = kHashSize * 2; // u32 words backing the table
-constexpr int kWarpsPerBlock = 4;
+constexpr int kBucketWays = 4;
+constexpr int kHashWords = kHashSize * kBucketWays; // u32 words backing the table, 1 position each
+constexpr int kWarpsPerBlock = 1;
 constexpr unsigned kFullMask = 0xFFFFFFFFu;
-constexpr uint32_t kEmptyPos = 0xFFFFu;
+constexpr uint32_t kEmptyPos = 0xFFFFFFFFu;
 
 // One parsed sequence: lit_len literals followed by a match of ml bytes
-// at backward distance off (ml == 0 only for a literals-only tail). A
-// match can never span a whole 64KB chunk (the first window is always
-// literals), so ml fits in 16 bits; lit_len can be the whole chunk.
+// at backward distance off (ml == 0 only for a literals-only tail). Both
+// can be as large as the chunk itself, so both are u32.
 struct SeqRec {
   uint32_t lit_len;
-  uint16_t ml;
-  uint16_t off;
+  uint32_t off;
+  uint32_t ml;
 };
-static_assert(sizeof(SeqRec) == 8, "scratch_bytes() assumes 8-byte sequence records");
+static_assert(sizeof(SeqRec) == 12, "scratch_bytes() assumes 12-byte sequence records");
 
 __device__ __forceinline__ uint32_t load4(const uint8_t* p) {
   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -61,14 +68,13 @@ __device__ __forceinline__ uint32_t match_len(const uint8_t* in, uint32_t a, uin
   return l;
 }
 
-// Checks all 4 candidates packed into one bucket's two words (2 candidates
-// per word, low half = more recently inserted) and keeps the longest match.
-__device__ __forceinline__ void probe_bucket(const uint8_t* in, uint32_t p, uint32_t w0, uint32_t w1,
+// Checks all kBucketWays candidates (one u32 chunk-relative position per
+// word, bucket[0] = most recently inserted) and keeps the longest match.
+__device__ __forceinline__ void probe_bucket(const uint8_t* in, uint32_t p, const uint32_t* bucket,
                                              uint32_t max_len, uint32_t& best_len, uint32_t& best_off) {
-  uint32_t cands[4] = {w0 & 0xFFFFu, w0 >> 16, w1 & 0xFFFFu, w1 >> 16};
 #pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    uint32_t cand = cands[i];
+  for (int i = 0; i < kBucketWays; ++i) {
+    uint32_t cand = bucket[i];
     if (cand != kEmptyPos && cand < p) {
       uint32_t l = match_len(in, cand, p, max_len);
       if (l > best_len) {
@@ -83,7 +89,7 @@ __device__ __forceinline__ uint32_t ext_bytes(uint32_t v) { return v >= 15 ? 1 +
 
 __device__ __forceinline__ uint32_t seq_size(uint32_t lit_len, uint32_t ml) {
   uint32_t s = 1 + ext_bytes(lit_len) + lit_len;
-  if (ml) s += 2 + ext_bytes(ml - kMinMatch);
+  if (ml) s += 4 + ext_bytes(ml - kMinMatch); // 4-byte offset field
   return s;
 }
 
@@ -113,6 +119,8 @@ __device__ __forceinline__ bool emit_seq(const uint8_t* in, uint8_t* out, uint32
       uint32_t p = lit_pos + lit_len;
       out[p++] = (uint8_t)(off & 0xFF);
       out[p++] = (uint8_t)(off >> 8);
+      out[p++] = (uint8_t)(off >> 16);
+      out[p++] = (uint8_t)(off >> 24);
       if (mlc >= 15) write_ext(out, p, mlc);
     }
   }
@@ -146,7 +154,7 @@ struct SeqEmitter {
   uint32_t n_lit = 0;
   __device__ __forceinline__ bool operator()(uint32_t lit_start, uint32_t lit_len, uint32_t off, uint32_t ml) {
     int lane = threadIdx.x & 31;
-    if (lane == 0) seqs[n_seq] = SeqRec{lit_len, (uint16_t)ml, (uint16_t)off};
+    if (lane == 0) seqs[n_seq] = SeqRec{lit_len, off, ml};
     for (uint32_t k = lane; k < lit_len; k += 32) lits[n_lit + k] = in[lit_start + k];
     ++n_seq;
     n_lit += lit_len;
@@ -191,14 +199,15 @@ __device__ inline bool lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* ht
   while (pos + kMinMatch <= n) {
     uint32_t p = pos + lane;
     bool valid = p + kMinMatch <= n;
-    uint32_t h = 0, w0 = 0xFFFFFFFFu, w1 = 0xFFFFFFFFu;
+    uint32_t h = 0;
+    uint32_t bucket[kBucketWays]; // only read after being populated below, when valid
     uint32_t best_len = 0, best_off = 0;
     if (valid) {
       h = hash_at(in + p);
-      w0 = htab[2 * h];
-      w1 = htab[2 * h + 1];
+#pragma unroll
+      for (int w = 0; w < kBucketWays; ++w) bucket[w] = htab[kBucketWays * h + w];
       uint32_t max_len = min((uint32_t)kProbe, n - p);
-      probe_bucket(in, p, w0, w1, max_len, best_len, best_off);
+      probe_bucket(in, p, bucket, max_len, best_len, best_off);
     }
     __syncwarp(); // all reads of htab precede any insert
 
@@ -206,19 +215,21 @@ __device__ inline bool lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* ht
     // deterministically. Inserting the earliest position lets the later
     // lanes of this same window find it in the second probe below, so
     // repeats shorter than a window apart are caught immediately. The new
-    // position becomes the most-recent candidate; the oldest of the 4 is
-    // dropped.
+    // position becomes the most-recent candidate; the oldest is dropped.
     unsigned valid_mask = __ballot_sync(kFullMask, valid);
     unsigned peers = __match_any_sync(kFullMask, h) & valid_mask;
     if (valid && lane == __ffs(peers) - 1) {
-      htab[2 * h] = (w0 << 16) | p;
-      htab[2 * h + 1] = (w1 << 16) | (w0 >> 16);
+#pragma unroll
+      for (int w = kBucketWays - 1; w > 0; --w) htab[kBucketWays * h + w] = bucket[w - 1];
+      htab[kBucketWays * h] = p;
     }
     __syncwarp();
 
     if (valid && best_len < (uint32_t)kMinMatch) {
+#pragma unroll
+      for (int w = 0; w < kBucketWays; ++w) bucket[w] = htab[kBucketWays * h + w];
       uint32_t max_len = min((uint32_t)kProbe, n - p);
-      probe_bucket(in, p, htab[2 * h], htab[2 * h + 1], max_len, best_len, best_off);
+      probe_bucket(in, p, bucket, max_len, best_len, best_off);
     }
 
     unsigned mask = __ballot_sync(kFullMask, best_len >= (uint32_t)kMinMatch);
@@ -274,9 +285,10 @@ __device__ inline bool lz_decode_warp(const uint8_t* in, uint32_t in_len, uint8_
     op += lit;
     if (op >= orig) break;
 
-    if (ip + 2 > in_len) return false;
-    uint32_t off = (uint32_t)in[ip] | ((uint32_t)in[ip + 1] << 8);
-    ip += 2;
+    if (ip + 4 > in_len) return false;
+    uint32_t off = (uint32_t)in[ip] | ((uint32_t)in[ip + 1] << 8) | ((uint32_t)in[ip + 2] << 16) |
+                   ((uint32_t)in[ip + 3] << 24);
+    ip += 4;
     uint32_t ml = (tok & 15) + kMinMatch;
     if ((tok & 15) == 15) {
       uint32_t e = 15;

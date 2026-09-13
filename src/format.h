@@ -7,14 +7,27 @@
 namespace gzp {
 
 constexpr uint32_t kMagic = 0x50475A47; // "GZGP" little-endian
-constexpr uint32_t kVersion = 3;
+constexpr uint32_t kVersion = 4;
 
 // One warp compresses one chunk, and ~400-500 warps are resident on this
 // GPU at once, so batches of a few hundred chunks fill it regardless of
 // chunk size; larger chunks then mostly buy compression ratio (longer
-// history for matches). 64KB is the most the u16 match offsets allow.
+// history for matches). Match offsets are u32 (see lz_warp.cuh), so the
+// cap here is a deliberate limit, not a format one: 1MB keeps per-chunk
+// scratch and the match-finding hash table's reach reasonable given a
+// fixed table size (see kHashBits) rather than growing them further.
 constexpr uint32_t kDefaultChunkSize = 65536;
-constexpr uint32_t kMaxChunkSize = 65536; // match offsets are u16
+constexpr uint32_t kMaxChunkSize = 1u << 20;
+
+// Named chunk-size presets for `gzp c --profile <name>` (see main.cu),
+// measured on a 283MB text corpus: speed keeps today's default (fastest
+// on both ends); ratio uses the largest chunk this format allows (beats
+// zstd -1's ratio there, at a real compress/decompress speed cost — see
+// README for the full sweep); balance is a middle ground that closes
+// most of that ratio gap while staying well above gzip -1's speed.
+constexpr uint32_t kProfileSpeedChunkSize = 65536;
+constexpr uint32_t kProfileBalanceChunkSize = 262144;
+constexpr uint32_t kProfileRatioChunkSize = kMaxChunkSize;
 
 // Shortest match the LZ stage emits. Baked into both payload formats:
 // token match codes and rANS match-length codes are relative to it.

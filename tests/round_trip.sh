@@ -99,6 +99,39 @@ run_case_mismatched_batch() {
   rm -f "$comp" "$dec"
 }
 
+# Exercises --profile speed|balance|ratio (a convenience over chunk_size,
+# see main.cu) round-tripping correctly, plus its two error cases.
+run_profile_cases() {
+  local f comp dec
+  f="$(make_case profile_src $((2 * 1024 * 1024)) text)"
+  for prof in speed balance ratio; do
+    comp="$TMP/profile_$prof.gzp"
+    dec="$TMP/profile_$prof.out"
+    "${PREFIX[@]}" "$GZP" c "$f" "$comp" --profile "$prof" 2>>"$TMP/log"
+    "${PREFIX[@]}" "$GZP" d "$comp" "$dec" 2>>"$TMP/log"
+    if cmp -s "$f" "$dec"; then
+      printf "PASS %-28s --profile %s\n" "profile" "$prof"
+    else
+      printf "FAIL %-28s --profile %s round-trip mismatch\n" "profile" "$prof"
+      fail=1
+    fi
+    rm -f "$comp" "$dec"
+  done
+  if "${PREFIX[@]}" "$GZP" c "$f" "$TMP/profile_both.gzp" 65536 --profile speed 2>>"$TMP/log"; then
+    printf "FAIL %-28s chunk_size + --profile should be rejected\n" "profile"
+    fail=1
+  else
+    printf "PASS %-28s chunk_size + --profile rejected\n" "profile"
+  fi
+  if "${PREFIX[@]}" "$GZP" c "$f" "$TMP/profile_bogus.gzp" --profile bogus 2>>"$TMP/log"; then
+    printf "FAIL %-28s unknown --profile should be rejected\n" "profile"
+    fail=1
+  else
+    printf "PASS %-28s unknown --profile rejected\n" "profile"
+  fi
+  rm -f "$TMP/profile_both.gzp" "$TMP/profile_bogus.gzp"
+}
+
 run_suite() {
   local chunk="$1"
   local sub=$((chunk > 100 ? chunk - 100 : (chunk > 1 ? chunk / 2 : 1)))
@@ -119,12 +152,14 @@ run_suite() {
 
 if [ "$EXTREMES" -eq 1 ]; then
   # CHUNK=1 makes every byte its own chunk: slow, but it must still work.
-  # 65535/65536 straddle the u16 offset limit.
-  for chunk in 1 16 4096 8192 32768 65535 65536; do
+  # 65535/65536/1048575/1048576 straddle offsets that were once (before
+  # widening to u32) representable-limit boundaries; 1048576 is kMaxChunkSize.
+  for chunk in 1 16 4096 8192 32768 65535 65536 1048575 1048576; do
     run_suite "$chunk"
   done
 else
   run_suite "${CHUNK:-8192}"
+  run_profile_cases
 fi
 
 if [ "$EXTREMES" -eq 1 ]; then

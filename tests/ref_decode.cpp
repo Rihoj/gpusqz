@@ -83,8 +83,18 @@ struct RansDecoder {
     renorm(l);
     return s;
   }
+  // Mirrors the GPU's rans_dec_bits split: a single renorm only ever
+  // supplies one 16-bit word, so nb > 16 (possible with wide chunks) is
+  // decoded as the high (nb-16) bits first, then the low 16 bits --
+  // reassembled as (hi<<16)|lo -- matching encode's low-then-high call
+  // order (decode reads it in reverse).
   uint32_t bits(int l, uint32_t nb) {
     if (nb == 0) return 0;
+    if (nb > 16) {
+      uint32_t hi = bits(l, nb - 16);
+      uint32_t lo = bits(l, 16);
+      return (hi << 16) | lo;
+    }
     uint32_t b = x[l] & ((1u << nb) - 1);
     x[l] >>= nb;
     renorm(l);
@@ -119,7 +129,8 @@ bool decode_lzrans(const uint8_t* in, size_t in_len, uint8_t* out, size_t orig, 
       if (!active(l)) continue;
       uint32_t idx = g * 32 + l;
       if (ml[l] == 0 && idx != n_seq - 1) return false;
-      if (ml[l] && oc[l] > 15) return false;
+      if (ml[l] > chunk_size) return false; // a match can never be longer than the chunk itself
+      if (ml[l] && oc[l] >= (uint32_t)kSmallSyms) return false; // oc is a shift count (nb = oc)
       seqs[idx] = Seq{len_value(llc[l], llb[l]), ml[l], ml[l] ? off_value(oc[l], ob[l]) : 0};
     }
     if (d.bad) return false;
@@ -169,9 +180,10 @@ bool decode_lz(const uint8_t* in, size_t in_len, uint8_t* out, size_t orig) {
     ip += lit;
     op += lit;
     if (op >= orig) break;
-    if (ip + 2 > in_len) return false;
-    uint32_t off = (uint32_t)in[ip] | ((uint32_t)in[ip + 1] << 8);
-    ip += 2;
+    if (ip + 4 > in_len) return false;
+    uint32_t off = (uint32_t)in[ip] | ((uint32_t)in[ip + 1] << 8) | ((uint32_t)in[ip + 2] << 16) |
+                   ((uint32_t)in[ip + 3] << 24);
+    ip += 4;
     uint32_t ml = (tok & 15) + kMinMatch;
     if ((tok & 15) == 15) {
       uint32_t e = 15;

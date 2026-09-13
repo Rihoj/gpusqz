@@ -697,8 +697,10 @@ void decompress(const std::string& in_path, const std::string& out_path) {
 void usage() {
   std::fprintf(stderr,
                "usage:\n"
-               "  gzp c <input> <output> [chunk_size]   compress\n"
-               "  gzp d <input> <output>                decompress\n");
+               "  gzp c <input> <output> [chunk_size] [--profile speed|balance|ratio]   compress\n"
+               "  gzp d <input> <output>                                                decompress\n"
+               "chunk_size and --profile are mutually exclusive; the bare default (neither\n"
+               "given) is unchanged from before --profile existed.\n");
   std::exit(1);
 }
 
@@ -712,9 +714,26 @@ int main(int argc, char** argv) {
 
   auto t0 = std::chrono::steady_clock::now();
   if (mode == "c") {
+    bool have_chunk_size = false, have_profile = false;
     uint32_t chunk_size = kDefaultChunkSize;
-    if (argc >= 5) chunk_size = (uint32_t)std::strtoul(argv[4], nullptr, 10);
-    if (chunk_size == 0 || chunk_size > kMaxChunkSize) die("chunk_size must be in (0, 65536]");
+    for (int i = 4; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--profile" && i + 1 < argc) {
+        std::string p = argv[++i];
+        if (p == "speed") chunk_size = kProfileSpeedChunkSize;
+        else if (p == "balance") chunk_size = kProfileBalanceChunkSize;
+        else if (p == "ratio") chunk_size = kProfileRatioChunkSize;
+        else die("unknown --profile: " + p + " (expected speed, balance, or ratio)");
+        have_profile = true;
+      } else {
+        chunk_size = (uint32_t)std::strtoul(a.c_str(), nullptr, 10);
+        have_chunk_size = true;
+      }
+    }
+    if (have_chunk_size && have_profile) die("specify chunk_size or --profile, not both");
+    if (chunk_size == 0 || chunk_size > kMaxChunkSize) {
+      die("chunk_size must be in (0, " + std::to_string(kMaxChunkSize) + "]");
+    }
     compress(in_path, out_path, chunk_size);
   } else if (mode == "d") {
     decompress(in_path, out_path);

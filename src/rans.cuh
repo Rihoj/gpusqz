@@ -174,13 +174,38 @@ __device__ __forceinline__ bool rans_enc_put(uint32_t& x, bool active, uint32_t 
   return true;
 }
 
-__device__ __forceinline__ bool rans_enc_bits(uint32_t& x, bool active, uint32_t nb, uint32_t bits, uint16_t*& wp,
-                                              const uint16_t* wlimit) {
+// Encodes at most 16 raw ("bypass") bits in one step. A single flush only
+// ever drops one 16-bit word (rans_enc_flush), so nb must not exceed 16
+// here — see rans_enc_bits for the wider-nb wrapper around this.
+__device__ __forceinline__ bool rans_enc_bits16(uint32_t& x, bool active, uint32_t nb, uint32_t bits, uint16_t*& wp,
+                                                const uint16_t* wlimit) {
   bool on = active && nb != 0;
   bool need = on && x >= (1u << (32 - nb));
   if (!rans_enc_flush(x, need, wp, wlimit)) return false;
   if (on) x = (x << nb) | bits;
   return true;
+}
+
+// Encodes nb raw ("bypass") bits, nb possibly > 16 now that wide chunks
+// give length/offset codes up to kSmallSyms-1, needing up to ~19 extra
+// bits (kSmallLutBits assumes < 32; this comfortably fits under that).
+// Split into an explicit low-16-bit step (encoded first) and a high-
+// remainder step (encoded second, at most 16 bits since nb is capped well
+// under 32); decode reads in the opposite call order, so it sees the high
+// chunk first and the low chunk second, matching how it reassembles them.
+//
+// Both rans_enc_bits16 calls below are made by every lane every time
+// (their own nb may be 0, a harmless no-op), never skipped based on this
+// lane's own nb: rans_enc_bits16 -> rans_enc_flush -> __ballot_sync
+// requires every lane in the mask to reach the same call, so nb (which
+// can differ per lane, since it comes from each lane's own decoded
+// symbol) must never gate which calls execute, only what they encode.
+__device__ __forceinline__ bool rans_enc_bits(uint32_t& x, bool active, uint32_t nb, uint32_t bits, uint16_t*& wp,
+                                              const uint16_t* wlimit) {
+  uint32_t lo_nb = nb > 16 ? 16 : nb;
+  uint32_t hi_nb = nb > 16 ? nb - 16 : 0;
+  if (!rans_enc_bits16(x, active, lo_nb, bits & 0xFFFFu, wp, wlimit)) return false;
+  return rans_enc_bits16(x, active, hi_nb, bits >> 16, wp, wlimit);
 }
 
 // Encodes a chunk already parsed into `seqs`/`lits` against a table shared
@@ -276,10 +301,38 @@ __device__ __forceinline__ uint32_t rans_dec_small(uint32_t& x, const uint16_t* 
   return s;
 }
 
-__device__ __forceinline__ uint32_t rans_dec_bits(uint32_t& x, uint32_t nb) {
-  uint32_t b = x & ((1u << nb) - 1);
-  x >>= nb;
-  return b;
+// Decodes at most 16 raw ("bypass") bits in one step, renormalising once
+// afterward. See rans_dec_bits for the wider-nb wrapper around this.
+__device__ __forceinline__ bool rans_dec_bits16(uint32_t& x, bool active, uint32_t nb, uint32_t& out,
+                                                const uint8_t*& rp, const uint8_t* rend) {
+  bool on = active && nb != 0;
+  out = on ? (x & ((1u << nb) - 1)) : 0;
+  if (on) x >>= nb;
+  return rans_dec_renorm(x, on, rp, rend);
+}
+
+// Decodes nb raw ("bypass") bits, renormalising as needed. Mirrors
+// rans_enc_bits's split: for nb > 16 (possible now that wide chunks give
+// length/offset codes needing up to ~19 extra bits), a single renorm can
+// only ever supply one 16-bit word, so the high (nb-16) bits are decoded
+// first and the low 16 bits second — the reverse of encode's call order,
+// which is what lets the two sides' bit chunks line up.
+//
+// Both rans_dec_bits16 calls below are made by every lane every time
+// (their own width may be 0, a harmless no-op), never skipped based on
+// this lane's own nb: rans_dec_bits16 -> rans_dec_renorm -> __ballot_sync
+// requires every lane in the mask to reach the same call, so nb (which
+// can differ per lane, since it comes from each lane's own decoded
+// symbol) must never gate which calls execute, only what they decode.
+__device__ __forceinline__ bool rans_dec_bits(uint32_t& x, bool active, uint32_t nb, uint32_t& out,
+                                              const uint8_t*& rp, const uint8_t* rend) {
+  uint32_t hi_nb = nb > 16 ? nb - 16 : 0;
+  uint32_t lo_nb = nb > 16 ? 16 : nb;
+  uint32_t hi = 0, lo = 0;
+  if (!rans_dec_bits16(x, active, hi_nb, hi, rp, rend)) return false;
+  if (!rans_dec_bits16(x, active, lo_nb, lo, rp, rend)) return false;
+  out = (hi << 16) | lo;
+  return true;
 }
 
 // Decodes the sequence and literal streams into scratch, using an
@@ -302,42 +355,38 @@ __device__ inline bool rans_decode_warp(const uint8_t* payload, uint32_t len, co
   for (uint32_t g = 0; g < (n_seq + 31) / 32; ++g) {
     uint32_t idx = g * 32 + lane;
     bool act = idx < n_seq;
-    uint32_t llc = 0, mlc = 0, oc = 0, llb = 0, mlb = 0, ob = 0, nb;
+    uint32_t llc = 0, mlc = 0, oc = 0, llb = 0, mlb = 0, ob = 0;
 
     if (act) {
       llc = rans_dec_small(x, t.freq + kLlBase, t.cum + kLlBase, t.ll_lut);
       bad |= t.freq[kLlBase + llc] == 0;
     }
     if (!rans_dec_renorm(x, act, rp, rend)) return false;
-    nb = len_nb(llc);
-    if (act) llb = rans_dec_bits(x, nb);
-    if (!rans_dec_renorm(x, act && nb, rp, rend)) return false;
+    if (!rans_dec_bits(x, act, len_nb(llc), llb, rp, rend)) return false;
 
     if (act) {
       mlc = rans_dec_small(x, t.freq + kMlBase, t.cum + kMlBase, t.ml_lut);
       bad |= t.freq[kMlBase + mlc] == 0;
     }
     if (!rans_dec_renorm(x, act, rp, rend)) return false;
-    nb = len_nb(mlc);
-    if (act) mlb = rans_dec_bits(x, nb);
-    if (!rans_dec_renorm(x, act && nb, rp, rend)) return false;
+    if (!rans_dec_bits(x, act, len_nb(mlc), mlb, rp, rend)) return false;
 
     uint32_t mlv = len_value(mlc, mlb);
     uint32_t ml = mlv ? mlv + (kMinMatch - 1) : 0;
     bool has_off = act && ml != 0;
     if (has_off) {
       oc = rans_dec_small(x, t.freq + kOffBase, t.cum + kOffBase, t.off_lut);
-      bad |= t.freq[kOffBase + oc] == 0 || oc > 15;
+      // oc must stay < 32 regardless of chunk size: it's a shift count
+      // below (nb = oc), and rans_dec_bits(x, 32) would be undefined.
+      bad |= t.freq[kOffBase + oc] == 0 || oc >= (uint32_t)kSmallSyms;
     }
     if (!rans_dec_renorm(x, has_off, rp, rend)) return false;
-    nb = oc;
-    if (has_off) ob = rans_dec_bits(x, nb);
-    if (!rans_dec_renorm(x, has_off && nb, rp, rend)) return false;
+    if (!rans_dec_bits(x, has_off, oc, ob, rp, rend)) return false;
 
     if (act) {
       if (ml == 0 && idx != n_seq - 1) bad = true;
-      if (ml > 0xFFFF) bad = true;
-      seqs[idx] = SeqRec{len_value(llc, llb), (uint16_t)ml, (uint16_t)(has_off ? off_value(oc, ob) : 0)};
+      if (ml > max_lit) bad = true; // a match can never be longer than the chunk itself
+      seqs[idx] = SeqRec{len_value(llc, llb), has_off ? off_value(oc, ob) : 0, ml};
     }
     if (__any_sync(kFullMask, bad)) return false;
   }
