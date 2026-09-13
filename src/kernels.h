@@ -24,26 +24,23 @@ __host__ __device__ inline uint32_t max_sequences(uint32_t chunk_size) { return 
 constexpr int kHashBucketWays = 4;
 // Only 3 chunk sizes actually get exercised in practice (the `speed`/
 // `balance`/`ratio` profile presets, format.h), so this is a measured
-// two-tier choice rather than a generic formula extrapolated to sizes
-// nothing has validated:
-// - <= 4x the default (up to and including `balance`'s 256KB): stays at
-//   2048 buckets, the original shared-memory-era table size. Growing
-//   `balance`'s table by even one step measured a real ~25-30%
-//   compress-kernel regression on varied real data (this table's now in
-//   global memory rather than shared, so that's a genuine bandwidth/
-//   latency cost, not the shared-memory occupancy or cache-partition
-//   costs a bigger *shared* table paid -- see lz_warp.cuh) for a ratio
-//   gain that didn't justify it there.
-// - above that (in practice, just `ratio`'s 1MB): 8192 buckets (4x).
-//   Measured a real, consistent ~2x compress-kernel cost on both a
-//   repetitive and a genuinely varied large corpus (not a corpus-
-//   dependent cliff like the shared-memory attempts), in exchange for
-//   gzp's biggest ratio win this session -- a trade `ratio`'s whole
-//   purpose is to prefer. Growing further wasn't tried; the two
-//   corpora above are what it should be validated against before
-//   moving this constant.
+// three-tier choice rather than a generic formula extrapolated to sizes
+// nothing has validated. Re-measured once batches were sized for
+// occupancy (main.cu's plan_batches): the earlier "a bigger table costs
+// ~2x" results were taken with ~32 warps in flight, where every extra
+// global-memory miss was fully exposed. Size change and compress-kernel
+// change per step, on the repetitive 283MB and the varied 1GB corpora:
+// - <= the default 64KB (`speed`): 2048 buckets. 4096 saves 1.6% of
+//   output but costs ~18-20% of kernel and ~12% of wall throughput, the
+//   wrong trade for the default, fastest profile.
+// - <= 4x the default (`balance`'s 256KB): 4096 buckets. Saves ~2.9% of
+//   output for ~21-25% of kernel and ~11% of wall throughput.
+// - above that (`ratio`'s 1MB): 32768 buckets. 8192 -> 16384 saved 1.4%,
+//   -> 32768 another 0.8%, for ~3-4% of kernel throughput in total and no
+//   measurable wall-clock cost. 65536 saved only 0.4% more and cost ~18%
+//   of kernel throughput on the varied corpus.
 __host__ __device__ inline int hash_table_bits(uint32_t chunk_size) {
-  return chunk_size <= 4 * kDefaultChunkSize ? 11 : 13;
+  return chunk_size <= kDefaultChunkSize ? 11 : chunk_size <= 4 * kDefaultChunkSize ? 12 : 15;
 }
 __host__ __device__ inline size_t hash_table_bytes(uint32_t chunk_size) {
   return ((size_t)1 << hash_table_bits(chunk_size)) * kHashBucketWays * sizeof(uint32_t);

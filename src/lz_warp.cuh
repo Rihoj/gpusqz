@@ -22,7 +22,16 @@
 namespace gzp {
 
 static_assert(kMinMatch == 3 || kMinMatch == 4, "hashing supports 3- or 4-byte minimum matches");
-constexpr int kProbe = 32; // per-lane match-length cap before cooperative extension
+// Per-lane match-length cap before cooperative extension. 64 was measured
+// (all three profiles, both benchmark corpora, with occupancy-sized
+// batches): ~0.1% smaller output for 1-3% of compress-kernel throughput.
+//
+// Also measured and rejected in the same round: `const __restrict__` on
+// every kernel pointer (no change in any kernel) and loading the next
+// window's input bytes before the select loop in lz_parse_warp (no
+// change). The parse's cost is the dependent, random hash-bucket and
+// candidate loads, not the sequential input reads, which hit L1.
+constexpr int kProbe = 32;
 // 4-way set-associative hash table, one u32 chunk-relative position per
 // word (chunk_size can exceed 65536, so positions no longer fit in 16 bits
 // and can't be packed 2-per-word the way an earlier, 64KB-chunk-only
@@ -64,9 +73,9 @@ constexpr int kBucketWays = kHashBucketWays; // kernels.h; must match here since
 constexpr int kWarpsPerBlock = 1;
 // How many positions ahead the lazy-match heuristic in lz_parse_warp will
 // look before committing to a match (see there). 1 was the original
-// single-step lookahead; kept as a named constant since this is the
-// cheapest lever to try for "look a bit harder" without touching the
-// hash table or match-length cap.
+// single-step lookahead. 3 was measured on every profile and both
+// benchmark corpora: output within 0.01% of 2 and no speed change, so a
+// third step essentially never fires under the "clearly longer" rule.
 constexpr int kLazySteps = 2;
 constexpr unsigned kFullMask = 0xFFFFFFFFu;
 constexpr uint32_t kEmptyPos = 0xFFFFFFFFu;
