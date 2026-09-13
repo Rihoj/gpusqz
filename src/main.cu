@@ -1,4 +1,4 @@
-// gzp: a small GPU-accelerated file compressor.
+// gpusqz: a small GPU-accelerated file compressor.
 //
 // Design: the input is split into fixed-size, independent chunks. Each
 // chunk is LZ-compressed (or stored raw if that doesn't help) by one CUDA
@@ -32,7 +32,7 @@
 #include "format.h"
 #include "kernels.h"
 
-using namespace gzp;
+using namespace gpusqz;
 
 namespace {
 
@@ -40,7 +40,7 @@ namespace {
 // third only buys concurrent D2H/H2D copies, which PCIe at ~13GB/s doesn't
 // need, and costs a third of each batch's size.
 constexpr int kDefaultSets = 2;
-constexpr int kMaxSets = 3; // upper bound for GZP_FORCE_SETS
+constexpr int kMaxSets = 3; // upper bound for GPUSQZ_FORCE_SETS
 
 // Batch sizing (see plan_batches). Every chunk is one warp, and each warp's
 // LZ parse is latency-bound: it sustains only a few MB/s on its own, so
@@ -56,10 +56,10 @@ constexpr int kMaxSets = 3; // upper bound for GZP_FORCE_SETS
 constexpr uint32_t kTargetBatches = 8;
 constexpr uint32_t kMinBatchChunks = 1024;
 constexpr size_t kMinBatchBytes = 32u << 20;
-// GPU memory for batch buffers. By default gzp may use kDefaultBudgetPercent
-// of the VRAM free when it starts; --gpu-mem / GZP_GPU_MEM replace that
+// GPU memory for batch buffers. By default gpusqz may use kDefaultBudgetPercent
+// of the VRAM free when it starts; --gpu-mem / GPUSQZ_GPU_MEM replace that
 // with an explicit budget, limited only to all but kGpuMemReserve of the
-// free VRAM. Whatever gzp takes it allocates once, up front, and holds
+// free VRAM. Whatever gpusqz takes it allocates once, up front, and holds
 // until it exits, so no other process can claim it mid-run. The budget
 // matters most for the 1MB `ratio` profile, whose chunks need ~6MB of
 // device memory each; the smaller profiles' batches are bounded by
@@ -79,7 +79,7 @@ constexpr int kOutStages = 8;
 constexpr size_t kStdioBuf = 4u << 20;
 
 [[noreturn]] void die(const std::string& msg) {
-  std::fprintf(stderr, "gzp: %s\n", msg.c_str());
+  std::fprintf(stderr, "gpusqz: %s\n", msg.c_str());
   std::exit(1);
 }
 
@@ -93,7 +93,7 @@ double now_s() {
   return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-// GZP_VERBOSE=1 prints per-stage timing so we can tell whether a run is
+// GPUSQZ_VERBOSE=1 prints per-stage timing so we can tell whether a run is
 // bound by file I/O, PCIe copies, or the kernel. GPU stages are measured
 // with per-batch cudaEvents on their own streams, so they stay meaningful
 // when stages overlap; their sums can legitimately exceed wall time.
@@ -101,7 +101,7 @@ enum Mark { kH2d0, kH2d1, kK0, kK1, kD2h0, kD2h1, kMarks };
 
 struct Stats {
   bool enabled = [] {
-    const char* v = std::getenv("GZP_VERBOSE");
+    const char* v = std::getenv("GPUSQZ_VERBOSE");
     return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
   }();
   double setup_s = 0, fread_s = 0, fwrite_s = 0, in_wait_s = 0, out_wait_s = 0;
@@ -163,7 +163,7 @@ struct Stats {
 
     auto mbps = [](uint64_t bytes, double s) { return s > 0 ? bytes / 1e6 / s : 0.0; };
     std::fprintf(stderr,
-                 "gzp[%s] in=%llu out=%llu wall=%.3fs (%.1f MB/s)  batches=%d x %u chunks, %d buffer sets\n"
+                 "gpusqz[%s] in=%llu out=%llu wall=%.3fs (%.1f MB/s)  batches=%d x %u chunks, %d buffer sets\n"
                  "  setup  %.3fs  (CUDA context + buffer allocation, fixed cost)\n"
                  "  steady %.3fs  (%.1f MB/s of input: wall minus setup)\n"
                  "  fread  %.3fs  (%.1f MB/s of input; main thread)\n"
@@ -442,7 +442,7 @@ Plan plan_batches(uint32_t chunk_count, uint32_t chunk_size, size_t dev_bytes_pe
     size_t avail = free_bytes > kGpuMemReserve ? free_bytes - kGpuMemReserve : 0;
     budget = std::min(g_gpu_mem, avail);
     if (budget < g_gpu_mem) {
-      std::fprintf(stderr, "gzp: --gpu-mem %zu MiB is more than the %zu MiB free; using %zu MiB\n",
+      std::fprintf(stderr, "gpusqz: --gpu-mem %zu MiB is more than the %zu MiB free; using %zu MiB\n",
                    g_gpu_mem >> 20, free_bytes >> 20, budget >> 20);
     }
   }
@@ -455,13 +455,13 @@ Plan plan_batches(uint32_t chunk_count, uint32_t chunk_size, size_t dev_bytes_pe
   // encode side vs. decode-batch boundaries), which is the one scenario
   // that exercises the per-chunk group_id lookup instead of always
   // hitting the trivial case where a decode batch sits inside one group.
-  if (const char* f = std::getenv("GZP_FORCE_BATCH")) {
+  if (const char* f = std::getenv("GPUSQZ_FORCE_BATCH")) {
     uint32_t forced = (uint32_t)std::strtoul(f, nullptr, 10);
     if (forced >= 1) want = forced;
   }
   // Tuning-only override of the ring depth (1..kMaxSets).
   int max_sets = kDefaultSets;
-  if (const char* f = std::getenv("GZP_FORCE_SETS")) {
+  if (const char* f = std::getenv("GPUSQZ_FORCE_SETS")) {
     max_sets = std::clamp((int)std::strtol(f, nullptr, 10), 1, kMaxSets);
   }
 
@@ -556,14 +556,14 @@ struct Compressor {
   std::vector<ChunkEntry> entries;
   std::vector<TableGroup> groups; // one per batch
   std::vector<uint8_t> tables;     // each group's quantised counts, in group order
-  int forced_lit_shift = -1;       // GZP_FORCE_LIT_SHIFT, tests and tuning only
+  int forced_lit_shift = -1;       // GPUSQZ_FORCE_LIT_SHIFT, tests and tuning only
   std::unique_ptr<CompressSet[]> sets;
   Plan plan;
   InRing in_ring;
   Writer writer;
   uint64_t payload_offset = 0;
   uint32_t next_chunk = 0;
-  FILE* lit_dump = nullptr; // GZP_DUMP_LITS=<path>, see dump_literals
+  FILE* lit_dump = nullptr; // GPUSQZ_DUMP_LITS=<path>, see dump_literals
 
   void allocate() {
     size_t dev_per_chunk = (size_t)chunk_size + (size_t)slot_stride +
@@ -591,7 +591,7 @@ struct Compressor {
   }
 
   // Debug aid for evaluating literal models offline: with
-  // GZP_DUMP_LITS=<path>, appends each chunk's parsed literal stream to that
+  // GPUSQZ_DUMP_LITS=<path>, appends each chunk's parsed literal stream to that
   // file as a u32 length followed by the bytes. Called between the encode
   // kernel and the compaction that overwrites scratch; it synchronises the
   // stream, so it serialises the pipeline and must not be used while
@@ -716,13 +716,13 @@ struct Compressor {
   }
 };
 
-// GZP_FORCE_LIT_SHIFT=0|4|8 forces every batch's literal-context rule
+// GPUSQZ_FORCE_LIT_SHIFT=0|4|8 forces every batch's literal-context rule
 // (rans_codes.h) instead of letting each batch pick; tests and tuning only.
 int forced_lit_shift() {
-  const char* f = std::getenv("GZP_FORCE_LIT_SHIFT");
+  const char* f = std::getenv("GPUSQZ_FORCE_LIT_SHIFT");
   if (!f) return -1;
   uint32_t v = (uint32_t)std::strtoul(f, nullptr, 10);
-  if (!lit_shift_valid(v)) die("GZP_FORCE_LIT_SHIFT must be 0, 4 or 8");
+  if (!lit_shift_valid(v)) die("GPUSQZ_FORCE_LIT_SHIFT must be 0, 4 or 8");
   return (int)v;
 }
 
@@ -761,9 +761,9 @@ void compress(const std::string& in_path, const std::string& out_path, uint32_t 
     cz.total_size = total_size;
     cz.entries.swap(entries);
     cz.forced_lit_shift = forced_lit_shift();
-    if (const char* p = std::getenv("GZP_DUMP_LITS")) {
+    if (const char* p = std::getenv("GPUSQZ_DUMP_LITS")) {
       cz.lit_dump = std::fopen(p, "wb");
-      if (!cz.lit_dump) die(std::string("cannot open GZP_DUMP_LITS file: ") + p);
+      if (!cz.lit_dump) die(std::string("cannot open GPUSQZ_DUMP_LITS file: ") + p);
     }
 
     double t = now_s();
@@ -1025,7 +1025,7 @@ void decompress(const std::string& in_path, const std::string& out_path) {
 
   FileHeader header;
   if (std::fread(&header, sizeof(header), 1, in) != 1) die("truncated header");
-  if (header.magic != kMagic) die("bad magic (not a gzp file)");
+  if (!magic_ok(header.magic)) die("bad magic (not a gpusqz file)");
   if (header.version != kVersion) die("unsupported version");
   if (header.chunk_size == 0 || header.chunk_size > kMaxChunkSize) die("corrupt header: bad chunk_size");
 
@@ -1106,16 +1106,16 @@ void decompress(const std::string& in_path, const std::string& out_path) {
 void usage() {
   std::fprintf(stderr,
                "usage:\n"
-               "  gzp c <input> <output> [chunk_size | --profile speed|balance|ratio] [--gpu-mem SIZE]\n"
-               "  gzp d <input> <output> [--gpu-mem SIZE]\n"
+               "  gpusqz c <input> <output> [chunk_size | --profile speed|balance|ratio] [--gpu-mem SIZE]\n"
+               "  gpusqz d <input> <output> [--gpu-mem SIZE]\n"
                "chunk_size and --profile are mutually exclusive; with neither, chunk_size is %u.\n"
                "--gpu-mem caps the GPU memory used for batch buffers (e.g. 8G, 512M; a bare\n"
-               "number is MiB). Default: 80%% of the free GPU memory. Also GZP_GPU_MEM.\n",
+               "number is MiB). Default: 80%% of the free GPU memory. Also GPUSQZ_GPU_MEM.\n",
                kDefaultChunkSize);
   std::exit(1);
 }
 
-// Parses a --gpu-mem / GZP_GPU_MEM value: a positive number with an
+// Parses a --gpu-mem / GPUSQZ_GPU_MEM value: a positive number with an
 // optional K, M, G or T suffix (binary units; a trailing "B" or "iB" is
 // allowed). A bare number is MiB.
 size_t parse_mem_size(const std::string& s) {
@@ -1146,8 +1146,8 @@ int main(int argc, char** argv) {
   std::string out_path = argv[3];
 
   auto t0 = std::chrono::steady_clock::now();
-  if (const char* m = std::getenv("GZP_GPU_MEM")) g_gpu_mem = parse_mem_size(m);
-  // --gpu-mem applies to both modes (and wins over GZP_GPU_MEM); the rest
+  if (const char* m = std::getenv("GPUSQZ_GPU_MEM")) g_gpu_mem = parse_mem_size(m);
+  // --gpu-mem applies to both modes (and wins over GPUSQZ_GPU_MEM); the rest
   // of the arguments are mode-specific.
   std::vector<std::string> rest;
   for (int i = 4; i < argc; ++i) {
@@ -1195,7 +1195,7 @@ int main(int argc, char** argv) {
   }
   auto t1 = std::chrono::steady_clock::now();
   double secs = std::chrono::duration<double>(t1 - t0).count();
-  std::fprintf(stderr, "gzp: %s done in %.3fs\n", mode == "c" ? "compress" : "decompress", secs);
+  std::fprintf(stderr, "gpusqz: %s done in %.3fs\n", mode == "c" ? "compress" : "decompress", secs);
   g_stats.report(mode == "c" ? "compress" : "decompress", secs);
   return 0;
 }

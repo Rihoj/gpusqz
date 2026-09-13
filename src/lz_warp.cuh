@@ -19,7 +19,7 @@
 #include "format.h"
 #include "kernels.h"
 
-namespace gzp {
+namespace gpusqz {
 
 static_assert(kMinMatch == 3 || kMinMatch == 4, "hashing supports 3- or 4-byte minimum matches");
 // Per-lane match-length cap before cooperative extension. 64 was measured
@@ -371,4 +371,4 @@ __device__ inline bool lz_decode_warp(const uint8_t* in, uint32_t in_len, uint8_
   return ip == in_len;
 }
 
-} // namespace gzp
+} // namespace gpusqz

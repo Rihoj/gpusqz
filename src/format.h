@@ -1,13 +1,17 @@
-// gzp container format: self-describing, chunk-based, raw-fallback per chunk.
+// gpusqz container format: self-describing, chunk-based, raw-fallback per chunk.
 #pragma once
 #include <cstddef>
 #include <cstdint>
 
 #include "rans_codes.h"
 
-namespace gzp {
+namespace gpusqz {
 
-constexpr uint32_t kMagic = 0x50475A47; // "GZGP" little-endian
+constexpr uint32_t kMagic = 0x5A515347; // "GSQZ" in file byte order
+// The same version-5 format was written with this magic before the tool
+// was renamed from gzp to gpusqz; decoders still accept it.
+constexpr uint32_t kLegacyMagic = 0x50475A47; // "GZGP"
+inline bool magic_ok(uint32_t magic) { return magic == kMagic || magic == kLegacyMagic; }
 constexpr uint32_t kVersion = 5;
 
 // One warp compresses one chunk; kernel throughput follows how many chunks
@@ -20,7 +24,7 @@ constexpr uint32_t kVersion = 5;
 constexpr uint32_t kDefaultChunkSize = 65536;
 constexpr uint32_t kMaxChunkSize = 1u << 20;
 
-// Named chunk-size presets for `gzp c --profile <name>` (see main.cu),
+// Named chunk-size presets for `gpusqz c --profile <name>` (see main.cu),
 // measured on a 283MB text corpus: speed keeps today's default (fastest
 // on both ends); ratio uses the largest chunk this format allows (beats
 // zstd -1's ratio there, at a real compress/decompress speed cost — see
@@ -86,4 +90,4 @@ struct TableGroup {
 
 inline size_t group_quant_bytes(const TableGroup& g) { return (size_t)quant_bytes(lit_ctx_count(g.lit_ctx_shift)); }
 
-} // namespace gzp
+} // namespace gpusqz

@@ -3,7 +3,7 @@
 # Linux, macOS and Windows (no shell, cmp or diff needed).
 execute_process(COMMAND ${REFDEC} ${INPUT} ${OUTPUT} RESULT_VARIABLE rc)
 if(NOT rc EQUAL 0)
-  message(FATAL_ERROR "gzp_refdec failed on ${INPUT} (exit ${rc})")
+  message(FATAL_ERROR "gpusqz_refdec failed on ${INPUT} (exit ${rc})")
 endif()
 execute_process(COMMAND ${CMAKE_COMMAND} -E compare_files ${OUTPUT} ${EXPECTED} RESULT_VARIABLE diff)
 if(NOT diff EQUAL 0)

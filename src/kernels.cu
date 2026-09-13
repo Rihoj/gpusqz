@@ -5,18 +5,18 @@
 
 #include <cub/device/device_scan.cuh>
 
-namespace gzp {
+namespace gpusqz {
 
 constexpr int kBlockThreads = kWarpsPerBlock * 32;
 
-// GZP_MIN_BLOCKS_PER_SM (set via CMake's GZP_MIN_BLOCKS_PER_SM cache var)
+// GPUSQZ_MIN_BLOCKS_PER_SM (set via CMake's GPUSQZ_MIN_BLOCKS_PER_SM cache var)
 // forces ptxas to keep register usage low enough for that many blocks per
 // SM, for A/B occupancy testing. Left unset, __launch_bounds__ takes only
 // the thread-count argument and ptxas picks registers freely.
-#ifdef GZP_MIN_BLOCKS_PER_SM
-#define GZP_LAUNCH_BOUNDS __launch_bounds__(kBlockThreads, GZP_MIN_BLOCKS_PER_SM)
+#ifdef GPUSQZ_MIN_BLOCKS_PER_SM
+#define GPUSQZ_LAUNCH_BOUNDS __launch_bounds__(kBlockThreads, GPUSQZ_MIN_BLOCKS_PER_SM)
 #else
-#define GZP_LAUNCH_BOUNDS __launch_bounds__(kBlockThreads)
+#define GPUSQZ_LAUNCH_BOUNDS __launch_bounds__(kBlockThreads)
 #endif
 
 __device__ __forceinline__ void chunk_scratch(uint8_t* scratch, uint32_t c, uint32_t chunk_size, SeqRec*& seqs,
@@ -57,7 +57,7 @@ __device__ __forceinline__ bool rans_may_win(uint32_t token_bytes) { return toke
 // of scratch is valid so the encode kernel doesn't need to re-parse.
 // htab is chunk_count * hash_table_bytes(chunk_size) of global memory (see
 // kernels.h): chunk c's region starts at htab + c * hash_table_words.
-__global__ void GZP_LAUNCH_BOUNDS
+__global__ void GPUSQZ_LAUNCH_BOUNDS
 parse_hist_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, const uint32_t* in_lens,
                   uint8_t* out, uint32_t out_slot_stride, uint32_t* out_start, uint32_t* out_sizes,
                   uint8_t* scratch, uint32_t* htab, uint32_t hash_bits, uint32_t* n_seq_arr, uint32_t* n_lit_arr,
@@ -143,7 +143,7 @@ __device__ float row_coded_bits(const uint32_t* row) {
 // can't end up rANS-coded are already out of the histogram (see
 // parse_hist_kernel); counting them once made `yes`-style text pick 16
 // contexts that no chunk used, 0.8% larger. forced_shift >= 0 skips the choice
-// (GZP_FORCE_LIT_SHIFT, for tests). The cost sums run in a fixed order, so
+// (GPUSQZ_FORCE_LIT_SHIFT, for tests). The cost sums run in a fixed order, so
 // the choice -- and so the output -- is deterministic.
 constexpr int kTableThreads = 256;
 __global__ void __launch_bounds__(kTableThreads)
@@ -206,7 +206,7 @@ build_table_kernel(uint32_t* cnt, int forced_shift, uint32_t* shift_out, uint8_t
 // One warp per chunk (skips in_len <= 1 chunks, already finalized). Tries
 // rANS against the batch's shared table, then plain tokens, then raw,
 // keeping whichever is smallest.
-__global__ void GZP_LAUNCH_BOUNDS
+__global__ void GPUSQZ_LAUNCH_BOUNDS
 rans_encode_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, const uint32_t* in_lens,
                    uint8_t* out, uint32_t out_slot_stride, uint32_t* out_start, uint32_t* out_sizes,
                    uint8_t* scratch, const uint32_t* n_seq_arr, const uint32_t* n_lit_arr,
@@ -268,7 +268,7 @@ rans_encode_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count,
 // out_lens[c] bytes. LzRans chunks read their tables from group g =
 // group_id[c]'s region at group_tables + group_off[g], expanded for its
 // literal-context rule group_shift[g]. Any malformed chunk sets *err.
-__global__ void GZP_LAUNCH_BOUNDS
+__global__ void GPUSQZ_LAUNCH_BOUNDS
 decompress_kernel(const uint8_t* in, const uint32_t* in_offsets, uint32_t chunk_count, const uint32_t* in_lens,
                   uint8_t* out, uint32_t chunk_size, const uint32_t* out_lens, uint8_t* scratch,
                   uint8_t* group_tables, const uint64_t* group_off, const uint32_t* group_shift,
@@ -398,4 +398,4 @@ cudaError_t launch_compact(const uint8_t* d_slots, uint32_t slot_stride, const u
   return cudaGetLastError();
 }
 
-} // namespace gzp
+} // namespace gpusqz

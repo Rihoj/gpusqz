@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Round-trip correctness tests for gzp, covering the edge cases most likely
+# Round-trip correctness tests for gpusqz, covering the edge cases most likely
 # to hide bugs: empty input, sub-chunk, exact chunk multiples, and
 # incompressible data.
 #
-#   tests/round_trip.sh [--extremes] [path/to/gzp]
+#   tests/round_trip.sh [--extremes] [path/to/gpusqz]
 #
 # Env:
 #   CHUNK=<n>         chunk size to test (default 8192); ignored with --extremes
-#   GZP_PREFIX="..."  command prefix, e.g. "compute-sanitizer --tool memcheck"
+#   GPUSQZ_PREFIX="..."  command prefix, e.g. "compute-sanitizer --tool memcheck"
 #   EXTRA_FILE=<p>    also round-trip this real file
 #   BIG=1             also run 300MB random + 300MB text (multi-batch) cases
 set -euo pipefail
@@ -17,16 +17,16 @@ if [ "${1:-}" = "--extremes" ]; then
   EXTREMES=1
   shift
 fi
-GZP="${1:-./build/gzp}"
-# Independent CPU decoder (built alongside gzp); skipped if absent.
-REFDEC="${REFDEC:-$(dirname "$GZP")/gzp_refdec}"
+GPUSQZ="${1:-./build/gpusqz}"
+# Independent CPU decoder (built alongside gpusqz); skipped if absent.
+REFDEC="${REFDEC:-$(dirname "$GPUSQZ")/gpusqz_refdec}"
 [ -x "$REFDEC" ] || REFDEC=""
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 # Word-split on purpose so a multi-word prefix works.
 # shellcheck disable=SC2206
-PREFIX=(${GZP_PREFIX:-})
+PREFIX=(${GPUSQZ_PREFIX:-})
 
 fail=0
 
@@ -56,9 +56,9 @@ make_case() {
 
 run_case() {
   local chunk="$1" name="$2" f="$3"
-  local comp="$TMP/$name.gzp" dec="$TMP/$name.out"
-  "${PREFIX[@]}" "$GZP" c "$f" "$comp" "$chunk" 2>>"$TMP/log"
-  "${PREFIX[@]}" "$GZP" d "$comp" "$dec" 2>>"$TMP/log"
+  local comp="$TMP/$name.gsz" dec="$TMP/$name.out"
+  "${PREFIX[@]}" "$GPUSQZ" c "$f" "$comp" "$chunk" 2>>"$TMP/log"
+  "${PREFIX[@]}" "$GPUSQZ" d "$comp" "$dec" 2>>"$TMP/log"
   local ref_ok=1
   if [ -n "$REFDEC" ]; then
     if ! "$REFDEC" "$comp" "$TMP/$name.ref" 2>>"$TMP/log" || ! cmp -s "$f" "$TMP/$name.ref"; then
@@ -82,16 +82,16 @@ run_case() {
   rm -f "$comp" "$dec"
 }
 
-# Compresses and decompresses with different GZP_FORCE_BATCH values, so
+# Compresses and decompresses with different GPUSQZ_FORCE_BATCH values, so
 # LzRans table groups (fixed at compress time to whatever batch size was
 # used then) never align with the decoder's own batches. This is the one
 # scenario that exercises the per-chunk group_id lookup instead of always
 # hitting the trivial case where a decode batch sits inside one group.
 run_case_mismatched_batch() {
   local name="$1" f="$2" enc_batch="$3" dec_batch="$4"
-  local comp="$TMP/$name.gzp" dec="$TMP/$name.out"
-  GZP_FORCE_BATCH="$enc_batch" "${PREFIX[@]}" "$GZP" c "$f" "$comp" 2>>"$TMP/log"
-  GZP_FORCE_BATCH="$dec_batch" "${PREFIX[@]}" "$GZP" d "$comp" "$dec" 2>>"$TMP/log"
+  local comp="$TMP/$name.gsz" dec="$TMP/$name.out"
+  GPUSQZ_FORCE_BATCH="$enc_batch" "${PREFIX[@]}" "$GPUSQZ" c "$f" "$comp" 2>>"$TMP/log"
+  GPUSQZ_FORCE_BATCH="$dec_batch" "${PREFIX[@]}" "$GPUSQZ" d "$comp" "$dec" 2>>"$TMP/log"
   local ref_ok=1
   if [ -n "$REFDEC" ]; then
     if ! "$REFDEC" "$comp" "$TMP/$name.ref" 2>>"$TMP/log" || ! cmp -s "$f" "$TMP/$name.ref"; then
@@ -117,10 +117,10 @@ run_profile_cases() {
   local f comp dec
   f="$(make_case profile_src $((2 * 1024 * 1024)) text)"
   for prof in speed balance ratio; do
-    comp="$TMP/profile_$prof.gzp"
+    comp="$TMP/profile_$prof.gsz"
     dec="$TMP/profile_$prof.out"
-    "${PREFIX[@]}" "$GZP" c "$f" "$comp" --profile "$prof" 2>>"$TMP/log"
-    "${PREFIX[@]}" "$GZP" d "$comp" "$dec" 2>>"$TMP/log"
+    "${PREFIX[@]}" "$GPUSQZ" c "$f" "$comp" --profile "$prof" 2>>"$TMP/log"
+    "${PREFIX[@]}" "$GPUSQZ" d "$comp" "$dec" 2>>"$TMP/log"
     if cmp -s "$f" "$dec"; then
       printf "PASS %-28s --profile %s\n" "profile" "$prof"
     else
@@ -129,31 +129,31 @@ run_profile_cases() {
     fi
     rm -f "$comp" "$dec"
   done
-  if "${PREFIX[@]}" "$GZP" c "$f" "$TMP/profile_both.gzp" 65536 --profile speed 2>>"$TMP/log"; then
+  if "${PREFIX[@]}" "$GPUSQZ" c "$f" "$TMP/profile_both.gsz" 65536 --profile speed 2>>"$TMP/log"; then
     printf "FAIL %-28s chunk_size + --profile should be rejected\n" "profile"
     fail=1
   else
     printf "PASS %-28s chunk_size + --profile rejected\n" "profile"
   fi
-  if "${PREFIX[@]}" "$GZP" c "$f" "$TMP/profile_bogus.gzp" --profile bogus 2>>"$TMP/log"; then
+  if "${PREFIX[@]}" "$GPUSQZ" c "$f" "$TMP/profile_bogus.gsz" --profile bogus 2>>"$TMP/log"; then
     printf "FAIL %-28s unknown --profile should be rejected\n" "profile"
     fail=1
   else
     printf "PASS %-28s unknown --profile rejected\n" "profile"
   fi
-  rm -f "$TMP/profile_both.gzp" "$TMP/profile_bogus.gzp"
+  rm -f "$TMP/profile_both.gsz" "$TMP/profile_bogus.gsz"
 
   # --gpu-mem: a tiny budget forces many small batches on both sides.
-  comp="$TMP/gpumem.gzp"
+  comp="$TMP/gpumem.gsz"
   dec="$TMP/gpumem.out"
-  if "${PREFIX[@]}" "$GZP" c "$f" "$comp" 4096 --gpu-mem 64M 2>>"$TMP/log" &&
-     "${PREFIX[@]}" "$GZP" d "$comp" "$dec" --gpu-mem 48M 2>>"$TMP/log" && cmp -s "$f" "$dec"; then
+  if "${PREFIX[@]}" "$GPUSQZ" c "$f" "$comp" 4096 --gpu-mem 64M 2>>"$TMP/log" &&
+     "${PREFIX[@]}" "$GPUSQZ" d "$comp" "$dec" --gpu-mem 48M 2>>"$TMP/log" && cmp -s "$f" "$dec"; then
     printf "PASS %-28s --gpu-mem 64M / 48M\n" "gpu_mem"
   else
     printf "FAIL %-28s --gpu-mem round-trip mismatch\n" "gpu_mem"
     fail=1
   fi
-  if "${PREFIX[@]}" "$GZP" c "$f" "$comp" --gpu-mem 8Q 2>>"$TMP/log"; then
+  if "${PREFIX[@]}" "$GPUSQZ" c "$f" "$comp" --gpu-mem 8Q 2>>"$TMP/log"; then
     printf "FAIL %-28s bad --gpu-mem unit should be rejected\n" "gpu_mem"
     fail=1
   else
@@ -162,7 +162,7 @@ run_profile_cases() {
   rm -f "$comp" "$dec"
 }
 
-# Exercises all three literal-context rules (GZP_FORCE_LIT_SHIFT, see
+# Exercises all three literal-context rules (GPUSQZ_FORCE_LIT_SHIFT, see
 # rans_codes.h) on literal-heavy inputs; the automatic choice depends on
 # file size, so small test files would otherwise only ever use order-0.
 run_lit_ctx_cases() {
@@ -170,10 +170,10 @@ run_lit_ctx_cases() {
   b64="$(make_case base64_3mb $((3 * 1024 * 1024)) base64)"
   src="$(make_case source_2mb $((2 * 1024 * 1024)) source)"
   for sh in 8 4 0; do
-    export GZP_FORCE_LIT_SHIFT="$sh"
+    export GPUSQZ_FORCE_LIT_SHIFT="$sh"
     run_case "$chunk" "base64_3mb_lit$sh" "$b64"
     run_case "$chunk" "source_2mb_lit$sh" "$src"
-    unset GZP_FORCE_LIT_SHIFT
+    unset GPUSQZ_FORCE_LIT_SHIFT
   done
 }
 
@@ -218,10 +218,10 @@ if [ "$EXTREMES" -eq 1 ]; then
   # Same, with 256 literal contexts on literal-heavy data, so the group
   # lookup is exercised with the largest per-group tables.
   mismatch_b64="$(make_case mismatch_b64_src $((5 * 1024 * 1024)) base64)"
-  export GZP_FORCE_LIT_SHIFT=0
+  export GPUSQZ_FORCE_LIT_SHIFT=0
   run_case_mismatched_batch "b64_lit0_small_enc_large_dec" "$mismatch_b64" 16 4000
   run_case_mismatched_batch "b64_lit0_large_enc_small_dec" "$mismatch_b64" 4000 16
-  unset GZP_FORCE_LIT_SHIFT
+  unset GPUSQZ_FORCE_LIT_SHIFT
 
   # A De Bruijn sequence B(32,4) is exactly 2^20 bytes in which every 4-byte
   # string occurs once, so the LZ parse finds no match and a 1MB chunk is a

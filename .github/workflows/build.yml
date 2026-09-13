@@ -1,15 +1,15 @@
-# Builds gzp for Linux (deb, rpm), Windows (zip) and macOS (tar.gz), runs
+# Builds gpusqz for Linux (deb, rpm), Windows (zip) and macOS (tar.gz), runs
 # the tests that don't need a GPU, and on a v* tag publishes the packages
 # as a GitHub release.
 #
 # GitHub-hosted runners have no NVIDIA GPU, so CI compiles the CUDA code
 # and runs only the GPU-free tests (`ctest -LE gpu`): the CPU reference
 # decoder against committed fixtures made by the real GPU build
-# (tests/fixtures), and gzp's argument handling. The GPU round trip
+# (tests/fixtures), and gpusqz's argument handling. The GPU round trip
 # (tests/round_trip.sh, ctest label "gpu") has to run on a machine with a
 # GPU before tagging a release.
 #
-# macOS gets only gzp_refdec, the CPU decoder: CUDA does not exist on
+# macOS gets only gpusqz_refdec, the CPU decoder: CUDA does not exist on
 # macOS, so the compressor cannot be built or run there.
 name: build
 
@@ -24,7 +24,7 @@ permissions:
   contents: read
 
 env:
-  # sm_70 (Volta) is the oldest GPU gzp can run on (it needs
+  # sm_70 (Volta) is the oldest GPU gpusqz can run on (it needs
   # __match_any_sync). Native code for every generation up to Blackwell,
   # plus sm_120 PTX so newer GPUs can JIT-compile it.
   CUDA_ARCHS: "70-real;75-real;80-real;86-real;89-real;90-real;100-real;120"
@@ -62,7 +62,7 @@ jobs:
           -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc
           -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS"
           -DCMAKE_CUDA_FLAGS="$CUDA_FLAGS"
-          -DGZP_VERSION=${{ steps.version.outputs.version }}
+          -DGPUSQZ_VERSION=${{ steps.version.outputs.version }}
 
       - name: Build
         run: cmake --build build
@@ -80,13 +80,13 @@ jobs:
       - name: Install and smoke-test the package
         run: |
           sudo apt-get install -y ./build/*.deb
-          gzp_refdec tests/fixtures/text__c4k_lit0.gzp /tmp/out
+          gpusqz_refdec tests/fixtures/text__c4k_lit0.gsz /tmp/out
           cmp /tmp/out tests/fixtures/text.orig
-          gzp 2>&1 | grep -q usage:
+          gpusqz 2>&1 | grep -q usage:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: gzp-linux-deb
+          name: gpusqz-linux-deb
           path: build/*.deb
           if-no-files-found: error
 
@@ -120,7 +120,7 @@ jobs:
           -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc
           -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS"
           -DCMAKE_CUDA_FLAGS="$CUDA_FLAGS"
-          -DGZP_VERSION=${{ steps.version.outputs.version }}
+          -DGPUSQZ_VERSION=${{ steps.version.outputs.version }}
 
       - name: Build
         run: cmake --build build -j "$(nproc)"
@@ -138,13 +138,13 @@ jobs:
       - name: Install and smoke-test the package
         run: |
           dnf install -y ./build/*.rpm
-          gzp_refdec tests/fixtures/text__c4k_lit0.gzp /tmp/out
+          gpusqz_refdec tests/fixtures/text__c4k_lit0.gsz /tmp/out
           cmp /tmp/out tests/fixtures/text.orig
-          gzp 2>&1 | grep -q usage:
+          gpusqz 2>&1 | grep -q usage:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: gzp-linux-rpm
+          name: gpusqz-linux-rpm
           path: build/*.rpm
           if-no-files-found: error
 
@@ -189,7 +189,7 @@ jobs:
           -DCMAKE_CUDA_COMPILER="$env:CUDA_PATH/bin/nvcc.exe"
           "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS"
           "-DCMAKE_CUDA_FLAGS=$env:CUDA_FLAGS"
-          -DGZP_VERSION=${{ steps.version.outputs.version }}
+          -DGPUSQZ_VERSION=${{ steps.version.outputs.version }}
 
       - name: Build
         run: cmake --build build
@@ -206,17 +206,17 @@ jobs:
         run: |
           $zip = Get-ChildItem build\*.zip | Select-Object -First 1
           Expand-Archive $zip.FullName -DestinationPath pkg
-          $bin = Get-ChildItem pkg -Recurse -Filter gzp_refdec.exe | Select-Object -First 1
-          & $bin.FullName tests\fixtures\text__c4k_lit0.gzp out.txt
-          if ($LASTEXITCODE -ne 0) { throw "gzp_refdec failed" }
+          $bin = Get-ChildItem pkg -Recurse -Filter gpusqz_refdec.exe | Select-Object -First 1
+          & $bin.FullName tests\fixtures\text__c4k_lit0.gsz out.txt
+          if ($LASTEXITCODE -ne 0) { throw "gpusqz_refdec failed" }
           if ((Get-FileHash out.txt).Hash -ne (Get-FileHash tests\fixtures\text.orig).Hash) { throw "decode mismatch" }
-          $gzp = Join-Path $bin.DirectoryName gzp.exe
-          $usage = & $gzp 2>&1 | Out-String
-          if ($usage -notmatch "usage:") { throw "gzp.exe did not print usage: $usage" }
+          $gpusqz = Join-Path $bin.DirectoryName gpusqz.exe
+          $usage = & $gpusqz 2>&1 | Out-String
+          if ($usage -notmatch "usage:") { throw "gpusqz.exe did not print usage: $usage" }
 
       - uses: actions/upload-artifact@v4
         with:
-          name: gzp-windows-zip
+          name: gpusqz-windows-zip
           path: build/*.zip
           if-no-files-found: error
 
@@ -237,10 +237,10 @@ jobs:
         run: >
           cmake -S . -B build
           -DCMAKE_BUILD_TYPE=Release
-          -DGZP_BUILD_GPU=OFF
+          -DGPUSQZ_BUILD_GPU=OFF
           "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"
           -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
-          -DGZP_VERSION=${{ steps.version.outputs.version }}
+          -DGPUSQZ_VERSION=${{ steps.version.outputs.version }}
 
       - name: Build
         run: cmake --build build -j "$(sysctl -n hw.ncpu)"
@@ -253,11 +253,11 @@ jobs:
         run: |
           cpack -G TGZ
           tar tzf ./*.tar.gz
-          lipo -verify_arch gzp_refdec arm64 x86_64  # universal binary: Apple silicon and Intel
+          lipo -verify_arch gpusqz_refdec arm64 x86_64  # universal binary: Apple silicon and Intel
 
       - uses: actions/upload-artifact@v4
         with:
-          name: gzp-macos-tgz
+          name: gpusqz-macos-tgz
           path: build/*.tar.gz
           if-no-files-found: error
 
@@ -281,5 +281,5 @@ jobs:
           ls -l dist
           gh release create "$GITHUB_REF_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
-            --title "gzp $GITHUB_REF_NAME" \
+            --title "gpusqz $GITHUB_REF_NAME" \
             --generate-notes

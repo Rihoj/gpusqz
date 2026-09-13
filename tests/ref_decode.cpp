@@ -1,9 +1,9 @@
-// Independent CPU decoder for the gzp container, used by the tests to
+// Independent CPU decoder for the gpusqz container, used by the tests to
 // check that GPU-compressed files decode correctly by an implementation
 // that shares no code with the GPU path (a symmetric bug in the GPU
 // encoder and decoder would still round-trip on the GPU alone).
 //
-//   gzp_refdec <input.gzp> <output>
+//   gpusqz_refdec <input.gsz> <output>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
@@ -15,12 +15,12 @@
 #include "format.h"
 #include "rans_codes.h"
 
-using namespace gzp;
+using namespace gpusqz;
 
 namespace {
 
 [[noreturn]] void fail(const std::string& msg) {
-  std::fprintf(stderr, "gzp_refdec: %s\n", msg.c_str());
+  std::fprintf(stderr, "gpusqz_refdec: %s\n", msg.c_str());
   std::exit(1);
 }
 
@@ -297,7 +297,7 @@ bool decode_lz(const uint8_t* in, size_t in_len, uint8_t* out, size_t orig) {
 } // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 3) fail("usage: gzp_refdec <input.gzp> <output>");
+  if (argc != 3) fail("usage: gpusqz_refdec <input.gsz> <output>");
   FILE* in = std::fopen(argv[1], "rb");
   if (!in) fail("cannot open input");
   FILE* out = std::fopen(argv[2], "wb");
@@ -305,7 +305,7 @@ int main(int argc, char** argv) {
 
   FileHeader h;
   if (std::fread(&h, sizeof(h), 1, in) != 1) fail("truncated header");
-  if (h.magic != kMagic) fail("bad magic");
+  if (!magic_ok(h.magic)) fail("bad magic");
   if (h.version != kVersion) fail("unsupported version");
   if (h.chunk_size == 0 || h.chunk_size > kMaxChunkSize) fail("bad chunk_size");
 

@@ -43,7 +43,7 @@
 #include "rans_codes.h"
 #include "lz_warp.cuh"
 
-namespace gzp {
+namespace gpusqz {
 
 // Coarse index for the 32-symbol alphabets: lut[i] is the largest symbol s
 // with cum[s] <= i * (kProbScale >> kSmallLutBits), i.e. a lower bound on
@@ -634,4 +634,4 @@ __device__ inline bool lz_reconstruct_warp(const SeqRec* seqs, uint32_t n_seq, c
   return op == orig && lp == n_lit;
 }
 
-} // namespace gzp
+} // namespace gpusqz

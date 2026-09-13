@@ -1,6 +1,8 @@
-# gzp — a GPU file compressor
+# gpusqz — a GPU file compressor
 
-`gzp` compresses and decompresses files on an NVIDIA GPU with CUDA. Each
+`gpusqz` (pronounced "GPU squeeze"; formerly `gzp`) compresses and
+decompresses files on an NVIDIA GPU with CUDA. Compressed files use the
+`.gsz` extension by convention. Each
 chunk of the input (64KB by default, up to 1MB) is handled by one warp: an
 LZ parse where all 32 lanes search for matches together, followed by a
 32-way interleaved rANS entropy coder with order-1 literal contexts. It's
@@ -14,14 +16,14 @@ profile lands within 0.5% of `zstd -3`'s output size while compressing
 
 RTX 5060 Ti (16GB) under WSL2, CPU tools single-threaded, best of 3–5 runs
 per column (`REPEAT=<n>`, see *Benchmarking*). Wall figures are
-whole-process (file I/O, PCIe copies, and for gzp ~0.2s of CUDA context
+whole-process (file I/O, PCIe copies, and for gpusqz ~0.2s of CUDA context
 creation and allocation); the kernel columns are the wall-clock time any
-gzp kernel was running. Ratio is output/input, so **lower is better**.
+gpusqz kernel was running. Ratio is output/input, so **lower is better**.
 
 **Measurement conditions.** The GPU was otherwise idle (~1GB used by the
-desktop, 0–2% utilisation), and gzp's batch budget was 4GB (the default
+desktop, 0–2% utilisation), and gpusqz's batch budget was 4GB (the default
 at the time; it is now 80% of free GPU memory, see *Usage*). On
-the 283MB corpus about half of gzp's wall time is the ~0.2s fixed startup
+the 283MB corpus about half of gpusqz's wall time is the ~0.2s fixed startup
 cost, which varies by ±15% between runs, so its wall figures there move
 by that much from run to run; the kernel figures and the 1GB corpus are
 the steadier comparison. An earlier set of runs with another process
@@ -32,9 +34,9 @@ without repetition; see *Benchmarking*):
 
 | codec | compress MB/s (wall) | kernel MB/s | decompress MB/s (wall) | kernel MB/s | ratio |
 |---|---|---|---|---|---|
-| **gzp** (default, `speed`, 64KB) | **1297** | 2983 | 1130 | 4567 | 0.2526 |
-| gzp `--profile balance` (256KB) | 989 | 1847 | 1267 | 3353 | 0.2387 |
-| gzp `--profile ratio` (1MB) | 873 | 1552 | 1176 | 1906 | 0.2255 |
+| **gpusqz** (default, `speed`, 64KB) | **1297** | 2983 | 1130 | 4567 | 0.2526 |
+| gpusqz `--profile balance` (256KB) | 989 | 1847 | 1267 | 3353 | 0.2387 |
+| gpusqz `--profile ratio` (1MB) | 873 | 1552 | 1176 | 1906 | 0.2255 |
 | gzip -1 | 145 | – | 250 | – | 0.2836 |
 | gzip -6 | 56 | – | 278 | – | 0.2306 |
 | zstd -1 (1 thread) | 516 | – | **1434** | – | 0.2518 |
@@ -45,9 +47,9 @@ friendlier shape for a match finder, see the caveat in *Benchmarking*):
 
 | codec | compress MB/s (wall) | kernel MB/s | decompress MB/s (wall) | kernel MB/s | ratio |
 |---|---|---|---|---|---|
-| **gzp** (default, `speed`, 64KB) | **664** | 2390 | 718 | 3805 | 0.2673 |
-| gzp `--profile balance` (256KB) | 552 | 1746 | 715 | 3414 | 0.2547 |
-| gzp `--profile ratio` (1MB) | 487 | 1232 | 657 | 1515 | **0.2423** |
+| **gpusqz** (default, `speed`, 64KB) | **664** | 2390 | 718 | 3805 | 0.2673 |
+| gpusqz `--profile balance` (256KB) | 552 | 1746 | 715 | 3414 | 0.2547 |
+| gpusqz `--profile ratio` (1MB) | 487 | 1232 | 657 | 1515 | **0.2423** |
 | gzip -1 | 140 | – | 249 | – | 0.2985 |
 | gzip -6 | 53 | – | 273 | – | 0.2457 |
 | zstd -1 (1 thread) | 482 | – | **1328** | – | 0.2724 |
@@ -55,19 +57,19 @@ friendlier shape for a match finder, see the caveat in *Benchmarking*):
 
 Against the CPU tools:
 
-- **Default profile vs `zstd -1`.** gzp compresses 1.4x (283MB) to 2.5x
+- **Default profile vs `zstd -1`.** gpusqz compresses 1.4x (283MB) to 2.5x
   (1GB) faster. Its output is 1.9% smaller on the repetitive corpus and
   0.3% larger on the varied one. `zstd -1` decompresses faster: 1.85x on
-  the smaller file, where gzp's fixed startup cost weighs more, and 1.3x
+  the smaller file, where gpusqz's fixed startup cost weighs more, and 1.3x
   on the 1GB file.
-- **`ratio` profile vs `zstd -3`.** gzp compresses 1.3–2.2x faster. Its
+- **`ratio` profile vs `zstd -3`.** gpusqz compresses 1.3–2.2x faster. Its
   output is 0.1% smaller on the repetitive corpus and 0.5% larger on the
   varied one. `zstd -3` decompresses 1.1–1.8x faster.
-- **vs `gzip`.** Every gzp profile beats `gzip -1` on both ratio and
+- **vs `gzip`.** Every gpusqz profile beats `gzip -1` on both ratio and
   speed. The `ratio` profile also beats `gzip -6`'s ratio on both corpora
   while compressing 9–16x faster; `balance` does not beat `gzip -6`.
 
-The gzp wall figures on the 1GB corpus are bounded by file I/O more than
+The gpusqz wall figures on the 1GB corpus are bounded by file I/O more than
 by the GPU: under WSL2, decompression spends most of its time in
 `fwrite` (see *Known limitations*), and the kernels run 1.6–4x faster
 than the wall-clock rate.
@@ -227,7 +229,7 @@ Two measurements drove that design:
 Batch size comes from free VRAM, since the GPU may be shared: at least
 1024 chunks and 32MB of input, within 80% of the free VRAM (or an
 explicit `--gpu-mem` budget). That memory is allocated once, at startup,
-and held until gzp exits, so another process can't take it mid-run. A
+and held until gpusqz exits, so another process can't take it mid-run. A
 file that fits in one or two batches gets the whole budget. Allocation
 retries with a halved batch on failure. Compressed output is compacted
 on the GPU (a CUB scan plus a pack kernel, writing into the batch's
@@ -236,7 +238,7 @@ now-dead scratch), so the download moves only compressed bytes.
 ### Container format (`src/format.h`)
 
 ```
-FileHeader    { magic, version=5, chunk_size, original_size, chunk_count,
+FileHeader    { magic="GSQZ", version=5, chunk_size, original_size, chunk_count,
                 table_group_count, tables_offset }
 ChunkEntry[]  { offset, compressed_size, original_size }     -- one per chunk
 TableGroup[]  { start_chunk, chunk_count, lit_ctx_shift }    -- one per compression batch
@@ -255,6 +257,10 @@ come after the payload rather than in the directory. The decoder checks
 that the payload runs exactly from the end of the directory to
 `tables_offset` and that the table section ends the file.
 
+Files written before the rename from `gzp` carry the magic "GZGP"
+instead of "GSQZ" but are otherwise identical; both decoders accept
+either (`tests/fixtures/text__legacy_magic.gsz` checks that).
+
 ## Installing
 
 Pre-built packages come from the `build` GitHub workflow
@@ -263,12 +269,12 @@ workflow artifacts, and a `v*` tag publishes them as a GitHub release.
 
 | platform | package | contents |
 |---|---|---|
-| Ubuntu 22.04+, Debian 12+ | `gzp_<version>_amd64.deb` | `gzp`, `gzp_refdec` |
-| RHEL/Rocky/Alma 8+, Fedora | `gzp-<version>-1.x86_64.rpm` | `gzp`, `gzp_refdec` |
-| Windows 10/11 x64 | `gzp-<version>-win64.zip` | `gzp.exe`, `gzp_refdec.exe`, MSVC runtime DLLs |
-| macOS 11+ (Apple silicon and Intel) | `gzp-refdec-<version>-Darwin.tar.gz` | `gzp_refdec` only |
+| Ubuntu 22.04+, Debian 12+ | `gpusqz_<version>_amd64.deb` | `gpusqz`, `gpusqz_refdec` |
+| RHEL/Rocky/Alma 8+, Fedora | `gpusqz-<version>-1.x86_64.rpm` | `gpusqz`, `gpusqz_refdec` |
+| Windows 10/11 x64 | `gpusqz-<version>-win64.zip` | `gpusqz.exe`, `gpusqz_refdec.exe`, MSVC runtime DLLs |
+| macOS 11+ (Apple silicon and Intel) | `gpusqz-refdec-<version>-Darwin.tar.gz` | `gpusqz_refdec` only |
 
-`gzp` needs an NVIDIA GPU of compute capability 7.0 (Volta) or newer and
+`gpusqz` needs an NVIDIA GPU of compute capability 7.0 (Volta) or newer and
 an NVIDIA driver that supports CUDA 12; the CUDA runtime is linked into
 the binary, so no CUDA toolkit is needed to run it. The packages contain
 native GPU code for Volta through Blackwell, plus PTX that newer GPUs can
@@ -276,7 +282,7 @@ compile at load time.
 
 **macOS gets only the decoder.** NVIDIA dropped CUDA on macOS, and Apple
 hardware has no NVIDIA GPU, so the compressor cannot be built or run
-there. `gzp_refdec <in.gzp> <out>` decompresses files made by `gzp` on
+there. `gpusqz_refdec <in.gsz> <out>` decompresses files made by `gpusqz` on
 another machine, on the CPU.
 
 ## Building
@@ -293,11 +299,11 @@ cmake --build build -j
 silently fell back to sm_52 instead of detecting the GPU.) Release builds
 pass every generation: see `CUDA_ARCHS` in the workflow.
 
-`-DGZP_BUILD_GPU=OFF` builds only `gzp_refdec`, with no CUDA toolkit
+`-DGPUSQZ_BUILD_GPU=OFF` builds only `gpusqz_refdec`, with no CUDA toolkit
 needed; that is how the macOS package is made. `cpack -G DEB`, `RPM`,
 `ZIP` or `TGZ` in the build directory produces the packages above.
 
-`GZP_MIN_BLOCKS_PER_SM=<n>` (a CMake cache var, not a runtime flag) sets
+`GPUSQZ_MIN_BLOCKS_PER_SM=<n>` (a CMake cache var, not a runtime flag) sets
 `__launch_bounds__`'s `minBlocksPerSM` hint on the per-chunk kernels, for
 A/B occupancy testing — see the comment above it in `CMakeLists.txt`. None
 of those kernels use shared memory, and at 38 (parse), 64 (encode) and 58
@@ -309,32 +315,32 @@ register spilling.
 ## Usage
 
 ```
-./build/gzp c <input> <output> [chunk_size]                # compress (default chunk_size 65536)
-./build/gzp c <input> <output> --profile speed|balance|ratio  # ...or pick a chunk-size preset
-./build/gzp d <input> <output>                              # decompress
-./build/gzp c|d ... --gpu-mem 8G                            # GPU memory for batch buffers
+./build/gpusqz c <input> <output> [chunk_size]                # compress (default chunk_size 65536)
+./build/gpusqz c <input> <output> --profile speed|balance|ratio  # ...or pick a chunk-size preset
+./build/gpusqz d <input> <output>                              # decompress
+./build/gpusqz c|d ... --gpu-mem 8G                            # GPU memory for batch buffers
 ```
 
 `chunk_size` and `--profile` are mutually exclusive, and unrecognised
 arguments are rejected. See *Results* for what each profile costs and
 buys.
 
-`--gpu-mem SIZE` (or `GZP_GPU_MEM`) sets how much GPU memory gzp may use
+`--gpu-mem SIZE` (or `GPUSQZ_GPU_MEM`) sets how much GPU memory gpusqz may use
 for its batch buffers: a number with a K, M, G or T suffix, or a bare
-number of MiB. By default gzp takes 80% of the GPU memory free when it
+number of MiB. By default gpusqz takes 80% of the GPU memory free when it
 starts; an explicit value may use all but 256MiB of the free
 memory and is reduced, with a note, if it asks for more. Host RAM use
-does not depend on it: gzp pins a fixed ~96MB of staging buffers.
+does not depend on it: gpusqz pins a fixed ~96MB of staging buffers.
 
 Environment variables, all optional:
 
 | variable | effect |
 |---|---|
-| `GZP_VERBOSE=1` | Per-stage timing on stderr: setup, fread, copies, kernel time (summed and wall-clock union), fwrite, staging stalls. |
-| `GZP_FORCE_BATCH=<n>` | Force chunks per batch (testing; see *Testing*). |
-| `GZP_FORCE_SETS=<1-3>` | Force the device buffer-set count (tuning). |
-| `GZP_FORCE_LIT_SHIFT=<0\|4\|8>` | Force every batch's literal-context rule (testing and tuning). |
-| `GZP_DUMP_LITS=<path>` | Dump each chunk's parsed literal stream, for evaluating literal models offline. Serialises the pipeline. |
+| `GPUSQZ_VERBOSE=1` | Per-stage timing on stderr: setup, fread, copies, kernel time (summed and wall-clock union), fwrite, staging stalls. |
+| `GPUSQZ_FORCE_BATCH=<n>` | Force chunks per batch (testing; see *Testing*). |
+| `GPUSQZ_FORCE_SETS=<1-3>` | Force the device buffer-set count (tuning). |
+| `GPUSQZ_FORCE_LIT_SHIFT=<0\|4\|8>` | Force every batch's literal-context rule (testing and tuning). |
+| `GPUSQZ_DUMP_LITS=<path>` | Dump each chunk's parsed literal stream, for evaluating literal models offline. Serialises the pipeline. |
 
 ## Testing
 
@@ -367,7 +373,7 @@ Notable cases:
 - **Literal contexts.** Literal-heavy base64 and source-text inputs run
   at every forced literal-context rule, since the automatic choice would
   pick order-0 for most small test files.
-- **Mismatched batches.** `GZP_FORCE_BATCH` exists because a
+- **Mismatched batches.** `GPUSQZ_FORCE_BATCH` exists because a
   `TableGroup`'s boundaries are fixed at compress time, but decompression
   picks its own batch size independently. The extremes suite compresses
   and decompresses with deliberately different batch sizes, in both
@@ -383,16 +389,16 @@ Notable cases:
 ```
 find /usr/include -name '*.h' | head -400 | xargs cat > corpus.txt
 for i in $(seq 48); do cat corpus.txt; done > corpus_283mb.txt
-REPEAT=5 bash bench/run_bench.sh corpus_283mb.txt                     # gzp default vs gzip/zstd
-CPU=0 REPEAT=5 bash bench/run_bench.sh corpus_283mb.txt --profile ratio  # one gzp profile only
+REPEAT=5 bash bench/run_bench.sh corpus_283mb.txt                     # gpusqz default vs gzip/zstd
+CPU=0 REPEAT=5 bash bench/run_bench.sh corpus_283mb.txt --profile ratio  # one gpusqz profile only
 ```
 
-The script reports wall and kernel MB/s for gzp and compares against
+The script reports wall and kernel MB/s for gpusqz and compares against
 `gzip -1/-6` and single-threaded `zstd -1/-3` when available. On a shared
 GPU a single wall-clock measurement can be dominated by another process,
 so `REPEAT=<n>` runs each codec n times and reports the best run per
-column. Check `nvidia-smi` first: another process's memory shrinks gzp's
-batches, and its compute slows gzp's global-memory-latency-bound parse.
+column. Check `nvidia-smi` first: another process's memory shrinks gpusqz's
+batches, and its compute slows gpusqz's global-memory-latency-bound parse.
 
 **The 283MB recipe repeats one 5.4MB block 48x, which is not a neutral
 choice of large file.** It once hid a real regression: a match-finding
@@ -413,16 +419,16 @@ size while keeping the content non-repeating. The 1GB corpus in
 
 - **Fixed startup cost.** CUDA context creation and allocation take
   ~0.2s on this WSL2 machine, over half of the wall time on the 283MB
-  corpus. It amortises on larger inputs and is mostly outside gzp's
+  corpus. It amortises on larger inputs and is mostly outside gpusqz's
   control.
 - **Decompression is `fwrite`-bound under WSL2.** Writing 1GB measured
   0.5–1.2s depending on page-cache state, while the decompress kernel
   needs ~0.25s, so the writer thread is almost always the bottleneck.
-  gzp would need a faster filesystem path to go further, not a faster
+  gpusqz would need a faster filesystem path to go further, not a faster
   kernel.
-- **Ratio vs zstd.** zstd's parser is more sophisticated than gzp's hash
+- **Ratio vs zstd.** zstd's parser is more sophisticated than gpusqz's hash
   match finder with a two-step lazy lookahead: `zstd -3`'s output is ~0.5%
-  smaller than gzp's `ratio` profile on the varied corpus. An optimal parser, or
+  smaller than gpusqz's `ratio` profile on the varied corpus. An optimal parser, or
   a match finder with longer chains, would be the next ratio lever. A
   third lazy step and a 64-byte probe cap were measured and did nothing
   useful (see the comments at `kLazySteps` and `kProbe`).
@@ -455,7 +461,7 @@ size while keeping the content non-repeating. The 1GB corpus in
   throughput (~1550 MB/s, the GPU is saturated) and wall throughput within
   run-to-run noise (851 vs 869 MB/s compress). Going much lower does cost:
   a 2G budget measured 900 MB/s of kernel throughput.
-- **No exclusive GPU access.** gzp holds its batch memory for the whole
+- **No exclusive GPU access.** gpusqz holds its batch memory for the whole
   run, but it can't stop other processes from using the rest of the GPU's
   memory or its compute; exclusive use needs the system-wide compute mode
   (`nvidia-smi -c EXCLUSIVE_PROCESS`, administrator rights, not available

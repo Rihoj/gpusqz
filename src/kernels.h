@@ -6,7 +6,7 @@
 #include "format.h"
 #include "rans_codes.h"
 
-namespace gzp {
+namespace gpusqz {
 
 // Every match covers at least kMinMatch bytes, plus one optional tail.
 __host__ __device__ inline uint32_t max_sequences(uint32_t chunk_size) { return chunk_size / kMinMatch + 1; }
@@ -145,4 +145,4 @@ cudaError_t launch_compact(const uint8_t* d_slots, uint32_t slot_stride, const u
                            const uint32_t* d_sizes, uint32_t n, uint32_t* d_offsets, uint8_t* d_packed,
                            void* d_temp, size_t temp_bytes, cudaStream_t stream);
 
-} // namespace gzp
+} // namespace gpusqz

@@ -20,7 +20,7 @@
 #pragma once
 #include <cstdint>
 
-namespace gzp {
+namespace gpusqz {
 
 constexpr int kProbBits = 12;
 constexpr uint32_t kProbScale = 1u << kProbBits;
@@ -46,9 +46,9 @@ constexpr int kRansStates = 32;
 constexpr int kRansHeaderBytes = 8 + kRansStates * 4;
 
 #ifdef __CUDACC__
-#define GZP_HD __host__ __device__ inline
+#define GPUSQZ_HD __host__ __device__ inline
 #else
-#define GZP_HD inline
+#define GPUSQZ_HD inline
 #endif
 
 // ---- Order-1 literal contexts ----
@@ -72,12 +72,12 @@ constexpr int kRansHeaderBytes = 8 + kRansStates * 4;
 // both decoders all derive contexts from exactly this rule; a mismatch
 // would code a literal with a zero-frequency table entry.
 constexpr uint32_t kLitShiftOrder0 = 8, kLitShiftNibble = 4, kLitShiftByte = 0;
-GZP_HD bool lit_shift_valid(uint32_t shift) {
+GPUSQZ_HD bool lit_shift_valid(uint32_t shift) {
   return shift == kLitShiftOrder0 || shift == kLitShiftNibble || shift == kLitShiftByte;
 }
-GZP_HD int lit_ctx_count(uint32_t shift) { return 256 >> shift; }
-GZP_HD uint32_t lit_ctx(uint32_t prev, uint32_t shift) { return prev >> shift; }
-GZP_HD uint32_t lit_run_len(uint32_t n_lit) { return ((n_lit + 31) / 32 + 3) & ~3u; }
+GPUSQZ_HD int lit_ctx_count(uint32_t shift) { return 256 >> shift; }
+GPUSQZ_HD uint32_t lit_ctx(uint32_t prev, uint32_t shift) { return prev >> shift; }
+GPUSQZ_HD uint32_t lit_run_len(uint32_t n_lit) { return ((n_lit + 31) / 32 + 3) & ~3u; }
 
 // Layout of every quantised-count / frequency array: the three small
 // alphabets first, then one 256-entry literal table per context, so the
@@ -87,11 +87,11 @@ constexpr int kMlBase = kSmallSyms;
 constexpr int kOffBase = 2 * kSmallSyms;
 constexpr int kLitBase = 3 * kSmallSyms;
 constexpr int kMaxLitCtx = 256;
-GZP_HD int lit_entry(uint32_t ctx, uint32_t sym) { return kLitBase + (int)(ctx * kLitSyms + sym); }
-GZP_HD int quant_bytes(int n_ctx) { return kLitBase + n_ctx * kLitSyms; }
+GPUSQZ_HD int lit_entry(uint32_t ctx, uint32_t sym) { return kLitBase + (int)(ctx * kLitSyms + sym); }
+GPUSQZ_HD int quant_bytes(int n_ctx) { return kLitBase + n_ctx * kLitSyms; }
 constexpr int kMaxQuantBytes = kLitBase + kMaxLitCtx * kLitSyms;
 
-GZP_HD uint32_t floor_log2(uint32_t v) { // v >= 1
+GPUSQZ_HD uint32_t floor_log2(uint32_t v) { // v >= 1
 #if defined(__CUDA_ARCH__)
   return 31 - __clz(v);
 #else
@@ -101,7 +101,7 @@ GZP_HD uint32_t floor_log2(uint32_t v) { // v >= 1
 #endif
 }
 
-GZP_HD void len_code(uint32_t v, uint32_t& code, uint32_t& nb, uint32_t& bits) {
+GPUSQZ_HD void len_code(uint32_t v, uint32_t& code, uint32_t& nb, uint32_t& bits) {
   if (v < 16) {
     code = v;
     nb = 0;
@@ -113,24 +113,24 @@ GZP_HD void len_code(uint32_t v, uint32_t& code, uint32_t& nb, uint32_t& bits) {
     bits = v - (1u << l);
   }
 }
-GZP_HD uint32_t len_nb(uint32_t code) { return code < 16 ? 0 : code - 12; }
-GZP_HD uint32_t len_value(uint32_t code, uint32_t bits) { return code < 16 ? code : (1u << (code - 12)) + bits; }
+GPUSQZ_HD uint32_t len_nb(uint32_t code) { return code < 16 ? 0 : code - 12; }
+GPUSQZ_HD uint32_t len_value(uint32_t code, uint32_t bits) { return code < 16 ? code : (1u << (code - 12)) + bits; }
 
-GZP_HD void off_code(uint32_t off, uint32_t& code, uint32_t& nb, uint32_t& bits) {
+GPUSQZ_HD void off_code(uint32_t off, uint32_t& code, uint32_t& nb, uint32_t& bits) {
   uint32_t l = floor_log2(off);
   code = l;
   nb = l;
   bits = off - (1u << l);
 }
-GZP_HD uint32_t off_value(uint32_t code, uint32_t bits) { return (1u << code) + bits; }
+GPUSQZ_HD uint32_t off_value(uint32_t code, uint32_t bits) { return (1u << code) + bits; }
 // Bypass-bit width for a decoded offset code: for a real off_code() this
 // is the code itself (nb == floor(log2 off), see off_code above); a
 // repeat-offset code (>= kOffRepBase) carries no extra bits at all.
-GZP_HD uint32_t off_nb(uint32_t code) { return code >= kOffRepBase ? 0 : code; }
+GPUSQZ_HD uint32_t off_nb(uint32_t code) { return code >= kOffRepBase ? 0 : code; }
 
 // Quantises counts to one byte each for the header: zero iff absent,
 // otherwise 1..255 scaled to the largest count.
-GZP_HD void quantize_counts(const uint32_t* cnt, int k, uint8_t* q) {
+GPUSQZ_HD void quantize_counts(const uint32_t* cnt, int k, uint8_t* q) {
   uint32_t mx = 0;
   for (int s = 0; s < k; ++s) mx = cnt[s] > mx ? cnt[s] : mx;
   for (int s = 0; s < k; ++s) {
@@ -146,7 +146,7 @@ GZP_HD void quantize_counts(const uint32_t* cnt, int k, uint8_t* q) {
 // Expands quantised bytes into frequencies summing to exactly kProbScale,
 // every present symbol getting at least 1. Deterministic integer math so
 // encoder and decoder agree. Returns false if no symbol is present.
-GZP_HD bool normalize_table(const uint8_t* q, int k, uint16_t* freq, uint16_t* cum) {
+GPUSQZ_HD bool normalize_table(const uint8_t* q, int k, uint16_t* freq, uint16_t* cum) {
   uint32_t total = 0;
   for (int s = 0; s < k; ++s) total += q[s];
   if (total == 0) {
@@ -191,6 +191,6 @@ GZP_HD bool normalize_table(const uint8_t* q, int k, uint16_t* freq, uint16_t* c
   return true;
 }
 
-#undef GZP_HD
+#undef GPUSQZ_HD
 
-} // namespace gzp
+} // namespace gpusqz
