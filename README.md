@@ -1,8 +1,7 @@
 # gpusqz — a GPU file compressor
 
-`gpusqz` (pronounced "GPU squeeze"; formerly `gzp`) compresses and
-decompresses files on an NVIDIA GPU with CUDA. Compressed files use the
-`.gsz` extension by convention. Each
+`gpusqz` (pronounced "GPU squeeze") compresses and decompresses files on
+an NVIDIA GPU with CUDA; compressed files use the `.gsz` extension. Each
 chunk of the input (64KB by default, up to 1MB) is handled by one warp: an
 LZ parse where all 32 lanes search for matches together, followed by a
 32-way interleaved rANS entropy coder with order-1 literal contexts. It's
@@ -238,7 +237,7 @@ now-dead scratch), so the download moves only compressed bytes.
 ### Container format (`src/format.h`)
 
 ```
-FileHeader    { magic="GSQZ", version=5, chunk_size, original_size, chunk_count,
+FileHeader    { magic="GSQZ", version=1, chunk_size, original_size, chunk_count,
                 table_group_count, tables_offset }
 ChunkEntry[]  { offset, compressed_size, original_size }     -- one per chunk
 TableGroup[]  { start_chunk, chunk_count, lit_ctx_shift }    -- one per compression batch
@@ -256,10 +255,6 @@ plus 256 per literal context, so their size depends on the group's
 come after the payload rather than in the directory. The decoder checks
 that the payload runs exactly from the end of the directory to
 `tables_offset` and that the table section ends the file.
-
-Files written before the rename from `gzp` carry the magic "GZGP"
-instead of "GSQZ" but are otherwise identical; both decoders accept
-either (`tests/fixtures/text__legacy_magic.gsz` checks that).
 
 ## Installing
 
@@ -306,7 +301,7 @@ needed; that is how the macOS package is made. `cpack -G DEB`, `RPM`,
 `GPUSQZ_MIN_BLOCKS_PER_SM=<n>` (a CMake cache var, not a runtime flag) sets
 `__launch_bounds__`'s `minBlocksPerSM` hint on the per-chunk kernels, for
 A/B occupancy testing — see the comment above it in `CMakeLists.txt`. None
-of those kernels use shared memory, and at 38 (parse), 64 (encode) and 58
+of those kernels use shared memory, and at 40 (parse), 62 (encode) and 58
 (decode) registers per thread with no spills (`nvcc -Xptxas -v`), their
 one-warp blocks are limited by the per-SM block count rather than by
 registers, so this knob is mainly a regression check against future
@@ -338,9 +333,7 @@ Environment variables, all optional:
 |---|---|
 | `GPUSQZ_VERBOSE=1` | Per-stage timing on stderr: setup, fread, copies, kernel time (summed and wall-clock union), fwrite, staging stalls. |
 | `GPUSQZ_FORCE_BATCH=<n>` | Force chunks per batch (testing; see *Testing*). |
-| `GPUSQZ_FORCE_SETS=<1-3>` | Force the device buffer-set count (tuning). |
 | `GPUSQZ_FORCE_LIT_SHIFT=<0\|4\|8>` | Force every batch's literal-context rule (testing and tuning). |
-| `GPUSQZ_DUMP_LITS=<path>` | Dump each chunk's parsed literal stream, for evaluating literal models offline. Serialises the pipeline. |
 
 ## Testing
 

@@ -7,17 +7,13 @@
 #
 #   tests/fixtures/make_fixtures.sh [path/to/gpusqz]
 #
-# The .orig inputs are committed and never regenerated here, so fixtures
-# stay comparable across format versions. *__legacy_*.gsz files are
-# historical outputs kept to check backward compatibility (e.g.
-# text__legacy_magic.gsz, written before the gzp -> gpusqz rename with the
-# old "GZGP" magic) and are never regenerated either.
+# The .orig inputs are committed and never regenerated here.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GPUSQZ="$(realpath "${1:-$HERE/../../build/gpusqz}")"
 cd "$HERE"
-find . -maxdepth 1 \( -name '*.gsz' -o -name '*.gszbad' \) ! -name '*__legacy_*' -delete
+rm -f ./*.gsz ./*.gszbad
 
 c() { # c <name> <variant> [gpusqz args...], env passes through
   local name="$1" variant="$2"

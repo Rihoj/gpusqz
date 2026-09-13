@@ -9,13 +9,9 @@
 //                else:   code 12 + floor(log2 v), floor(log2 v) extra bits
 //   match_len    same coding of v = ml - (kMinMatch - 1) (v = 0 marks a
 //                literals-only final sequence; real matches give v >= 1)
-//   offset       code floor(log2 off), that many extra bits -- except the
-//                top 3 codes (kOffRepBase..kOffRepBase+2), which are never
-//                a real floor(log2 off) for any offset this format allows
-//                and instead mean "reuse the 1st/2nd/3rd most-recently-used
-//                distinct match offset" (zstd-style repeat offsets), with
-//                zero extra bits: see kOffRepBase below and
-//                compute_repeat_codes()/its decode-side mirror in rans.cuh.
+//   offset       code floor(log2 off), that many extra bits; the top 3
+//                codes instead mean "reuse the 1st/2nd/3rd most recent
+//                distinct offset" (zstd-style repeat offsets, no extra bits)
 // Extra bits are written raw (rANS bypass), so there is no side stream.
 #pragma once
 #include <cstdint>
@@ -27,22 +23,16 @@ constexpr uint32_t kProbScale = 1u << kProbBits;
 constexpr uint32_t kRansL = 1u << 16; // state lower bound; 16-bit output words
 constexpr int kLitSyms = 256;
 constexpr int kSmallSyms = 32; // lit_len / match_len / offset alphabets (29, 28, 29 used)
-// Offset codes >= kOffRepBase are repeat-offset codes, not real
-// floor(log2 off) values: kMaxChunkSize (1MB, format.h) caps a real
-// off_code() at floor_log2(1<<20) = 20, comfortably below this.
+// Offset codes >= kOffRepBase are repeat-offset codes. A real off_code() is
+// at most floor_log2(kMaxChunkSize) = 20, so they never collide.
 constexpr uint32_t kOffRepBase = kSmallSyms - 3;
 static_assert(kOffRepBase > 20, "repeat-offset codes must exceed any real off_code() for kMaxChunkSize");
-// Largest lit_len / match_len value len_code() can represent: code
-// 12 + floor(log2 v) must stay below kSmallSyms, so v < 2^(kSmallSyms-12)
-// = 2^20. One real value exceeds it: a kMaxChunkSize (2^20) chunk with no
-// match at all is a single literal run of exactly 2^20. The encoder
-// detects that and stores such a chunk as Lz tokens instead (whose
-// 255-extension lengths are unbounded); see rans_encode_warp.
+// Largest lit_len / match_len len_code() can represent (its code must stay
+// below kSmallSyms). Only a match-free kMaxChunkSize chunk, one literal run
+// of exactly 2^20, exceeds it; such a chunk is stored as Lz tokens instead.
 constexpr uint32_t kMaxLenValue = (1u << (kSmallSyms - 12)) - 1;
 constexpr int kRansStates = 32;
-// Payload header after the chunk flag: n_seq, n_lit, states. The quantised
-// tables live once per table group (see format.h's TableGroup), not per
-// chunk, so they are not part of this per-chunk header.
+// Per-chunk rANS payload header after the flag byte: n_seq, n_lit, states.
 constexpr int kRansHeaderBytes = 8 + kRansStates * 4;
 
 #ifdef __CUDACC__
@@ -53,24 +43,17 @@ constexpr int kRansHeaderBytes = 8 + kRansStates * 4;
 
 // ---- Order-1 literal contexts ----
 //
-// Literals are coded with one of lit_ctx_count(shift) tables, chosen by the
-// previous literal in the same lane's run: ctx = prev >> shift, so shift 8
-// is plain order-0 (one table), 4 keys on the previous byte's high nibble
-// (16 tables) and 0 on the whole previous byte (256 tables). Each table
-// group (one compression batch) picks its own shift: the compressor always
-// collects the full order-1 histogram, then keeps whichever rule minimises
-// the estimated coded size plus 256 table bytes per context (see
-// build_table_kernel), so incompressible or literal-poor batches don't pay
-// for tables they can't use.
+// Literals are coded with one of lit_ctx_count(shift) tables chosen by the
+// previous literal: ctx = prev >> shift, so shift 8 is order-0 (1 table),
+// 4 keys on the previous byte's high nibble (16) and 0 on the whole byte
+// (256). Each table group picks its shift (see build_table_kernel).
 //
-// For the previous literal to be known to the decoder, each of the 32
-// rANS lanes owns one contiguous run of the chunk's literal stream, not
-// every 32nd literal: lane j owns literals [j*L, min((j+1)*L, n_lit)) with
-// L = lit_run_len(n_lit), and the first literal of every run uses context
-// 0. L is a multiple of 4 so every run starts 4-byte aligned, which lets
-// the decoder store 4 literals at a time. The histogram, the encoder and
-// both decoders all derive contexts from exactly this rule; a mismatch
-// would code a literal with a zero-frequency table entry.
+// So the decoder knows the previous literal, each of the 32 rANS lanes owns
+// one contiguous run of the chunk's literals: lane j owns [j*L, (j+1)*L)
+// with L = lit_run_len(n_lit), and each run's first literal uses context 0.
+// L is a multiple of 4 so runs start 4-byte aligned (the decoder stores 4
+// literals at a time). The histogram, the encoder and both decoders must
+// all follow exactly this rule.
 constexpr uint32_t kLitShiftOrder0 = 8, kLitShiftNibble = 4, kLitShiftByte = 0;
 GPUSQZ_HD bool lit_shift_valid(uint32_t shift) {
   return shift == kLitShiftOrder0 || shift == kLitShiftNibble || shift == kLitShiftByte;
@@ -128,8 +111,8 @@ GPUSQZ_HD uint32_t off_value(uint32_t code, uint32_t bits) { return (1u << code)
 // repeat-offset code (>= kOffRepBase) carries no extra bits at all.
 GPUSQZ_HD uint32_t off_nb(uint32_t code) { return code >= kOffRepBase ? 0 : code; }
 
-// Quantises counts to one byte each for the header: zero iff absent,
-// otherwise 1..255 scaled to the largest count.
+// Quantises counts to one byte each: zero iff absent, else 1..255 scaled
+// to the largest count.
 GPUSQZ_HD void quantize_counts(const uint32_t* cnt, int k, uint8_t* q) {
   uint32_t mx = 0;
   for (int s = 0; s < k; ++s) mx = cnt[s] > mx ? cnt[s] : mx;
@@ -157,9 +140,8 @@ GPUSQZ_HD bool normalize_table(const uint8_t* q, int k, uint16_t* freq, uint16_t
   for (int s = 0; s < k; ++s) {
     uint32_t f = 0;
     if (q[s]) {
-      // Round to nearest: flooring biased every symbol low, e.g. a flat
-      // 256-symbol histogram (q of 254 or 255 each) came out as a noisy mix
-      // of 15s and 16s out of 4096, costing ~1% on such data.
+      // Round to nearest (flooring made a flat histogram a noisy mix of 15s
+      // and 16s out of 4096).
       f = (uint32_t)((((uint64_t)q[s] << kProbBits) + total / 2) / total);
       if (f < 1) f = 1;
     }

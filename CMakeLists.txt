@@ -39,6 +39,8 @@ if(GPUSQZ_BUILD_GPU)
     src/kernels.cu
   )
 
+  # All kernels live in kernels.cu, so no relocatable device code is needed;
+  # with it, the device link step dropped the PTX that lets newer GPUs run.
   set_target_properties(gpusqz PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF
   )
@@ -52,21 +54,10 @@ if(GPUSQZ_BUILD_GPU)
     $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
   )
 
-  # Occupancy A/B testing. The per-chunk kernels carry an explicit
-  # __launch_bounds__, which takes precedence over a bare --maxrregcount,
-  # so that flag alone cannot force fewer registers here;
-  # GPUSQZ_MIN_BLOCKS_PER_SM instead sets __launch_bounds__'s second
-  # (minBlocksPerSM) argument, which does force ptxas to cut register usage
-  # until that many blocks fit (spilling to local memory if it can't).
-  # Compare with e.g.:
-  #   cmake -S . -B build-b2 -DGPUSQZ_MIN_BLOCKS_PER_SM=2 && cmake --build build-b2
-  #   bash bench/run_bench.sh <file>   # vs. a build with this unset
-  # and check `nvcc -Xptxas -v` for registers/spills alongside GPUSQZ_VERBOSE
-  # kernel MB/s. None of the per-chunk kernels use shared memory any more
-  # (the match-finding table moved to global memory), and at 38 (parse), 64
-  # (encode) and 58 (decode) registers per thread with no spills, their
-  # one-warp blocks are limited by the per-SM block count rather than by
-  # registers, so this knob is mainly a regression check.
+  # Occupancy experiments: sets __launch_bounds__'s minBlocksPerSM on the
+  # per-chunk kernels, forcing ptxas to cut registers until that many blocks
+  # fit (a bare --maxrregcount is overridden by __launch_bounds__). Check
+  # `nvcc -Xptxas -v` for spills alongside GPUSQZ_VERBOSE kernel MB/s.
   set(GPUSQZ_MIN_BLOCKS_PER_SM "" CACHE STRING "minBlocksPerSM for __launch_bounds__ on gpusqz's kernels (empty = compiler default)")
   if(GPUSQZ_MIN_BLOCKS_PER_SM)
     target_compile_definitions(gpusqz PRIVATE GPUSQZ_MIN_BLOCKS_PER_SM=${GPUSQZ_MIN_BLOCKS_PER_SM})

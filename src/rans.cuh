@@ -1,43 +1,28 @@
 // Warp-interleaved rANS entropy coder for the parsed LZ stream.
 //
-// 32 rANS states, one per lane, share ONE stream of 16-bit words. Every
-// lane encodes/decodes in lockstep; at each step the lanes that need to
-// renormalise write (or read) their word contiguously in lane order, found
-// with a ballot + popcount, so the stream needs no per-lane offsets. The
-// encoder runs in reverse (last symbol first) writing backward from the
-// end of the slot; the decoder reads forward. With a 2^16 state floor and
-// 16-bit words each step moves at most one word per lane, which is what
-// keeps the encoder's and decoder's step-by-step word counts identical.
+// 32 rANS states, one per lane, share ONE stream of 16-bit words. All lanes
+// step in lockstep; at each step the lanes that need to renormalise write
+// (or read) their word contiguously in lane order, located with a ballot
+// and a popcount, so the stream needs no per-lane offsets. The encoder runs
+// in reverse, writing backward from the end of the slot; the decoder reads
+// forward. With a 2^16 state floor and 16-bit words, each step moves at
+// most one word per lane, which keeps both sides' word counts in step.
 //
-// The frequency tables are NOT part of the per-chunk payload: they are
-// shared by every chunk in the same TableGroup (see format.h), expanded
-// once (expand_group_table, into the layout table_view() describes) and
-// referenced from global memory by every chunk's decode. This removes the
-// per-chunk table overhead an earlier design paid, and also means decode
-// never rebuilds a table per chunk.
+// Tables are not in the per-chunk payload: every chunk of a TableGroup
+// shares them, expanded once per group (expand_group_table).
 //
-// Payload layout (ChunkFlag::LzRans, after the flag byte):
+// Payload (ChunkFlag::LzRans, after the flag byte):
 //   u32 n_seq, u32 n_lit, u32 state[32], u16 words[]
-// Decode order: sequence groups of 32, lane j owning sequence 32g+j
+// Decode order: sequences in groups of 32, lane j owning sequence 32g+j
 // (sub-steps ll_code, ll_bits, ml_code, ml_bits, off_code, off_bits), then
-// the literals, lane j owning one contiguous run of lit_run_len(n_lit) of
-// them so that each literal's context -- the previous literal of its run,
-// see rans_codes.h -- is already decoded in that lane's registers.
+// the literals, lane j owning one contiguous run (see lit_run_len).
 //
-// Offset codes reuse one of the last 3 distinct match offsets (see
-// kOffRepBase, rans_codes.h) when possible, zstd-style, instead of always
-// coding a fresh magnitude -- struct/record-shaped data tends to reuse a
-// handful of strides constantly. That MRU state is inherently sequential
-// (state at sequence i depends on every real offset before it), which
-// the interleaved rANS's own per-group parallel decode doesn't carry
-// across lanes on its own: compute_repeat_codes() (encode side, a
-// forward serial replay over the already-parsed sequences) and
-// rans_decode_warp's inline replay (decode side, a register-only
-// per-group shuffle walk) both reconstruct the same state machine so
-// encode and decode agree without adding any new rANS steps.
+// Repeat offsets (kOffRepBase) need the most-recent-offsets state at every
+// sequence, which is inherently sequential: the encoder computes it in one
+// serial pass (compute_repeat_codes), and the decoder replays it per group
+// of 32 with shuffles. Both use RepOffsets.
 #pragma once
 #include <cstdint>
-#include <initializer_list>
 
 #include "format.h"
 #include "rans_codes.h"
@@ -66,11 +51,10 @@ __device__ __forceinline__ void build_small_lut(const uint16_t* cum, uint8_t* lu
   }
 }
 
-// One group's decode tables, shared by every chunk in a TableGroup. Built
-// once per group (expand_group_table), then read (never written) by every
-// chunk's decode straight out of global memory. The size depends on the
-// file's literal context count (group_table_bytes); table_view() finds the
-// parts within one group's region:
+// One group's decode tables, built once (expand_group_table) and read by
+// every chunk of the group straight from global memory. Their size depends
+// on the group's literal context count (group_table_bytes); table_view()
+// finds the parts within the group's region:
 //   sym[n_ctx][kProbScale]   literal slot -> symbol, per context
 //   freq, cum[quant_bytes(n_ctx)]   indexed like the quantised counts
 //   ll_lut, ml_lut, off_lut[kSmallLutSize]
@@ -104,8 +88,8 @@ __device__ __forceinline__ RansTableView table_view(uint8_t* base, int n_ctx) {
   return v;
 }
 
-// Quantises+normalises table t of n_ctx + 3 (the literal contexts, then the
-// three small alphabets): row base and size in the shared layout.
+// Table t of n_ctx + 3 (the literal contexts, then the three small
+// alphabets): its base and size in the rans_codes.h layout.
 __device__ __forceinline__ void table_row(int t, int n_ctx, int& base, int& k) {
   if (t < n_ctx) {
     base = lit_entry((uint32_t)t, 0);
@@ -116,10 +100,9 @@ __device__ __forceinline__ void table_row(int t, int n_ctx, int& base, int& k) {
   }
 }
 
-// Quantises a batch-wide histogram (as accumulated by accumulate_hist) into
-// the q[] bytes stored in the file for this TableGroup, and expands them
-// into freq/cum for the encoder to use directly. One block, called once
-// per batch; each thread handles whole tables (up to 259 of them).
+// Quantises a batch histogram into the counts stored in the file and
+// expands them into the encoder's freq/cum. One block; each thread handles
+// whole tables.
 __device__ inline void build_batch_table(const uint32_t* cnt, int n_ctx, uint8_t* q_out, uint16_t* freq,
                                          uint16_t* cum) {
   for (int t = threadIdx.x; t < n_ctx + 3; t += blockDim.x) {
@@ -130,12 +113,8 @@ __device__ inline void build_batch_table(const uint32_t* cnt, int n_ctx, uint8_t
   }
 }
 
-// Expands one group's quantised bytes into its decode tables. One block
-// per group. Callers must zero the region first: a table whose counts are
-// all zero (a context no literal used, or a group with no LzRans chunks)
-// leaves freq/cum/sym untouched, which is fine as long as they started
-// zeroed -- a zero frequency is then what flags a corrupt chunk that
-// decodes against one.
+// Expands one group's quantised counts into its decode tables; one block
+// per group. The region must be zeroed first (see launch_expand_group_tables).
 __device__ inline void expand_group_table(const uint8_t* q, int n_ctx, uint8_t* region) {
   RansTableView v = table_view(region, n_ctx);
   for (int t = threadIdx.x; t < n_ctx + 3; t += blockDim.x) {
@@ -171,47 +150,39 @@ __device__ __forceinline__ void store_u32(uint8_t* p, uint32_t v) {
   p[3] = (uint8_t)(v >> 24);
 }
 
-// Serially replays the zstd-style 3-slot MRU repeat-offset state forward
-// over this chunk's already-parsed sequences, writing rep_code[i] for
-// every match sequence (ml != 0): 0 means "code seqs[i].off() explicitly",
-// 1/2/3 means "reuse the 1st/2nd/3rd most-recently-used distinct offset"
-// (see kOffRepBase, rans_codes.h). rep_code[i] is left unset for literal-
-// only sequences (ml == 0); callers must not read it there.
-//
-// This has to be a genuine forward-order serial replay, not a per-group
-// parallel one: the encoder needs the exact state decode will reconstruct
-// at each sequence, decode reads sequences in ascending order, and the
-// state at sequence i depends on every real offset before it, including
-// ones the interleaved rANS group loop would otherwise decode in
-// parallel with i (see rans_decode_warp's own replay of this same state
-// machine over an already-decoded group, which faces the same
-// constraint from the decode side). One lane does this; it is O(n_seq)
-// but each step is a handful of scalar compares -- tiny next to the LZ
-// parse that produced `seqs`.
+// The 3 most recent distinct match offsets (zstd-style repeat offsets).
+// Slot 0..2 means "reuse that recent offset"; kRepNew means a new one.
+constexpr uint32_t kRepNew = 3;
+struct RepOffsets {
+  uint32_t r0 = 0, r1 = 0, r2 = 0; // 0 never matches: real offsets are >= 1
+  __device__ __forceinline__ uint32_t find(uint32_t off) const {
+    return off == r0 ? 0 : off == r1 ? 1 : off == r2 ? 2 : kRepNew;
+  }
+  __device__ __forceinline__ uint32_t get(uint32_t slot) const { return slot == 0 ? r0 : slot == 1 ? r1 : r2; }
+  // Moves `off`, found in `slot` (or kRepNew), to the front. Written as
+  // selects, not branches: the decoder runs this 32 times per group.
+  __device__ __forceinline__ void use(uint32_t slot, uint32_t off) {
+    bool front = slot == 0;
+    r2 = slot >= 2 ? r1 : r2;
+    r1 = front ? r1 : r0;
+    r0 = front ? r0 : off;
+  }
+};
+
+// Writes rep_code[i] for every match sequence: 0 = code the offset
+// explicitly, 1..3 = reuse the 1st/2nd/3rd recent offset. Serial, on lane
+// 0: the state at sequence i depends on every offset before it.
 __device__ inline void compute_repeat_codes(const SeqRec* seqs, uint32_t n_seq, uint8_t* rep_code) {
   int lane = threadIdx.x & 31;
   if (lane == 0) {
-    uint32_t r0 = 0, r1 = 0, r2 = 0; // 0 never matches: real offsets are >= 1
+    RepOffsets rep;
     for (uint32_t i = 0; i < n_seq; ++i) {
-      uint32_t ml = seqs[i].ml(), off = seqs[i].off();
+      uint32_t off = seqs[i].off();
       uint8_t code = 0;
-      if (ml) {
-        if (off == r0) {
-          code = 1;
-        } else if (off == r1) {
-          code = 2;
-          r1 = r0;
-          r0 = off;
-        } else if (off == r2) {
-          code = 3;
-          r2 = r1;
-          r1 = r0;
-          r0 = off;
-        } else {
-          r2 = r1;
-          r1 = r0;
-          r0 = off;
-        }
+      if (seqs[i].ml()) {
+        uint32_t slot = rep.find(off);
+        if (slot != kRepNew) code = (uint8_t)(slot + 1);
+        rep.use(slot, off);
       }
       rep_code[i] = code;
     }
@@ -219,37 +190,27 @@ __device__ inline void compute_repeat_codes(const SeqRec* seqs, uint32_t n_seq, 
   __syncwarp();
 }
 
-// Adds one chunk's symbol counts into a batch-wide histogram
-// (quant_bytes(lit_ctx_count(lit_shift)) entries, in the layout of
-// rans_codes.h) via atomics, so every chunk in a host batch can contribute to
-// one shared table. Call once per chunk, all lanes, after that chunk's LZ
-// parse has filled `seqs`/`lits` and compute_repeat_codes has filled
-// `rep_code`.
+// Adds one chunk's symbol counts to the batch histogram (kMaxQuantBytes
+// entries: the full order-1 literal histogram, which build_table_kernel
+// folds to the batch's context rule). Callers skip chunks that can't be
+// rANS-coded (see parse_hist_kernel), so every lit_len fits the alphabet.
 __device__ inline void accumulate_hist(const SeqRec* seqs, uint32_t n_seq, const uint8_t* rep_code,
-                                       const uint8_t* lits, uint32_t n_lit, uint32_t lit_shift,
-                                       uint32_t* batch_cnt) {
+                                       const uint8_t* lits, uint32_t n_lit, uint32_t* batch_cnt) {
   int lane = threadIdx.x & 31;
-  // Literals: each lane walks its own run in order, with the same context
-  // rule the encoder and decoders use (see lit_run_len, rans_codes.h).
+  // Literals: each lane walks its own run, as the encoder will.
   uint32_t run_len = lit_run_len(n_lit);
   uint32_t run0 = lane * run_len, run_end = min(n_lit, run0 + run_len);
   uint32_t prev = 0;
   for (uint32_t i = run0; i < run_end; ++i) {
     uint32_t sym = lits[i];
-    atomicAdd(&batch_cnt[lit_entry(lit_ctx(prev, lit_shift), sym)], 1u);
+    atomicAdd(&batch_cnt[lit_entry(lit_ctx(prev, kLitShiftByte), sym)], 1u);
     prev = sym;
   }
   for (uint32_t i = lane; i < n_seq; i += 32) {
     SeqRec r = seqs[i];
     uint32_t c, nb, b;
-    // A literal run too long for the ll alphabet (only possible for a
-    // match-free kMaxChunkSize chunk, see kMaxLenValue) would index past
-    // the ll table into the ml one. That chunk never uses rANS, so just
-    // leave its run out of the histogram.
-    if (r.lit_len() <= kMaxLenValue) {
-      len_code(r.lit_len(), c, nb, b);
-      atomicAdd(&batch_cnt[kLlBase + c], 1u);
-    }
+    len_code(r.lit_len(), c, nb, b);
+    atomicAdd(&batch_cnt[kLlBase + c], 1u);
     len_code(r.ml() ? (uint32_t)r.ml() - (kMinMatch - 1) : 0, c, nb, b);
     atomicAdd(&batch_cnt[kMlBase + c], 1u);
     if (r.ml()) {
@@ -300,20 +261,10 @@ __device__ __forceinline__ bool rans_enc_bits16(uint32_t& x, bool active, uint32
   return true;
 }
 
-// Encodes nb raw ("bypass") bits, nb possibly > 16 now that wide chunks
-// give length/offset codes up to kSmallSyms-1, needing up to ~19 extra
-// bits (kSmallLutBits assumes < 32; this comfortably fits under that).
-// Split into an explicit low-16-bit step (encoded first) and a high-
-// remainder step (encoded second, at most 16 bits since nb is capped well
-// under 32); decode reads in the opposite call order, so it sees the high
-// chunk first and the low chunk second, matching how it reassembles them.
-//
-// Both rans_enc_bits16 calls below are made by every lane every time
-// (their own nb may be 0, a harmless no-op), never skipped based on this
-// lane's own nb: rans_enc_bits16 -> rans_enc_flush -> __ballot_sync
-// requires every lane in the mask to reach the same call, so nb (which
-// can differ per lane, since it comes from each lane's own decoded
-// symbol) must never gate which calls execute, only what they encode.
+// Encodes nb (up to 20) raw bits as a low-16-bit step, then the rest; the
+// decoder reads them in the opposite order. Every lane makes both calls
+// whatever its own nb (0 is a no-op): each contains a ballot that every
+// lane must reach.
 __device__ __forceinline__ bool rans_enc_bits(uint32_t& x, bool active, uint32_t nb, uint32_t bits, uint16_t*& wp,
                                               const uint16_t* wlimit) {
   uint32_t lo_nb = nb > 16 ? 16 : nb;
@@ -322,13 +273,11 @@ __device__ __forceinline__ bool rans_enc_bits(uint32_t& x, bool active, uint32_t
   return rans_enc_bits16(x, active, hi_nb, bits >> 16, wp, wlimit);
 }
 
-// Encodes a chunk already parsed into `seqs`/`lits` against tables shared
-// by its whole batch (freq/cum, in the layout of rans_codes.h, with
-// lit_ctx_count(lit_shift) literal contexts). `rep_code` is
-// compute_repeat_codes()'s output for these same `seqs`. Words are written
-// backward from the end of the slot and the header is placed right before
-// them, so the payload starts at *out_start within the slot. The caller
-// guarantees in_len > kRansHeaderBytes + 1.
+// Encodes a parsed chunk against its batch's freq/cum (literal-context rule
+// lit_shift). Words are written backward from the end of the slot with the
+// header just before them, so the payload starts at *out_start. Returns
+// false if the result would not beat raw storage. Requires in_len >
+// kRansHeaderBytes + 1 and a chunk that passed rans_eligible (kernels.cu).
 __device__ inline bool rans_encode_warp(const SeqRec* seqs, uint32_t n_seq, const uint8_t* rep_code,
                                         const uint8_t* lits, uint32_t n_lit, uint32_t lit_shift,
                                         const uint16_t* freq, const uint16_t* cum, uint8_t* slot,
@@ -344,15 +293,8 @@ __device__ inline bool rans_encode_warp(const SeqRec* seqs, uint32_t n_seq, cons
   uint16_t* wp = slot_end;
   uint32_t x = kRansL;
 
-  // Match lengths are always <= kMaxLenValue (a match starts at p >= 1), but
-  // a match-free kMaxChunkSize chunk is one literal run of 2^20, one past
-  // what the ll alphabet can code. Such a chunk falls back to Lz tokens.
-  bool too_long = false;
-  for (uint32_t i = lane; i < n_seq; i += 32) too_long |= seqs[i].lit_len() > kMaxLenValue;
-  if (__any_sync(kFullMask, too_long)) return false;
-
-  // Literals, last step first; lane j owns the run starting at j * run_len
-  // and codes each literal in the context of the one before it in that run.
+  // Literals, last step first, each in the context of the one before it
+  // in its lane's run.
   uint32_t run_len = lit_run_len(n_lit);
   for (int t = (int)run_len - 1; t >= 0; --t) {
     uint32_t idx = lane * run_len + (uint32_t)t;
@@ -441,8 +383,7 @@ __device__ __forceinline__ uint32_t rans_dec_small(uint32_t& x, const uint16_t* 
   return s;
 }
 
-// Decodes at most 16 raw ("bypass") bits in one step, renormalising once
-// afterward. See rans_dec_bits for the wider-nb wrapper around this.
+// Decodes at most 16 raw bits, then renormalises.
 __device__ __forceinline__ bool rans_dec_bits16(uint32_t& x, bool active, uint32_t nb, uint32_t& out,
                                                 const uint8_t*& rp, const uint8_t* rend) {
   bool on = active && nb != 0;
@@ -451,19 +392,8 @@ __device__ __forceinline__ bool rans_dec_bits16(uint32_t& x, bool active, uint32
   return rans_dec_renorm(x, on, rp, rend);
 }
 
-// Decodes nb raw ("bypass") bits, renormalising as needed. Mirrors
-// rans_enc_bits's split: for nb > 16 (possible now that wide chunks give
-// length/offset codes needing up to ~19 extra bits), a single renorm can
-// only ever supply one 16-bit word, so the high (nb-16) bits are decoded
-// first and the low 16 bits second — the reverse of encode's call order,
-// which is what lets the two sides' bit chunks line up.
-//
-// Both rans_dec_bits16 calls below are made by every lane every time
-// (their own width may be 0, a harmless no-op), never skipped based on
-// this lane's own nb: rans_dec_bits16 -> rans_dec_renorm -> __ballot_sync
-// requires every lane in the mask to reach the same call, so nb (which
-// can differ per lane, since it comes from each lane's own decoded
-// symbol) must never gate which calls execute, only what they decode.
+// Decodes nb raw bits: the high part first, then the low 16, mirroring
+// rans_enc_bits. As there, every lane makes both calls.
 __device__ __forceinline__ bool rans_dec_bits(uint32_t& x, bool active, uint32_t nb, uint32_t& out,
                                               const uint8_t*& rp, const uint8_t* rend) {
   uint32_t hi_nb = nb > 16 ? nb - 16 : 0;
@@ -475,10 +405,9 @@ __device__ __forceinline__ bool rans_dec_bits(uint32_t& x, bool active, uint32_t
   return true;
 }
 
-// Decodes the sequence and literal streams into scratch, using an
-// already-expanded group table `t`. Rejects any malformed input (empty
-// tables in use, truncated or over-long streams) without touching memory
-// beyond the scratch bounds.
+// Decodes the sequences and literals into scratch using the group's tables
+// `t`. Rejects malformed input (zero-frequency symbols, truncated or
+// over-long streams) without writing beyond the scratch bounds.
 __device__ inline bool rans_decode_warp(const uint8_t* payload, uint32_t len, const RansTableView& t,
                                         uint32_t lit_shift, SeqRec* seqs, uint32_t max_seq, uint8_t* lits,
                                         uint32_t max_lit, uint32_t* n_seq_out, uint32_t* n_lit_out) {
@@ -491,11 +420,7 @@ __device__ inline bool rans_decode_warp(const uint8_t* payload, uint32_t len, co
   const uint8_t* rp = payload + kRansHeaderBytes;
   const uint8_t* rend = payload + len;
   bool bad = false;
-  // Repeat-offset MRU state, carried across groups. Every lane keeps an
-  // identical copy, advanced by the register-only replay below -- see
-  // compute_repeat_codes for why this can't just fall out of the
-  // group's normal per-lane-parallel decode.
-  uint32_t rep0 = 0, rep1 = 0, rep2 = 0;
+  RepOffsets rep; // identical in every lane, advanced by the replay below
 
   for (uint32_t g = 0; g < (n_seq + 31) / 32; ++g) {
     uint32_t idx = g * 32 + lane;
@@ -526,57 +451,38 @@ __device__ inline bool rans_decode_warp(const uint8_t* payload, uint32_t len, co
     if (!rans_dec_renorm(x, has_off, rp, rend)) return false;
     if (!rans_dec_bits(x, has_off, off_nb(oc), ob, rp, rend)) return false;
 
-    // Resolve this group's offsets: every lane replays the same forward
-    // MRU walk over all 32 (has_off, oc, ob) triples via shuffles,
-    // keeping only its own lane's result -- see compute_repeat_codes.
+    // Resolve the group's offsets: every lane replays the recent-offset
+    // state over all 32 sequences in order, keeping its own lane's result.
     uint32_t off = 0;
-    {
-      uint32_t r0 = rep0, r1 = rep1, r2 = rep2;
-      for (int j = 0; j < 32; ++j) {
-        bool j_has = __shfl_sync(kFullMask, has_off, j);
-        uint32_t j_oc = __shfl_sync(kFullMask, oc, j);
-        uint32_t j_ob = __shfl_sync(kFullMask, ob, j);
-        uint32_t jo = 0;
-        if (j_has) {
-          if (j_oc >= kOffRepBase) {
-            uint32_t slot = j_oc - kOffRepBase;
-            jo = slot == 0 ? r0 : slot == 1 ? r1 : r2;
-            if (slot == 1) {
-              r1 = r0;
-              r0 = jo;
-            } else if (slot == 2) {
-              r2 = r1;
-              r1 = r0;
-              r0 = jo;
-            }
-          } else {
-            jo = off_value(j_oc, j_ob);
-            r2 = r1;
-            r1 = r0;
-            r0 = jo;
-          }
+    for (int j = 0; j < 32; ++j) {
+      bool j_has = __shfl_sync(kFullMask, has_off, j);
+      uint32_t j_oc = __shfl_sync(kFullMask, oc, j);
+      uint32_t j_ob = __shfl_sync(kFullMask, ob, j);
+      uint32_t jo = 0;
+      if (j_has) {
+        if (j_oc >= kOffRepBase) {
+          jo = rep.get(j_oc - kOffRepBase);
+          rep.use(j_oc - kOffRepBase, jo);
+        } else {
+          jo = off_value(j_oc, j_ob);
+          rep.use(kRepNew, jo);
         }
-        if (j == lane) off = jo;
       }
-      rep0 = r0;
-      rep1 = r1;
-      rep2 = r2;
+      if (j == lane) off = jo;
     }
 
     if (act) {
       if (ml == 0 && idx != n_seq - 1) bad = true;
-      // A match can never be longer, or reach further back, than the chunk
-      // itself. Checked here, before packing into SeqRec's 21-bit fields,
-      // so a corrupt offset is rejected rather than silently truncated.
+      // Reject lengths/offsets beyond the chunk before packing them into
+      // SeqRec's 21-bit fields.
       if (ml > max_lit || (has_off && off > max_lit)) bad = true;
       seqs[idx] = SeqRec{len_value(llc, llb), has_off ? off : 0, ml};
     }
     if (__any_sync(kFullMask, bad)) return false;
   }
 
-  // Literals: lane j decodes its own run in order (see lit_run_len), the
-  // previous literal of the run giving the context. Runs start 4-byte
-  // aligned, so each lane packs 4 literals and stores them as one word.
+  // Literals: each lane decodes its own run in order, the previous literal
+  // giving the context, and stores them 4 at a time (runs are 4-aligned).
   uint32_t run_len = lit_run_len(n_lit);
   uint32_t run0 = lane * run_len;
   uint32_t prev = 0, pack = 0;

@@ -9,10 +9,8 @@ namespace gpusqz {
 
 constexpr int kBlockThreads = kWarpsPerBlock * 32;
 
-// GPUSQZ_MIN_BLOCKS_PER_SM (set via CMake's GPUSQZ_MIN_BLOCKS_PER_SM cache var)
-// forces ptxas to keep register usage low enough for that many blocks per
-// SM, for A/B occupancy testing. Left unset, __launch_bounds__ takes only
-// the thread-count argument and ptxas picks registers freely.
+// GPUSQZ_MIN_BLOCKS_PER_SM (a CMake option) makes ptxas keep register use
+// low enough for that many blocks per SM, for occupancy experiments.
 #ifdef GPUSQZ_MIN_BLOCKS_PER_SM
 #define GPUSQZ_LAUNCH_BOUNDS __launch_bounds__(kBlockThreads, GPUSQZ_MIN_BLOCKS_PER_SM)
 #else
@@ -27,36 +25,33 @@ __device__ __forceinline__ void chunk_scratch(uint8_t* scratch, uint32_t c, uint
   lits = base + scratch_lits_offset(chunk_size);
 }
 
-// Size of the plain token stream (ChunkFlag::Lz payload) for these
-// sequences; warp-collective, every lane gets the total.
-__device__ __forceinline__ uint32_t token_stream_bytes(const SeqRec* seqs, uint32_t n_seq) {
+// Whether a parsed chunk could end up rANS-coded, and the size of its plain
+// token stream (ChunkFlag::Lz payload); warp-collective. rANS is ruled out
+// by a token stream shorter than a rANS header (rANS is kept only if it is
+// no bigger than the tokens) or by a literal run too long for its length
+// alphabet (kMaxLenValue). Both kernels below use this one test: such
+// chunks stay out of the batch histogram and never try rANS.
+__device__ __forceinline__ bool rans_eligible(const SeqRec* seqs, uint32_t n_seq, uint32_t& token_bytes) {
   int lane = threadIdx.x & 31;
   uint32_t tot = 0;
+  bool too_long = false;
   for (uint32_t i = lane; i < n_seq; i += 32) {
     SeqRec r = seqs[i];
     tot += seq_size(r.lit_len(), r.ml());
+    too_long |= r.lit_len() > kMaxLenValue;
   }
   for (int o = 16; o > 0; o >>= 1) tot += __shfl_xor_sync(kFullMask, tot, o);
-  return tot;
+  token_bytes = tot;
+  return !__any_sync(kFullMask, too_long) && tot >= (uint32_t)kRansHeaderBytes;
 }
 
-// rANS is kept only if its payload (kRansHeaderBytes plus the stream) is no
-// bigger than the token stream, so a token stream shorter than the header
-// alone rules it out.
-__device__ __forceinline__ bool rans_may_win(uint32_t token_bytes) { return token_bytes >= (uint32_t)kRansHeaderBytes; }
-
 // ---------------------------------------------------------------------------
-// Compress: 3 kernels sharing one rANS table per batch. Each chunk still
-// individually falls back to a plain LZ token stream, then to Raw storage,
-// whichever is smallest — see rans_encode_kernel.
+// Compress: parse + histogram, build the batch's tables, encode.
 // ---------------------------------------------------------------------------
 
-// One warp per chunk. in_len <= 1 chunks are finalized here directly (Raw)
-// since they never reach the encode kernel. Others are parsed into scratch
-// and contribute to the batch histogram; n_seq[c]/n_lit[c] record how much
-// of scratch is valid so the encode kernel doesn't need to re-parse.
-// htab is chunk_count * hash_table_bytes(chunk_size) of global memory (see
-// kernels.h): chunk c's region starts at htab + c * hash_table_words.
+// One warp per chunk. Chunks of at most 1 byte are stored raw right here.
+// Others are parsed into scratch (n_seq/n_lit record how much) and, if they
+// could be rANS-coded, counted into the batch histogram.
 __global__ void GPUSQZ_LAUNCH_BOUNDS
 parse_hist_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, const uint32_t* in_lens,
                   uint8_t* out, uint32_t out_slot_stride, uint32_t* out_start, uint32_t* out_sizes,
@@ -89,29 +84,14 @@ parse_hist_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, 
   uint32_t hash_words = (1u << hash_bits) * (uint32_t)kBucketWays;
   SeqEmitter em{chunk_in, seqs, lits};
   lz_parse_warp(chunk_in, in_len, htab + (size_t)c * hash_words, (int)hash_bits, em);
-  // A chunk that can never end up rANS-coded stays out of the batch
-  // histogram: its symbols would only skew the shared tables, and the
-  // literal-context choice, towards data that never uses them. That is a
-  // token stream shorter than a rANS header (rans_encode_kernel applies the
-  // same test), or a literal run too long for the length alphabet
-  // (rans_encode_warp's too_long, see kMaxLenValue).
-  bool too_long = false;
-  for (uint32_t i = lane; i < em.n_seq; i += 32) too_long |= seqs[i].lit_len() > kMaxLenValue;
-  if (__any_sync(kFullMask, too_long) || !rans_may_win(token_stream_bytes(seqs, em.n_seq))) {
-    if (lane == 0) {
-      n_seq_arr[c] = em.n_seq;
-      n_lit_arr[c] = em.n_lit;
-    }
-    return;
-  }
-  compute_repeat_codes(seqs, em.n_seq, rep_code);
-  // Always the full order-1 histogram; build_table_kernel folds it down
-  // to whichever context rule this batch ends up using.
-  accumulate_hist(seqs, em.n_seq, rep_code, lits, em.n_lit, kLitShiftByte, batch_cnt);
   if (lane == 0) {
     n_seq_arr[c] = em.n_seq;
     n_lit_arr[c] = em.n_lit;
   }
+  uint32_t token_bytes;
+  if (!rans_eligible(seqs, em.n_seq, token_bytes)) return;
+  compute_repeat_codes(seqs, em.n_seq, rep_code);
+  accumulate_hist(seqs, em.n_seq, rep_code, lits, em.n_lit, batch_cnt);
 }
 
 // Bits to code a 256-symbol histogram row with the table the encoder would
@@ -130,21 +110,13 @@ __device__ float row_coded_bits(const uint32_t* row) {
   return b;
 }
 
-// One block, launched once per batch. Picks this batch's literal-context
-// rule (rans_codes.h) from its full order-1 histogram, folds the histogram
-// down to that rule, then quantises+normalises it into freq/cum for the
-// encode kernel and q[] for the host to store in this batch's TableGroup.
-//
-// The rule minimises (estimated literal bits) + 8 * (256 table bytes per
-// context), each estimate being what the folded counts cost under the
-// tables they would get (row_coded_bits): order-1 on the whole previous
-// byte wins on large text batches, while incompressible or literal-poor
-// batches keep one table and pay nothing for the other 255. Chunks that
-// can't end up rANS-coded are already out of the histogram (see
-// parse_hist_kernel); counting them once made `yes`-style text pick 16
-// contexts that no chunk used, 0.8% larger. forced_shift >= 0 skips the choice
-// (GPUSQZ_FORCE_LIT_SHIFT, for tests). The cost sums run in a fixed order, so
-// the choice -- and so the output -- is deterministic.
+// One block per batch. Picks the batch's literal-context rule from its full
+// order-1 histogram, folds the histogram to that rule, and builds the
+// tables (freq/cum for the encoder, q for the file). The rule minimises
+// estimated literal bits (row_coded_bits) plus 8 * 256 table bytes per
+// context, so literal-poor or incompressible batches keep a single table.
+// forced_shift >= 0 skips the choice (GPUSQZ_FORCE_LIT_SHIFT, tests). The
+// costs are summed in a fixed order, so the output is deterministic.
 constexpr int kTableThreads = 256;
 __global__ void __launch_bounds__(kTableThreads)
 build_table_kernel(uint32_t* cnt, int forced_shift, uint32_t* shift_out, uint8_t* q_out, uint16_t* freq,
@@ -203,9 +175,8 @@ build_table_kernel(uint32_t* cnt, int forced_shift, uint32_t* shift_out, uint8_t
   build_batch_table(cnt, n_ctx, q_out, freq, cum);
 }
 
-// One warp per chunk (skips in_len <= 1 chunks, already finalized). Tries
-// rANS against the batch's shared table, then plain tokens, then raw,
-// keeping whichever is smallest.
+// One warp per chunk (chunks of at most 1 byte are already stored). Keeps
+// the smallest of rANS against the batch's tables, plain tokens, and raw.
 __global__ void GPUSQZ_LAUNCH_BOUNDS
 rans_encode_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, const uint32_t* in_lens,
                    uint8_t* out, uint32_t out_slot_stride, uint32_t* out_start, uint32_t* out_sizes,
@@ -227,13 +198,14 @@ rans_encode_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count,
   uint32_t n_seq = n_seq_arr[c], n_lit = n_lit_arr[c];
   uint32_t lit_shift = *lit_shift_p; // chosen by build_table_kernel for this batch
 
-  uint32_t tok_total = token_stream_bytes(seqs, n_seq);
+  uint32_t tok_total;
+  bool eligible = rans_eligible(seqs, n_seq, tok_total);
 
   bool ok = false;
   uint32_t start = 0, size = 0;
-  // Same test as parse_hist_kernel: such a chunk contributed nothing to the
-  // batch tables, so it must not try to use them either.
-  if (in_len > (uint32_t)kRansHeaderBytes + 1 && rans_may_win(tok_total)) {
+  // An ineligible chunk contributed nothing to the batch tables, so it
+  // must not use them either.
+  if (eligible && in_len > (uint32_t)kRansHeaderBytes + 1) {
     ok = rans_encode_warp(seqs, n_seq, rep_code, lits, n_lit, lit_shift, freq, cum, slot, out_slot_stride, in_len,
                           &start, &size);
     if (ok && 1 + tok_total < size) ok = false;

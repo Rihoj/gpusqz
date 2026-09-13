@@ -4,13 +4,13 @@
 // chunk is LZ-compressed (or stored raw if that doesn't help) by one CUDA
 // warp. See README.md for the format and the tradeoffs.
 //
-// Host side, batches of chunks live only in device memory (a ring of up to
-// kMaxSets device buffer sets, each with its own stream). File data moves
-// through a small, fixed pool of pinned staging buffers instead: the main
-// thread freads into an input stage and copies it up asynchronously, and a
-// writer thread drains output stages the main thread fills with
-// asynchronous downloads. So batch i+1's read and upload overlap batch i's
-// kernels, and batch i-1's download and file write overlap both.
+// Host side, batches of chunks live only in device memory, in a ring of
+// kSets buffer sets with a stream each. File data moves through a small,
+// fixed pool of pinned staging buffers: the main thread freads into an
+// input stage and uploads it asynchronously, and a writer thread drains the
+// output stages the main thread fills with asynchronous downloads. So batch
+// i+1's read and upload overlap batch i's kernels, and batch i-1's download
+// and file write overlap both.
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -36,43 +36,27 @@ using namespace gpusqz;
 
 namespace {
 
-// Device buffer sets in the ring (see plan_batches). Two measured best: a
-// third only buys concurrent D2H/H2D copies, which PCIe at ~13GB/s doesn't
-// need, and costs a third of each batch's size.
-constexpr int kDefaultSets = 2;
-constexpr int kMaxSets = 3; // upper bound for GPUSQZ_FORCE_SETS
+// Device buffer sets in the ring. A third set would only let uploads and
+// downloads overlap each other, which PCIe doesn't need, at the cost of a
+// third of each batch's size.
+constexpr int kSets = 2;
 
-// Batch sizing (see plan_batches). Every chunk is one warp, and each warp's
-// LZ parse is latency-bound: it sustains only a few MB/s on its own, so
-// kernel throughput is almost exactly proportional to how many chunks are
-// in flight at once. A batch therefore wants at least kMinBatchChunks
-// chunks (and at least kMinBatchBytes of input) whenever the file and the
-// memory budget allow it; kTargetBatches only matters for files so large
-// that even that many chunks would still leave more than kTargetBatches
-// batches. The earlier policy (one-eighth of the file per batch, 1GB
-// budget) left the 1MB `ratio` profile with 32 chunks per batch -- 32 warps
-// on a 36-SM GPU -- and was ~6x slower on that profile for that reason
-// alone.
+// Batch sizing (see plan_batches). A warp's LZ parse is latency-bound at a
+// few MB/s, so kernel throughput follows the chunks in flight: a batch
+// wants at least kMinBatchChunks chunks and kMinBatchBytes of input when
+// the file and the memory budget allow.
 constexpr uint32_t kTargetBatches = 8;
 constexpr uint32_t kMinBatchChunks = 1024;
 constexpr size_t kMinBatchBytes = 32u << 20;
-// GPU memory for batch buffers. By default gpusqz may use kDefaultBudgetPercent
-// of the VRAM free when it starts; --gpu-mem / GPUSQZ_GPU_MEM replace that
-// with an explicit budget, limited only to all but kGpuMemReserve of the
-// free VRAM. Whatever gpusqz takes it allocates once, up front, and holds
-// until it exits, so no other process can claim it mid-run. The budget
-// matters most for the 1MB `ratio` profile, whose chunks need ~6MB of
-// device memory each; the smaller profiles' batches are bounded by
-// kMinBatchChunks/kTargetBatches first.
+// GPU memory for batch buffers: by default kDefaultBudgetPercent of the VRAM
+// free at startup; --gpu-mem / GPUSQZ_GPU_MEM set an explicit budget, up to
+// all but kGpuMemReserve of it. It is allocated once and held until exit.
 constexpr size_t kDefaultBudgetPercent = 80;
 constexpr size_t kGpuMemReserve = 256ull << 20;
 size_t g_gpu_mem = 0; // explicit budget in bytes, 0 = automatic
 
-// Pinned staging. Pinning is the expensive part of host allocation under
-// WSL2 (cudaHostAlloc measured ~0.3-0.4s per GB, plus ~0.1s per GB to free
-// at exit, versus ~3ms per GB for cudaMalloc), so batches are sized by
-// device memory alone and host transfers go through this many fixed-size
-// stages, whatever the batch size.
+// Pinned staging, fixed in size whatever the batch: pinning host memory is
+// slow under WSL2 (~0.3-0.4s per GB), unlike cudaMalloc.
 constexpr size_t kStageBytes = 8u << 20;
 constexpr int kInStages = 4;
 constexpr int kOutStages = 8;
@@ -93,10 +77,9 @@ double now_s() {
   return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-// GPUSQZ_VERBOSE=1 prints per-stage timing so we can tell whether a run is
-// bound by file I/O, PCIe copies, or the kernel. GPU stages are measured
-// with per-batch cudaEvents on their own streams, so they stay meaningful
-// when stages overlap; their sums can legitimately exceed wall time.
+// GPUSQZ_VERBOSE=1 prints per-stage timing: whether a run is bound by file
+// I/O, PCIe copies or the kernels. GPU stages are timed with per-batch
+// events, so stages overlap and their sums can exceed wall time.
 enum Mark { kH2d0, kH2d1, kK0, kK1, kD2h0, kD2h1, kMarks };
 
 struct Stats {
@@ -425,15 +408,10 @@ struct Plan {
   int batches = 0;
 };
 
-// Sizes batches from currently-free VRAM (the GPU may be shared) and the
-// file's chunk count. Returns the largest batch we should try; callers
-// halve it if allocation still fails.
-//
-// A file that fits in one or two batches gets the whole budget split over
-// that many sets instead of being cut into smaller ones: kernel throughput
-// follows the chunks in flight (see kMinBatchChunks), and in practice
-// batches on different streams barely overlap on the GPU (the next one is
-// still being read while this one runs), so a bigger batch beats more sets.
+// Sizes batches from free VRAM (the GPU may be shared) and the file's chunk
+// count; callers halve the batch if allocation still fails. A file that fits
+// in one batch gets the whole budget as a single set: batches on different
+// streams barely overlap on the GPU, so a bigger batch beats a second set.
 Plan plan_batches(uint32_t chunk_count, uint32_t chunk_size, size_t dev_bytes_per_chunk) {
   size_t free_bytes = 0, total_bytes = 0;
   check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
@@ -450,23 +428,15 @@ Plan plan_batches(uint32_t chunk_count, uint32_t chunk_size, size_t dev_bytes_pe
   uint32_t min_batch = (uint32_t)std::max<size_t>(1, kMinBatchBytes / chunk_size);
   uint32_t want = std::max({min_batch, kMinBatchChunks, (chunk_count + kTargetBatches - 1) / kTargetBatches});
 
-  // Test-only override: forces compress and decompress to pick different
-  // batch sizes (hence different, misaligned TableGroup boundaries on the
-  // encode side vs. decode-batch boundaries), which is the one scenario
-  // that exercises the per-chunk group_id lookup instead of always
-  // hitting the trivial case where a decode batch sits inside one group.
+  // Tests only: lets compress and decompress use different batch sizes, so
+  // decode batches straddle TableGroup boundaries.
   if (const char* f = std::getenv("GPUSQZ_FORCE_BATCH")) {
     uint32_t forced = (uint32_t)std::strtoul(f, nullptr, 10);
     if (forced >= 1) want = forced;
   }
-  // Tuning-only override of the ring depth (1..kMaxSets).
-  int max_sets = kDefaultSets;
-  if (const char* f = std::getenv("GPUSQZ_FORCE_SETS")) {
-    max_sets = std::clamp((int)std::strtol(f, nullptr, 10), 1, kMaxSets);
-  }
 
   Plan p;
-  for (int s = 1; s <= max_sets; ++s) {
+  for (int s = 1; s <= kSets; ++s) {
     uint32_t mem_max = (uint32_t)std::max<size_t>(1, budget / ((size_t)s * dev_bytes_per_chunk));
     p.batch = std::min({want, mem_max, chunk_count});
     p.batches = (int)((chunk_count + p.batch - 1) / p.batch);
@@ -563,7 +533,6 @@ struct Compressor {
   Writer writer;
   uint64_t payload_offset = 0;
   uint32_t next_chunk = 0;
-  FILE* lit_dump = nullptr; // GPUSQZ_DUMP_LITS=<path>, see dump_literals
 
   void allocate() {
     size_t dev_per_chunk = (size_t)chunk_size + (size_t)slot_stride +
@@ -588,31 +557,6 @@ struct Compressor {
     g_stats.batches = plan.batches;
     g_stats.sets = plan.sets;
     g_stats.batch_chunks = plan.batch;
-  }
-
-  // Debug aid for evaluating literal models offline: with
-  // GPUSQZ_DUMP_LITS=<path>, appends each chunk's parsed literal stream to that
-  // file as a u32 length followed by the bytes. Called between the encode
-  // kernel and the compaction that overwrites scratch; it synchronises the
-  // stream, so it serialises the pipeline and must not be used while
-  // benchmarking.
-  void dump_literals(CompressSet& s) {
-    if (!lit_dump) return;
-    check_cuda(cudaStreamSynchronize(s.stream), "dump literals sync");
-    std::vector<uint32_t> n_lit(s.n);
-    check_cuda(cudaMemcpy(n_lit.data(), s.d_rans_n_lit.p, s.n * sizeof(uint32_t), cudaMemcpyDeviceToHost),
-               "dump n_lit");
-    std::vector<uint8_t> buf;
-    for (uint32_t c = 0; c < s.n; ++c) {
-      uint32_t k = s.h_in_lens.p[c] <= 1 ? 0 : n_lit[c]; // in_len <= 1 chunks never ran the parse
-      buf.resize(k);
-      if (k) {
-        const uint8_t* src = s.d_scratch.p + (size_t)c * scratch_bytes(chunk_size) + scratch_lits_offset(chunk_size);
-        check_cuda(cudaMemcpy(buf.data(), src, k, cudaMemcpyDeviceToHost), "dump lits");
-      }
-      std::fwrite(&k, sizeof(k), 1, lit_dump);
-      std::fwrite(buf.data(), 1, k, lit_dump);
-    }
   }
 
   // Reads batch b's input into s and starts its upload.
@@ -649,7 +593,6 @@ struct Compressor {
     launch_compress(s.d_in.p, chunk_size, n, s.d_in_lens.p, s.d_slots.p, slot_stride, s.d_start.p, s.d_sizes.p,
                     s.d_scratch.p, s.d_htab.p, forced_lit_shift, s.rans_bufs(), st);
     check_cuda(cudaGetLastError(), "compress_kernel launch");
-    dump_literals(s);
     // The encode kernel is done with scratch (same stream), so the packed
     // output reuses it; see compress_scratch_bytes.
     check_cuda(launch_compact(s.d_slots.p, slot_stride, s.d_start.p, s.d_sizes.p, n, s.d_offsets.p, s.d_scratch.p,
@@ -761,10 +704,6 @@ void compress(const std::string& in_path, const std::string& out_path, uint32_t 
     cz.total_size = total_size;
     cz.entries.swap(entries);
     cz.forced_lit_shift = forced_lit_shift();
-    if (const char* p = std::getenv("GPUSQZ_DUMP_LITS")) {
-      cz.lit_dump = std::fopen(p, "wb");
-      if (!cz.lit_dump) die(std::string("cannot open GPUSQZ_DUMP_LITS file: ") + p);
-    }
 
     double t = now_s();
     cz.allocate();
@@ -780,7 +719,6 @@ void compress(const std::string& in_path, const std::string& out_path, uint32_t 
 
     cz.run();
 
-    if (cz.lit_dump) std::fclose(cz.lit_dump);
     entries.swap(cz.entries);
     groups.swap(cz.groups);
     tables.swap(cz.tables);
@@ -1025,7 +963,7 @@ void decompress(const std::string& in_path, const std::string& out_path) {
 
   FileHeader header;
   if (std::fread(&header, sizeof(header), 1, in) != 1) die("truncated header");
-  if (!magic_ok(header.magic)) die("bad magic (not a gpusqz file)");
+  if (header.magic != kMagic) die("bad magic (not a gpusqz file)");
   if (header.version != kVersion) die("unsupported version");
   if (header.chunk_size == 0 || header.chunk_size > kMaxChunkSize) die("corrupt header: bad chunk_size");
 

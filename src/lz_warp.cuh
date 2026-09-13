@@ -22,72 +22,26 @@
 namespace gpusqz {
 
 static_assert(kMinMatch == 3 || kMinMatch == 4, "hashing supports 3- or 4-byte minimum matches");
-// Per-lane match-length cap before cooperative extension. 64 was measured
-// (all three profiles, both benchmark corpora, with occupancy-sized
-// batches): ~0.1% smaller output for 1-3% of compress-kernel throughput.
-//
-// Also measured and rejected in the same round: `const __restrict__` on
-// every kernel pointer (no change in any kernel) and loading the next
-// window's input bytes before the select loop in lz_parse_warp (no
-// change). The parse's cost is the dependent, random hash-bucket and
-// candidate loads, not the sequential input reads, which hit L1.
+// Per-lane match-length cap before cooperative extension (64 measured
+// ~0.1% smaller output for 1-3% slower compression).
 constexpr int kProbe = 32;
-// 4-way set-associative hash table, one u32 chunk-relative position per
-// word (chunk_size can exceed 65536, so positions no longer fit in 16 bits
-// and can't be packed 2-per-word the way an earlier, 64KB-chunk-only
-// design did). Measured against 8-way/256-bucket (same total words, more
-// candidates per bucket instead of more buckets) at the same word count:
-// that was worse on both ratio and speed, so more distinct buckets
-// matters more than deeper chains per bucket for this workload.
-//
-// This table lives in *global* memory now, one region per chunk (sized by
-// hash_table_bits()/hash_table_bytes() in kernels.h), not shared memory --
-// after two failed attempts at growing a shared-memory version:
-//  1. Dynamic shared memory past the 48KB-per-block static limit, up to
-//     64KB. Requesting more than 48KB of shared memory at launch measurably
-//     changes something about the SM's cache behaviour for the *whole*
-//     kernel, not just the table: on a 283MB corpus built by repeating one
-//     5.4MB text block 48x that cost was hidden (compress kernel MB/s
-//     barely moved), but on a genuinely varied 1GB real-file corpus the
-//     SAME growth to 64KB nearly halved compress kernel throughput (349 ->
-//     ~190 MB/s at the 1MB `ratio` profile) for an unchanged, small ~4%
-//     ratio gain. Confirmed the trigger is the bytes actually requested at
-//     launch, not merely raising the kernel's ceiling via
-//     cudaFuncSetAttribute (raising the ceiling to the device's 99KB
-//     opt-in but still launching with 32KB requested measured identically
-//     to never raising it at all).
-//  2. Staying at or under 48KB total (4096 buckets, 3-way instead of
-//     4-way, still fully static, no opt-in involved) still cost real
-//     throughput -- growing shared memory *at all*, even within the
-//     no-opt-in default, reduces how many of this 1-warp-per-block
-//     kernel's blocks fit per SM (basic CUDA occupancy, unrelated to the
-//     opt-in-triggered anomaly above). Measured ~38-52% slower across both
-//     corpora for a ~1-4% ratio gain -- a worse trade than doing nothing.
-// Moving the table out of shared memory entirely sidesteps both costs
-// (this kernel now uses none for the table), at the cost of global-memory
-// latency per probe/insert instead of shared-memory latency -- see
-// hash_table_bits() in kernels.h for the size/growth policy and the
-// README for how this measured against both a repetitive and a varied
-// corpus.
-constexpr int kBucketWays = kHashBucketWays; // kernels.h; must match here since it sizes this table
+// Set-associative hash table, one u32 chunk-relative position per word
+// (more buckets beat deeper buckets at equal size). It lives in global
+// memory, one region per chunk: a bigger shared-memory table cost more in
+// occupancy than it gained (see README, Known limitations).
+constexpr int kBucketWays = kHashBucketWays;
 constexpr int kWarpsPerBlock = 1;
-// How many positions ahead the lazy-match heuristic in lz_parse_warp will
-// look before committing to a match (see there). 1 was the original
-// single-step lookahead. 3 was measured on every profile and both
-// benchmark corpora: output within 0.01% of 2 and no speed change, so a
-// third step essentially never fires under the "clearly longer" rule.
+// How many positions ahead lz_parse_warp's lazy matching looks before
+// committing to a match (zstd's "lazy2"; a third step never paid off).
 constexpr int kLazySteps = 2;
 constexpr unsigned kFullMask = 0xFFFFFFFFu;
 constexpr uint32_t kEmptyPos = 0xFFFFFFFFu;
 
-// One parsed sequence: lit_len literals followed by a match of ml bytes
-// at backward distance off (ml == 0 only for a literals-only tail). Each
-// is at most kMaxChunkSize = 2^20 (lit_len reaches it exactly for a
-// match-free chunk; off and ml stay below it), so all three pack into 21
-// bits of one u64. That is 8 bytes of scratch per sequence instead of 12,
-// which at 1MB chunks is 1MB less device memory per chunk in flight and so
-// more chunks resident per batch (see plan_batches in main.cu). Decode
-// rejects any off or ml above the chunk size before packing one.
+// One parsed sequence: lit_len literals, then a match of ml bytes at
+// backward distance off (ml == 0 only for a literals-only tail). Each field
+// is at most kMaxChunkSize = 2^20, so all three pack into 21 bits of one
+// u64, keeping per-chunk scratch small. Decode rejects any off or ml above
+// the chunk size before packing it.
 struct SeqRec {
   uint64_t v;
   static constexpr uint64_t kMask = (1ull << 21) - 1;
@@ -193,20 +147,19 @@ __device__ __forceinline__ uint32_t warp_extend(const uint8_t* in, uint32_t p, u
   return len;
 }
 
-// Records sequences and copies literals into scratch for a later stage.
+// Records sequences and copies literals into the chunk's scratch.
 struct SeqEmitter {
   const uint8_t* in;
   SeqRec* seqs;
   uint8_t* lits;
   uint32_t n_seq = 0;
   uint32_t n_lit = 0;
-  __device__ __forceinline__ bool operator()(uint32_t lit_start, uint32_t lit_len, uint32_t off, uint32_t ml) {
+  __device__ __forceinline__ void operator()(uint32_t lit_start, uint32_t lit_len, uint32_t off, uint32_t ml) {
     int lane = threadIdx.x & 31;
     if (lane == 0) seqs[n_seq] = SeqRec{lit_len, off, ml};
     for (uint32_t k = lane; k < lit_len; k += 32) lits[n_lit + k] = in[lit_start + k];
     ++n_seq;
     n_lit += lit_len;
-    return true;
   }
 };
 
@@ -224,24 +177,20 @@ __device__ inline bool tokens_from_seqs(const uint8_t* in, const SeqRec* seqs, u
 }
 
 // Parses in[0..n) into sequences, calling emit(lit_start, lit_len, off, ml)
-// for each match (and once more with ml = 0 for any trailing literals).
-// htab is this chunk's (1 << hash_bits) * kBucketWays-word global-memory
-// table (see hash_table_bits(), kernels.h). Returns false as soon as emit
-// does.
+// for each match and once more with ml = 0 for any trailing literals.
+// htab is this chunk's (1 << hash_bits) * kBucketWays-word table.
 //
 // The warp walks the chunk in 32-byte windows. Every lane hashes its own
-// position, probes the four candidates in its bucket (capped at kProbe
-// bytes so per-lane work is bounded), and the window's matches are then
-// selected warp-uniformly with a one-position lazy lookahead; matches
-// that hit the probe cap are extended cooperatively. Candidates only ever
-// come from earlier windows because insertion happens after every lane
-// has read; a repeat that starts and recurs inside the same 32 bytes is
-// picked up from the next window on.
-template <class Emit>
-__device__ inline bool lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* htab, int hash_bits, Emit& emit) {
+// position and probes its bucket's candidates (capped at kProbe bytes so
+// per-lane work is bounded). One lane per bucket then inserts its position,
+// and lanes that found nothing probe again, which catches repeats within
+// the same window. The window's matches are selected warp-uniformly with a
+// kLazySteps lookahead; matches that hit the probe cap are extended
+// cooperatively.
+__device__ inline void lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* htab, int hash_bits, SeqEmitter& emit) {
   int lane = threadIdx.x & 31;
   uint32_t hash_words = (1u << hash_bits) * (uint32_t)kBucketWays;
-  for (uint32_t i = lane; i < hash_words; i += 32) htab[i] = 0xFFFFFFFFu;
+  for (uint32_t i = lane; i < hash_words; i += 32) htab[i] = kEmptyPos;
   __syncwarp();
 
   uint32_t lit_start = 0;
@@ -261,11 +210,9 @@ __device__ inline bool lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* ht
     }
     __syncwarp(); // all reads of htab precede any insert
 
-    // One insert per distinct bucket per window, by the lowest valid lane,
-    // deterministically. Inserting the earliest position lets the later
-    // lanes of this same window find it in the second probe below, so
-    // repeats shorter than a window apart are caught immediately. The new
-    // position becomes the most-recent candidate; the oldest is dropped.
+    // One insert per distinct bucket, by its lowest valid lane (so the
+    // output is deterministic). The new position becomes the most recent
+    // candidate and the oldest is dropped.
     unsigned valid_mask = __ballot_sync(kFullMask, valid);
     unsigned peers = __match_any_sync(kFullMask, h) & valid_mask;
     if (valid && lane == __ffs(peers) - 1) {
@@ -289,14 +236,8 @@ __device__ inline bool lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* ht
       if (!m) break;
       uint32_t j = __ffs(m) - 1;
       uint32_t lj = __shfl_sync(kFullMask, best_len, j);
-      // Lazy match, up to kLazySteps positions ahead: if the next
-      // candidate position has a clearly longer match than the one we're
-      // currently holding, drop this one to a literal and take that one
-      // instead, repeating so a still-better match 2 (or kLazySteps)
-      // positions on isn't missed just because position j+1 was only
-      // marginally better than j. Matches zstd's "lazy2" strategy; kept
-      // to a small fixed step count so this stays a bounded amount of
-      // extra warp-uniform work per window, not a search.
+      // Lazy matching: while the next position's match is longer by more
+      // than one byte, take it instead (up to kLazySteps positions on).
 #pragma unroll
       for (int step = 0; step < kLazySteps; ++step) {
         if (j >= 31 || !((mask >> (j + 1)) & 1)) break;
@@ -308,14 +249,13 @@ __device__ inline bool lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* ht
       uint32_t off = __shfl_sync(kFullMask, best_off, j);
       uint32_t len = lj;
       if (len == (uint32_t)kProbe) len = warp_extend(in, pos + j, off, n, len);
-      if (!emit(lit_start, pos + j - lit_start, off, len)) return false;
+      emit(lit_start, pos + j - lit_start, off, len);
       lit_start = pos + j + len;
       cur = j + len;
     }
     pos += cur > 32 ? cur : 32;
   }
-  if (lit_start < n && !emit(lit_start, n - lit_start, 0, 0)) return false;
-  return true;
+  if (lit_start < n) emit(lit_start, n - lit_start, 0, 0);
 }
 
 __device__ __forceinline__ bool read_ext(const uint8_t* in, uint32_t in_len, uint32_t& ip, uint32_t& v) {
