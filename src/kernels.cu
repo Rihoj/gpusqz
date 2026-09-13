@@ -89,12 +89,15 @@ parse_hist_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, 
   uint32_t hash_words = (1u << hash_bits) * (uint32_t)kBucketWays;
   SeqEmitter em{chunk_in, seqs, lits};
   lz_parse_warp(chunk_in, in_len, htab + (size_t)c * hash_words, (int)hash_bits, em);
-  // A chunk whose plain token stream is shorter than a rANS header can
-  // never end up rANS-coded (rans_encode_kernel applies the same test), so
-  // it stays out of the batch histogram: its symbols would only skew the
-  // shared tables, and the literal-context choice, towards data that never
-  // uses them.
-  if (!rans_may_win(token_stream_bytes(seqs, em.n_seq))) {
+  // A chunk that can never end up rANS-coded stays out of the batch
+  // histogram: its symbols would only skew the shared tables, and the
+  // literal-context choice, towards data that never uses them. That is a
+  // token stream shorter than a rANS header (rans_encode_kernel applies the
+  // same test), or a literal run too long for the length alphabet
+  // (rans_encode_warp's too_long, see kMaxLenValue).
+  bool too_long = false;
+  for (uint32_t i = lane; i < em.n_seq; i += 32) too_long |= seqs[i].lit_len() > kMaxLenValue;
+  if (__any_sync(kFullMask, too_long) || !rans_may_win(token_stream_bytes(seqs, em.n_seq))) {
     if (lane == 0) {
       n_seq_arr[c] = em.n_seq;
       n_lit_arr[c] = em.n_lit;
