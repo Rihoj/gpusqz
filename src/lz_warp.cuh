@@ -26,22 +26,53 @@ constexpr int kProbe = 32; // per-lane match-length cap before cooperative exten
 // 4-way set-associative hash table, one u32 chunk-relative position per
 // word (chunk_size can exceed 65536, so positions no longer fit in 16 bits
 // and can't be packed 2-per-word the way an earlier, 64KB-chunk-only
-// design did). 2048 buckets — 4x an earlier 512-bucket table that fit 4
-// warps' worth of it per block — needs the whole 48KB static shared-memory
-// budget for just one warp's table, so blocks now hold one warp each.
-// Measured against 8-way/256-bucket (same total words, more candidates
-// per bucket instead of more buckets) at the SAME word count: that was
-// worse on both ratio and speed, so more distinct buckets matters more
-// than deeper chains per bucket for this workload. Growing the table
-// further would need dynamic (not static) shared memory to get past the
-// 48KB static limit — not done here, but the natural next lever.
-constexpr int kHashBits = 11;
-constexpr int kHashSize = 1 << kHashBits; // number of buckets
+// design did). Measured against 8-way/256-bucket (same total words, more
+// candidates per bucket instead of more buckets) at the same word count:
+// that was worse on both ratio and speed, so more distinct buckets matters
+// more than deeper chains per bucket for this workload.
+//
+// The table lives in *dynamic* shared memory (see pick_hash_bits() below)
+// rather than a fixed static array, so its size can scale with chunk_size
+// at launch time instead of being pinned to whatever fits one warp's slice
+// of the 48KB static budget. kMinHashBits (11 -> 2048 buckets, 32KB) is
+// that old static-budget figure, kept as the floor so the default 64KB
+// chunk profile is unchanged; larger chunks get a proportionally bigger
+// table, up to whatever the device's opt-in dynamic shared memory limit
+// allows for one warp's block (see kWarpsPerBlock).
+constexpr int kMinHashBits = 11;
 constexpr int kBucketWays = 4;
-constexpr int kHashWords = kHashSize * kBucketWays; // u32 words backing the table, 1 position each
 constexpr int kWarpsPerBlock = 1;
 constexpr unsigned kFullMask = 0xFFFFFFFFu;
 constexpr uint32_t kEmptyPos = 0xFFFFFFFFu;
+
+// Table sizing: start at kMinHashBits and double while doing so still
+// leaves at least ~4 chunk-bytes per hash-table slot (so a bigger chunk
+// gets a bigger table instead of the same fixed window stretched over more
+// data) and still fits in max_smem_bytes (the device's actual dynamic
+// shared memory ceiling for this kernel, queried once at runtime).
+__host__ __device__ inline int pick_hash_bits(uint32_t chunk_size, size_t max_smem_bytes) {
+  int bits = kMinHashBits;
+  for (;;) {
+    size_t next_bytes = (size_t)(1u << (bits + 1)) * kBucketWays * sizeof(uint32_t);
+    uint64_t next_slots = (uint64_t)(1u << (bits + 1)) * kBucketWays;
+    // Zeroing the table is a fixed per-chunk cost independent of how much
+    // the chunk actually needs it, so growing the table only pays off once
+    // a chunk is big enough to amortise that cost against real parsing
+    // work. Measured: at the 32 threshold below, the 256KB `balance`
+    // profile isn't (kernel MB/s dropped ~2x for a ~3% ratio gain when
+    // this was left more aggressive), but the 1MB `ratio` profile clearly
+    // is (>1MB chunks amortise the same fixed cost over 4x more data,
+    // and the byte cap below still limits it to the same table balance
+    // would have used) — so this only grows the table for chunks
+    // meaningfully past the default 64KB and `balance`'s 256KB.
+    if (next_slots * 32 > chunk_size || next_bytes > max_smem_bytes) break;
+    ++bits;
+  }
+  return bits;
+}
+__host__ __device__ inline size_t hash_table_bytes(int hash_bits) {
+  return (size_t)(1u << hash_bits) * kBucketWays * sizeof(uint32_t);
+}
 
 // One parsed sequence: lit_len literals followed by a match of ml bytes
 // at backward distance off (ml == 0 only for a literals-only tail). Both
@@ -57,9 +88,9 @@ __device__ __forceinline__ uint32_t load4(const uint8_t* p) {
   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-__device__ __forceinline__ uint32_t hash_at(const uint8_t* p) {
+__device__ __forceinline__ uint32_t hash_at(const uint8_t* p, int hash_bits) {
   uint32_t v = kMinMatch == 4 ? load4(p) : ((uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16));
-  return (v * 2654435761u) >> (32 - kHashBits);
+  return (v * 2654435761u) >> (32 - hash_bits);
 }
 
 __device__ __forceinline__ uint32_t match_len(const uint8_t* in, uint32_t a, uint32_t b, uint32_t max_len) {
@@ -177,8 +208,9 @@ __device__ inline bool tokens_from_seqs(const uint8_t* in, const SeqRec* seqs, u
 
 // Parses in[0..n) into sequences, calling emit(lit_start, lit_len, off, ml)
 // for each match (and once more with ml = 0 for any trailing literals).
-// htab is this warp's kHashWords-word shared-memory table (kHashSize
-// 4-way buckets). Returns false as soon as emit does.
+// htab is this warp's dynamic-shared-memory table: (1 << hash_bits)
+// 4-way buckets, sized by the caller via pick_hash_bits(). Returns false
+// as soon as emit does.
 //
 // The warp walks the chunk in 32-byte windows. Every lane hashes its own
 // position, probes the four candidates in its bucket (capped at kProbe
@@ -189,9 +221,10 @@ __device__ inline bool tokens_from_seqs(const uint8_t* in, const SeqRec* seqs, u
 // has read; a repeat that starts and recurs inside the same 32 bytes is
 // picked up from the next window on.
 template <class Emit>
-__device__ inline bool lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* htab, Emit& emit) {
+__device__ inline bool lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* htab, int hash_bits, Emit& emit) {
   int lane = threadIdx.x & 31;
-  for (int i = lane; i < kHashWords; i += 32) htab[i] = 0xFFFFFFFFu;
+  uint32_t hash_words = (1u << hash_bits) * kBucketWays;
+  for (uint32_t i = lane; i < hash_words; i += 32) htab[i] = 0xFFFFFFFFu;
   __syncwarp();
 
   uint32_t lit_start = 0;
@@ -203,7 +236,7 @@ __device__ inline bool lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* ht
     uint32_t bucket[kBucketWays]; // only read after being populated below, when valid
     uint32_t best_len = 0, best_off = 0;
     if (valid) {
-      h = hash_at(in + p);
+      h = hash_at(in + p, hash_bits);
 #pragma unroll
       for (int w = 0; w < kBucketWays; ++w) bucket[w] = htab[kBucketWays * h + w];
       uint32_t max_len = min((uint32_t)kProbe, n - p);
