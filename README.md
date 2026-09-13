@@ -1,11 +1,13 @@
 # gzp — a GPU file compressor
 
 `gzp` compresses and decompresses files on an NVIDIA GPU with CUDA. Each
-64KB chunk of the input is handled by one warp: an LZ parse where all 32
-lanes search for matches together, followed by a 32-way interleaved rANS
-entropy coder. It's a from-scratch, educational implementation — not a
-drop-in replacement for zstd — but on text it beats single-threaded
-`gzip -1` on both ratio and speed.
+chunk of the input (64KB by default, up to 1MB) is handled by one warp: an
+LZ parse where all 32 lanes search for matches together, followed by a
+32-way interleaved rANS entropy coder. It's a from-scratch, educational
+implementation — not a drop-in replacement for zstd — but it beats
+single-threaded `gzip -1` on both ratio and speed at every chunk size, and
+at the largest chunk size (`--profile ratio`) it beats `zstd -1`'s ratio
+too.
 
 ## Results
 
@@ -17,51 +19,58 @@ creation); the kernel columns are GPU time only.
 
 | codec | compress MB/s (wall) | kernel MB/s | decompress MB/s (wall) | kernel MB/s | ratio |
 |---|---|---|---|---|---|
-| **gzp** (64KB chunks) | **583** | 1598 | **629** | 3759 | **0.272** |
-| gzip -1 | 149 | – | 262 | – | 0.284 |
-| gzip -6 | 59 | – | 293 | – | 0.231 |
-| zstd -1 (1 thread) | 513 | – | 1400 | – | 0.252 |
-| zstd -3 (1 thread) | 390 | – | 1301 | – | 0.225 |
+| **gzp** (`--profile speed`, 64KB) | **440** | 766 | **731** | 3474 | 0.263 |
+| gzip -1 | 153 | – | 274 | – | 0.284 |
+| gzip -6 | 59 | – | 301 | – | 0.231 |
+| zstd -1 (1 thread) | 552 | – | 1403 | – | 0.252 |
+| zstd -3 (1 thread) | 425 | – | 1366 | – | 0.225 |
 
-gzp beats `gzip -1` on both ratio and speed, and beats `zstd -1`'s ratio
-and compress speed (zstd's hand-tuned decoder is still faster to
-decode). Earlier measurements taken while another process held ~90% of
-the GPU showed much lower and noisier numbers purely from contention —
-`REPEAT=<n>` (see *Benchmarking*) exists because of exactly that.
+gzp beats `gzip -1` on both ratio and speed at every chunk size, and
+beats `zstd -1`'s compress speed here (zstd's hand-tuned decoder is
+still faster to decode). Earlier measurements taken while another
+process held ~90% of the GPU showed much lower and noisier numbers
+purely from contention — `REPEAT=<n>` (see *Benchmarking*) exists
+because of exactly that.
 
-Chunk size trades ratio for per-chunk latency; 64KB is the default and
-the maximum the 16-bit match offsets allow. With the GPU idle, smaller
-chunks turn out to decode substantially faster too (more, smaller units
-of parallel work), so this is a real ratio-vs-speed dial, not just a
-ratio-vs-latency one:
+Chunk size trades ratio for speed — bigger chunks give the match finder
+more history to search, at the cost of fewer, coarser-grained units of
+GPU parallelism. `--profile <name>` (see *Usage*) selects one of three
+presets; `ratio` is the largest chunk this format allows and is the
+only one that beats `zstd -1`'s ratio on this corpus:
 
-| chunk | ratio | compress kernel MB/s | decompress kernel MB/s |
-|---|---|---|---|
-| 16KB | 0.297 | 2372 | 8106 |
-| 32KB | 0.281 | 2073 | 6644 |
-| 64KB | 0.272 | 1585 | 3741 |
+| profile | chunk | ratio | compress kernel MB/s | decompress kernel MB/s |
+|---|---|---|---|---|
+| speed (default) | 64KB | 0.263 | 766 | 3361 |
+| balance | 256KB | 0.253 | 508 | 923 |
+| ratio | 1MB | **0.250** | 252 | 242 |
+
+(`zstd -1`'s ratio on this corpus is 0.252, `zstd -3`'s is 0.225.)
 
 ## How it works
 
 ### Chunks and warps
 
-The input is split into independent, fixed-size chunks (default 64KB).
-One warp — 32 lanes — compresses or decompresses one chunk; a few hundred
-warps are resident on the GPU at once, so batches of a few hundred
-chunks keep it full. There are no cross-chunk references: any chunk can
-be decoded on its own, and a corrupt chunk cannot damage another.
+The input is split into independent, fixed-size chunks (64KB by default,
+up to 1MB — see `--profile` in *Usage*). One warp — 32 lanes — compresses
+or decompresses one chunk; a few hundred warps are resident on the GPU at
+once, so batches of a few hundred chunks keep it full at the default
+chunk size (fewer, larger chunks fill it less well, one reason bigger
+chunks cost speed as well as buying ratio). There are no cross-chunk
+references: any chunk can be decoded on its own, and a corrupt chunk
+cannot damage another.
 
 ### LZ parse (`src/lz_warp.cuh`)
 
 The warp walks a chunk in 32-byte windows. Every lane hashes the 4 bytes
 at its own position, reads a 4-way bucket from a per-warp shared-memory
-hash table (1024 buckets, four 16-bit positions each, packed two per u32
-word — 8KB per warp total, same footprint as an earlier 2-way/2048-bucket
-design that measured worse) and compares against all four candidates,
-capped at 32 bytes so per-lane work is bounded. One deterministic lane
-per bucket then inserts its position, evicting the oldest of the four;
-lanes that found nothing re-probe once more so repeats shorter than a
-window apart are caught immediately. The window's matches are selected
+hash table (2048 buckets, one u32 chunk-relative position per word — 32KB
+per warp, the whole default static shared-memory budget for one warp's
+table, since positions no longer fit in 16 bits once chunks can exceed
+64KB) and compares against all four candidates, capped at 32 bytes so
+per-lane work is bounded. One deterministic lane per bucket then inserts
+its position, evicting the oldest of the four; lanes that found nothing
+re-probe once more so repeats shorter than a window apart are caught
+immediately. The window's matches are selected
 warp-uniformly from a ballot mask with a one-position lazy lookahead
 (take position *i+1*'s match instead if it's clearly longer), and matches
 that hit the 32-byte cap are extended cooperatively, 32 bytes per step,
@@ -128,7 +137,7 @@ allocation retries with a halved batch on failure.
 ### Container format (`src/format.h`)
 
 ```
-FileHeader    { magic, version=3, chunk_size, original_size, chunk_count, table_group_count }
+FileHeader    { magic, version=4, chunk_size, original_size, chunk_count, table_group_count }
 ChunkEntry[]  { offset, compressed_size, original_size }         -- one per chunk
 TableGroup[]  { start_chunk, chunk_count, q[352] }               -- one per compression batch
 payload       -- each chunk: [flag: Raw | Lz | LzRans] [data]
@@ -164,25 +173,36 @@ silently fell back to sm_52 instead of detecting the GPU.)
 `__launch_bounds__`'s `minBlocksPerSM` hint on both kernels, for A/B
 occupancy testing — see the comment above it in `CMakeLists.txt` for
 why a bare `--maxrregcount` can't do this (both kernels already carry
-an explicit `__launch_bounds__`, which takes precedence) and why it's
-unlikely to change occupancy today (both kernels are shared-memory-
-bound, not register-bound, at their current sizes).
+an explicit `__launch_bounds__`, which takes precedence). The parse
+kernel's match-finding table now uses 32KB of the 48KB default static
+shared-memory budget for one warp (see *LZ parse*), leaving no room for
+a second block, so it's shared-memory-bound at 1 warp/SM regardless of
+this flag; decompress is register-bound, where this flag can actually
+move the needle.
 
 ## Usage
 
 ```
-./build/gzp c <input> <output> [chunk_size]   # compress (default chunk_size 65536)
-./build/gzp d <input> <output>                # decompress
-GZP_VERBOSE=1 ./build/gzp ...                 # per-stage timing
-GZP_FORCE_BATCH=<n> ./build/gzp ...           # force chunks/batch (testing only)
+./build/gzp c <input> <output> [chunk_size]                # compress (default chunk_size 65536)
+./build/gzp c <input> <output> --profile speed|balance|ratio  # ...or pick a chunk-size preset
+./build/gzp d <input> <output>                              # decompress
+GZP_VERBOSE=1 ./build/gzp ...                               # per-stage timing
+GZP_FORCE_BATCH=<n> ./build/gzp ...                         # force chunks/batch (testing only)
 ```
+
+`chunk_size` and `--profile` are mutually exclusive (specifying both is
+an error); the bare default (neither given) is unchanged from before
+`--profile` existed. See *Results* for what each profile actually costs
+and buys — `balance` and `ratio` trade real compress/decompress speed
+for a smaller output.
 
 ## Testing
 
 ```
-bash tests/round_trip.sh                 # default chunk size
+bash tests/round_trip.sh                 # default chunk size, plus --profile cases
 bash tests/round_trip.sh --extremes      # chunk sizes 1, 16, 4K, 8K, 32K, 65535, 65536,
-                                          # plus GZP_FORCE_BATCH mismatch cases (see below)
+                                          # 1048575, 1048576 (kMaxChunkSize), plus
+                                          # GZP_FORCE_BATCH mismatch cases (see below)
 BIG=1 bash tests/round_trip.sh           # + 300MB random and 300MB text (multi-batch)
 ```
 
@@ -224,11 +244,23 @@ REPEAT=5 bash bench/run_bench.sh corpus_283mb.txt
 - **Fixed startup cost.** CUDA context creation alone takes 0.14–0.19s
   on this WSL2 machine; on a 94MB file that is half the wall time. It
   amortises on larger inputs and is outside gzp's control.
-- **Ratio vs zstd.** gzp's rANS codes literals with an order-0 model and
-  its parser is a single-pass hash match finder; zstd -1 is still ~8%
-  smaller on this corpus even after moving to one shared table per batch
-  (a per-chunk table cost ~1-2% more). Repeat-offset codes and a better
-  parser (hash chains, optimal parsing) would close more of the gap.
+- **Ratio vs zstd at the default profile.** gzp's rANS codes literals
+  with an order-0 model and its parser is a single-pass hash match
+  finder with a fixed-capacity table; at the default 64KB chunk size
+  `zstd -1` is still smaller (0.252 vs 0.263 on this corpus). Only the
+  `ratio` profile's 1MB chunks close and slightly reverse that gap
+  (0.250) — `--profile balance` (256KB) is a middle ground that gets
+  close (0.253) without paying `ratio`'s full speed cost. Repeat-offset
+  codes and a better parser (hash chains, optimal parsing) would improve
+  the ratio at every chunk size, not just the largest.
+- **The match-finding hash table's capacity doesn't scale with chunk
+  size.** It's a fixed-size, per-warp shared-memory table (32KB — the
+  full default static-shared-memory budget for one warp), so a 1MB
+  chunk gets the same "recently seen positions" recall as a 64KB one,
+  just spread over 16x more data. This is *why* the ratio gain from
+  bigger chunks is real but sub-linear, and why the natural next lever
+  is a bigger table via dynamic (rather than static) shared memory,
+  which can exceed the current 48KB-per-block static limit.
 - **rANS decode is inherently more work than a plain token stream's
   direct byte copies** — even with the coarse-LUT lookup and per-batch
   tables (which removed the earlier per-chunk table-rebuild cost
@@ -237,4 +269,5 @@ REPEAT=5 bash bench/run_bench.sh corpus_283mb.txt
   literal and match copies. This is why a chunk that doesn't compress
   much better under rANS is kept as plain tokens instead.
 - **No multi-GPU, no streaming API** — it's a file-in, file-out CLI.
-- Match offsets are 16-bit, which caps chunks at 64KB.
+- Match offsets are 32-bit, but chunks are capped at 1MB by policy (see
+  `kMaxChunkSize` in `src/format.h`) rather than by the wire format.
