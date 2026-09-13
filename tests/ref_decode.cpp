@@ -83,24 +83,55 @@ struct RansDecoder {
     renorm(l);
     return s;
   }
-  // Mirrors the GPU's rans_dec_bits split: a single renorm only ever
-  // supplies one 16-bit word, so nb > 16 (possible with wide chunks) is
-  // decoded as the high (nb-16) bits first, then the low 16 bits --
-  // reassembled as (hi<<16)|lo -- matching encode's low-then-high call
-  // order (decode reads it in reverse).
-  uint32_t bits(int l, uint32_t nb) {
-    if (nb == 0) return 0;
-    if (nb > 16) {
-      uint32_t hi = bits(l, nb - 16);
-      uint32_t lo = bits(l, 16);
-      return (hi << 16) | lo;
+  // Mirrors the GPU's rans_dec_bits16 exactly: extracts at most 16 bits
+  // for lane l (0 if !on), then renorms -- but renorm's word-need check
+  // is itself gated by `on`, so an inactive/width-0 call never consumes a
+  // word for lane l regardless of its x[l]. Must be called for every lane
+  // 0..31 at this same logical step even when on(l) is false for some of
+  // them: the GPU's ballot-based word consumption is a per-step, whole-
+  // warp operation, so which lanes participate at THIS step (not just
+  // which lanes are active overall) determines the shared stream's word
+  // order. See bits_pass() below for why a per-lane serial bits(l, nb)
+  // (extracting nb up to 32 bits for lane l immediately, before moving to
+  // lane l+1) does NOT reproduce this: it interleaves lane l's low-16
+  // step with lane (l+1)'s high step in the wrong order whenever nb > 16
+  // for only some lanes in the group.
+  uint32_t bits16(int l, bool on, uint32_t nb) {
+    on = on && nb != 0;
+    uint32_t b = on ? (x[l] & ((1u << nb) - 1)) : 0;
+    if (on) x[l] >>= nb;
+    if (on && x[l] < kRansL) {
+      if (rp + 2 > len) {
+        bad = true;
+        return b;
+      }
+      x[l] = (x[l] << 16) | ((uint32_t)p[rp] | ((uint32_t)p[rp + 1] << 8));
+      rp += 2;
     }
-    uint32_t b = x[l] & ((1u << nb) - 1);
-    x[l] >>= nb;
-    renorm(l);
     return b;
   }
 };
+
+// Decodes nb[l] raw bypass bits for every lane 0..31 (out[l] = 0 for
+// !active(l) or nb[l] == 0), as two whole-warp phases -- all 32 lanes'
+// high (nb-16, when nb>16) bits first, then all 32 lanes' low (<=16)
+// bits -- exactly mirroring rans_dec_bits/rans_dec_bits16 on the GPU,
+// where each phase is one ballot-gated word-consumption step shared by
+// the whole warp. Splitting per-lane (extract lane l's full nb bits
+// before moving to lane l+1) would consume the shared stream's words in
+// the wrong order whenever lanes in the same group have different nb.
+void bits_pass(RansDecoder& d, bool active[32], const uint32_t nb[32], uint32_t out[32]) {
+  uint32_t hi[32];
+  for (int l = 0; l < 32; ++l) {
+    uint32_t hi_nb = nb[l] > 16 ? nb[l] - 16 : 0;
+    hi[l] = d.bits16(l, active[l], hi_nb);
+  }
+  for (int l = 0; l < 32; ++l) {
+    uint32_t lo_nb = nb[l] > 16 ? 16 : nb[l];
+    uint32_t lo = d.bits16(l, active[l], lo_nb);
+    out[l] = (hi[l] << 16) | lo;
+  }
+}
 
 bool decode_lzrans(const uint8_t* in, size_t in_len, uint8_t* out, size_t orig, uint32_t chunk_size,
                    const uint8_t* group_q) {
@@ -110,27 +141,32 @@ bool decode_lzrans(const uint8_t* in, size_t in_len, uint8_t* out, size_t orig, 
   RansDecoder d(in, in_len, group_q);
   std::vector<Seq> seqs(n_seq);
   std::vector<uint8_t> lits(n_lit);
-  uint32_t llc[32], mlc[32], oc[32], llb[32], mlb[32], ob[32], ml[32];
+  uint32_t llc[32], mlc[32], oc[32], llb[32], mlb[32], ob[32], ml[32], nb[32];
+  bool active[32], has_off[32];
 
   for (uint32_t g = 0; g < (n_seq + 31) / 32; ++g) {
-    auto active = [&](int l) { return g * 32 + l < n_seq; };
-    for (int l = 0; l < 32; ++l) if (active(l)) llc[l] = d.get(l, RansDecoder::kLl, kSmallSyms);
-    for (int l = 0; l < 32; ++l) if (active(l)) llb[l] = d.bits(l, len_nb(llc[l]));
-    for (int l = 0; l < 32; ++l) if (active(l)) mlc[l] = d.get(l, RansDecoder::kMl, kSmallSyms);
-    for (int l = 0; l < 32; ++l) if (active(l)) mlb[l] = d.bits(l, len_nb(mlc[l]));
+    for (int l = 0; l < 32; ++l) active[l] = g * 32 + l < n_seq;
+    for (int l = 0; l < 32; ++l) if (active[l]) llc[l] = d.get(l, RansDecoder::kLl, kSmallSyms);
+    for (int l = 0; l < 32; ++l) nb[l] = active[l] ? len_nb(llc[l]) : 0;
+    bits_pass(d, active, nb, llb);
+    for (int l = 0; l < 32; ++l) if (active[l]) mlc[l] = d.get(l, RansDecoder::kMl, kSmallSyms);
+    for (int l = 0; l < 32; ++l) nb[l] = active[l] ? len_nb(mlc[l]) : 0;
+    bits_pass(d, active, nb, mlb);
     for (int l = 0; l < 32; ++l) {
-      if (!active(l)) continue;
+      if (!active[l]) continue;
       uint32_t v = len_value(mlc[l], mlb[l]);
       ml[l] = v ? v + (kMinMatch - 1) : 0;
     }
-    for (int l = 0; l < 32; ++l) if (active(l) && ml[l]) oc[l] = d.get(l, RansDecoder::kOff, kSmallSyms);
-    for (int l = 0; l < 32; ++l) if (active(l) && ml[l]) ob[l] = d.bits(l, oc[l]);
+    for (int l = 0; l < 32; ++l) has_off[l] = active[l] && ml[l] != 0;
+    for (int l = 0; l < 32; ++l) if (has_off[l]) oc[l] = d.get(l, RansDecoder::kOff, kSmallSyms);
+    for (int l = 0; l < 32; ++l) nb[l] = has_off[l] ? oc[l] : 0; // oc is itself a shift count (nb = oc)
+    bits_pass(d, has_off, nb, ob);
     for (int l = 0; l < 32; ++l) {
-      if (!active(l)) continue;
+      if (!active[l]) continue;
       uint32_t idx = g * 32 + l;
       if (ml[l] == 0 && idx != n_seq - 1) return false;
       if (ml[l] > chunk_size) return false; // a match can never be longer than the chunk itself
-      if (ml[l] && oc[l] >= (uint32_t)kSmallSyms) return false; // oc is a shift count (nb = oc)
+      if (ml[l] && oc[l] >= (uint32_t)kSmallSyms) return false;
       seqs[idx] = Seq{len_value(llc[l], llb[l]), ml[l], ml[l] ? off_value(oc[l], ob[l]) : 0};
     }
     if (d.bad) return false;
