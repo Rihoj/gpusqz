@@ -293,18 +293,24 @@ jobs:
       - name: Test (no GPU)
         run: ctest --test-dir build -LE "gpu|vulkan" --output-on-failure
 
-      # Informational: the runner's GPU is Apple's paravirtualized VM device,
-      # which lacks Metal argument encoders (MoltenVK aborts on it unless
-      # argument buffers are turned off). A failure here is not a gpusqz bug.
-      - name: Vulkan round trip on the runner's Metal GPU
+      # Informational. The runner's GPU is Apple's paravirtualized VM device:
+      # it lacks Metal argument encoders (MoltenVK aborts unless argument
+      # buffers are off) and, as of 2026-09, refuses every host-visible
+      # allocation, so gpusqz reports it unusable. The Vulkan tests run only
+      # if that changes; real Apple GPUs have to be tested on a Mac.
+      - name: Vulkan tests on the runner's Metal GPU, if usable
         continue-on-error: true
         env:
           MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS: "0"
         run: |
           export GPUSQZ_VULKAN_LIB="$MOLTENVK_DYLIB"
-          GPUSQZ_VK_DEBUG=1 ./build/gpusqz devices
-          # Fixture decoding plus the round-trip suite.
-          ctest --test-dir build -L vulkan --output-on-failure
+          GPUSQZ_VK_DEBUG=1 ./build/gpusqz devices 2>&1 | tee devices.txt
+          if grep -q ': usable' devices.txt; then
+            # Fixture decoding plus the round-trip suite.
+            ctest --test-dir build -L vulkan --output-on-failure
+          else
+            echo "No usable Vulkan device on this runner; skipping the Vulkan tests."
+          fi
 
       - name: Package
         working-directory: build
