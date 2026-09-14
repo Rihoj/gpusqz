@@ -2,8 +2,9 @@
 
 GPU file compressor (`.gsz`): warp-per-chunk LZ parse + 32-way interleaved
 rANS, with a CUDA backend (NVIDIA) and a Vulkan backend (AMD, Apple via
-MoltenVK, Intel). README.md is the design document; read the relevant
-section before changing an area.
+MoltenVK, Intel). The docs are in `docs/` (index: `docs/README.md`);
+`docs/design.md` is the design document: read the relevant section before
+changing an area.
 
 ## Layout
 - `src/main.cpp` host pipeline and CLI (backend-agnostic); `src/backend.h` the interface.
@@ -14,6 +15,8 @@ section before changing an area.
 - `tests/ref_decode.cpp` (`gpusqz_refdec`): independent CPU decoder, the oracle.
   `tests/round_trip.sh`, `tests/fixtures/` (committed `.gsz` files + `make_fixtures.sh`).
 - `packaging/`, `.github/workflows/build.yml`, `.releaserc.json`, `release/`: packaging and releases.
+- `docs/`: user and developer docs; `docs/performance-history.md` logs every measured
+  speed/ratio change. README.md is the short front page.
 
 ## Build and test
 ```
@@ -53,6 +56,9 @@ Configure options: `-DGPUSQZ_BUILD_CUDA=OFF`, `-DGPUSQZ_BUILD_VULKAN=OFF`,
   conditions with every number. Follow the `/benchmark` skill.
 - Compare kernel MB/s (`kbusy`) as well as wall: WSL2 adds ~0.2s of CUDA setup per run.
 - Measure on a varied corpus too; the repetitive 283MB one once hid a regression.
+- Record every measured speed/ratio change in `docs/performance-history.md` (and
+  update `docs/benchmarks.md` + the README summary when headline numbers move).
+  Check its "Measured and rejected" table before re-trying an idea.
 
 ## Environment traps
 - WSL2: CUDA `native` arch detection is broken (default pinned to sm_120);

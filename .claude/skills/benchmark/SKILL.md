@@ -71,3 +71,20 @@ for bin in /tmp/gpusqz-base/build/gpusqz ./build/gpusqz; do GPUSQZ=$bin CPU=0 RE
 Keep a change only if it wins on both corpora, and check output sizes: a
 speedup that changes the ratio is a trade-off to report, not a free win.
 Report per profile, per corpus: kernel and wall MB/s, ratio, conditions.
+
+Before trying an idea, check the *Measured and rejected* table in
+`docs/performance-history.md`: many obvious ones have been measured already.
+
+## 6. Record it
+
+Follow *Adding an entry* at the end of `docs/performance-history.md`:
+
+- a Milestones line (date, commit, release, change, effect);
+- rows in each measured corpus's table, newest last, with conditions
+  (GPU, backend, driver, VRAM used and utilisation, best of n) and `zstd -1`'s
+  ratio on that file;
+- dropped experiments in *Measured and rejected*, with numbers;
+- never rewrite old numbers: add a *Corrected claims* item instead.
+
+If the headline numbers change, update `docs/benchmarks.md` and the table
+in `README.md` too.

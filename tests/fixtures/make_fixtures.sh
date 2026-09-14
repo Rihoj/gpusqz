@@ -38,7 +38,7 @@ printf 'XXXX' | cat - <(tail -c +5 text__default.gsz) > text_badmagic.gszbad
 # A wrong sequence count in the first chunk's rANS header: the decoder then
 # consumes a different number of stream words than the chunk holds, which
 # it must detect. (A flipped byte inside the rANS stream itself is not
-# reliably detectable: the format has no checksum, see README.)
+# reliably detectable: the format has no checksum, see docs/limitations.md.)
 python3 - <<'EOF'
 import struct
 d = bytearray(open("text__c4k_lit0.gsz", "rb").read())

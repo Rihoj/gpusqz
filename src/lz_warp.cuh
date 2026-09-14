@@ -28,7 +28,7 @@ constexpr int kProbe = 32;
 // Set-associative hash table, one u32 chunk-relative position per word
 // (more buckets beat deeper buckets at equal size). It lives in global
 // memory, one region per chunk: a bigger shared-memory table cost more in
-// occupancy than it gained (see README, Known limitations).
+// occupancy than it gained (see docs/performance-history.md).
 constexpr int kBucketWays = kHashBucketWays;
 constexpr int kWarpsPerBlock = 1;
 // How many positions ahead lz_parse_warp's lazy matching looks before

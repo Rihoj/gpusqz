@@ -2,7 +2,7 @@
 //
 // Design: the input is split into fixed-size, independent chunks. Each
 // chunk is LZ-compressed (or stored raw if that doesn't help) by one group
-// of 32 GPU lanes. See README.md for the format and the tradeoffs.
+// of 32 GPU lanes. See docs/design.md for the format and the tradeoffs.
 //
 // Host side, batches of chunks live only in device memory, in a ring of
 // kSets buffer sets with a stream each. File data moves through a small,

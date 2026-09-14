@@ -24,6 +24,10 @@ Add a scope where it helps (`fix(vulkan):`, `feat(cli):`). Say in the body
 what changed for users; the release notes are generated from these
 subjects. Never hand-edit versions or create `v*` tags.
 
+A `perf:` commit, or any change that moves speed or ratio, carries its
+measurements into `docs/performance-history.md` in the same PR (see the
+`/benchmark` skill); add the release version to that entry once it ships.
+
 ## 2. PR
 
 ```
