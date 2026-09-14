@@ -24,8 +24,35 @@ if(GPUSQZ_BUILD_CUDA AND NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 120)
 endif()
 
-set(GPUSQZ_VERSION "0.5.0" CACHE STRING "Version stamped into packages (CI sets it from the git tag)")
-project(gpusqz VERSION ${GPUSQZ_VERSION} DESCRIPTION "GPU file compressor" LANGUAGES CXX)
+# Version (semver, releases are tagged vX.Y.Z by semantic-release, see
+# .releaserc.json). Release builds get it from CI (-DGPUSQZ_VERSION=X.Y.Z);
+# otherwise it comes from `git describe` at configure time, e.g.
+# 0.1.0-3-gabc1234 for 3 commits after v0.1.0 (plus -dirty for local edits),
+# or 0.0.0-dev without git. Packages carry the X.Y.Z part; `--version`
+# prints the whole string.
+set(GPUSQZ_VERSION "" CACHE STRING "Release version X.Y.Z (empty: from git describe)")
+if(GPUSQZ_VERSION)
+  set(GPUSQZ_VERSION_FULL ${GPUSQZ_VERSION})
+else()
+  set(GPUSQZ_VERSION_FULL 0.0.0-dev)
+  find_program(GPUSQZ_GIT git)
+  if(GPUSQZ_GIT)
+    execute_process(COMMAND ${GPUSQZ_GIT} describe --tags --match "v[0-9]*" --dirty
+                    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                    OUTPUT_VARIABLE _gpusqz_describe RESULT_VARIABLE _gpusqz_rc
+                    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(_gpusqz_rc EQUAL 0)
+      string(REGEX REPLACE "^v" "" GPUSQZ_VERSION_FULL "${_gpusqz_describe}")
+    endif()
+  endif()
+endif()
+if(NOT GPUSQZ_VERSION_FULL MATCHES "^([0-9]+\\.[0-9]+\\.[0-9]+)")
+  message(FATAL_ERROR "GPUSQZ_VERSION must start with X.Y.Z, got '${GPUSQZ_VERSION_FULL}'")
+endif()
+set(GPUSQZ_VERSION_NUMBER ${CMAKE_MATCH_1})
+message(STATUS "gpusqz version ${GPUSQZ_VERSION_FULL}")
+project(gpusqz VERSION ${GPUSQZ_VERSION_NUMBER} DESCRIPTION "GPU file compressor" LANGUAGES CXX)
+add_compile_definitions(GPUSQZ_VERSION_STRING="${GPUSQZ_VERSION_FULL}")
 if(GPUSQZ_BUILD_CUDA)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
@@ -198,10 +225,16 @@ foreach(dec ${GPUSQZ_DECODERS})
   endforeach()
 endforeach()
 
+string(REPLACE "." "\\." _gpusqz_version_re "${GPUSQZ_VERSION_NUMBER}")
+add_test(NAME refdec_version COMMAND gpusqz_refdec --version)
+set_tests_properties(refdec_version PROPERTIES PASS_REGULAR_EXPRESSION "^gpusqz_refdec ${_gpusqz_version_re}")
+
 if(GPUSQZ_BUILD_GPU)
-  # Runs without a GPU: argument errors are reported before any GPU call.
+  # Run without a GPU: argument errors are reported before any GPU call.
   add_test(NAME gpusqz_usage COMMAND gpusqz)
   set_tests_properties(gpusqz_usage PROPERTIES PASS_REGULAR_EXPRESSION "usage:")
+  add_test(NAME gpusqz_version COMMAND gpusqz --version)
+  set_tests_properties(gpusqz_version PROPERTIES PASS_REGULAR_EXPRESSION "^gpusqz ${_gpusqz_version_re}")
 
   # The full round-trip suite, per backend (needs bash).
   if(BASH_PROGRAM AND NOT WIN32)

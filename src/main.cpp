@@ -861,6 +861,7 @@ void usage() {
                "  gpusqz c <input> <output> [chunk_size | --profile speed|balance|ratio] [options]\n"
                "  gpusqz d <input> <output> [options]\n"
                "  gpusqz devices\n"
+               "  gpusqz --version\n"
                "chunk_size and --profile are mutually exclusive; with neither, chunk_size is %u.\n"
                "options:\n"
                "  --gpu-mem SIZE   cap the GPU memory used for batch buffers (e.g. 8G, 512M; a\n"
@@ -940,6 +941,10 @@ void list_devices() {
 int main(int argc, char** argv) {
   if (argc == 2 && std::strcmp(argv[1], "devices") == 0) {
     list_devices();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--version") == 0) {
+    std::printf("gpusqz %s\n", GPUSQZ_VERSION_STRING);
     return 0;
   }
   if (argc < 4) usage();

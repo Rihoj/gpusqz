@@ -1,7 +1,15 @@
 # Builds gpusqz for Linux (deb, rpm), Windows (zip, msi installer) and macOS
 # (tar.gz, pkg installer), runs the tests that don't need a GPU, installs
-# and uninstalls the installers, and on a v* tag publishes the packages as a
-# GitHub release.
+# and uninstalls the installers, and releases from main.
+#
+# Releases (semver, .releaserc.json): commits follow Conventional Commits.
+# On every push to main, semantic-release reads the commits since the last
+# vX.Y.Z tag: fix/perf -> patch, feat -> minor, breaking -> minor while on
+# 0.x; anything else releases nothing. The "version" job computes that
+# version first (dry run), every package is built and tested with it, and
+# only when all of them pass does the "release" job tag the commit and
+# publish the GitHub release with the packages attached. Other builds take
+# their version from `git describe`, e.g. 0.1.0-3-gabc1234.
 #
 # gpusqz has two backends (src/backend.h): CUDA for NVIDIA GPUs and Vulkan
 # for AMD, Apple, Intel and NVIDIA GPUs. Linux and Windows packages carry
@@ -13,18 +21,23 @@
 # else CI runs what needs no device (`ctest -LE "gpu|vulkan"`): the CPU
 # reference decoder against the committed fixtures and gpusqz's argument
 # handling. The CUDA tests (label "gpu") have to run on a machine with an
-# NVIDIA GPU before tagging a release.
+# NVIDIA GPU before a release-triggering change is merged.
 name: build
 
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
+
+# One run per branch at a time, so two pushes to main can't release the
+# same version; superseded pull request runs are cancelled.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   # sm_70 (Volta) is the oldest GPU gpusqz can run on (it needs
@@ -35,13 +48,59 @@ env:
   CUDA_FLAGS: "-Wno-deprecated-gpu-targets"
 
 jobs:
+  # The version this commit will be released as, or empty (pull requests,
+  # other branches, or no fix/feat/breaking commit since the last release).
+  version:
+    name: Next version
+    runs-on: ubuntu-latest
+    permissions:
+      # semantic-release checks it could push the tag even in a dry run.
+      contents: write
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+      release: ${{ steps.next.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --prefix release
+      - id: next
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node release/next-version.mjs
+
+  # Squash-merged pull requests become one commit named after the PR, so its
+  # title must be a Conventional Commit for semantic-release to see it.
+  pr-title:
+    name: PR title (Conventional Commits)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          re='^(feat|fix|perf|refactor|docs|test|build|ci|chore|revert|style)(\([a-z0-9 ._/-]+\))?!?: .+'
+          if [[ "$TITLE" =~ $re ]]; then
+            echo "ok: $TITLE"
+          else
+            echo "::error::PR title must be a Conventional Commit, e.g. 'feat: add --level' or 'fix(vulkan): ...' (got: $TITLE)"
+            exit 1
+          fi
+
   linux-deb:
     name: Linux (deb)
+    needs: version
     # Built on the oldest supported Ubuntu so the package's glibc/libstdc++
     # requirements stay low (Ubuntu 22.04+, Debian 12+).
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags, for git describe
 
       - name: Install CUDA compiler
         run: |
@@ -52,12 +111,6 @@ jobs:
             cuda-nvcc-12-8 cuda-cudart-dev-12-8 cuda-cccl-12-8 cmake ninja-build dpkg-dev \
             libvulkan-dev glslang-tools mesa-vulkan-drivers
 
-      - name: Version
-        id: version
-        shell: bash
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then v="${GITHUB_REF_NAME#v}"; else v=0.5.0; fi
-          echo "version=$v" >> "$GITHUB_OUTPUT"
 
       - name: Configure
         run: >
@@ -66,7 +119,7 @@ jobs:
           -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc
           -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS"
           -DCMAKE_CUDA_FLAGS="$CUDA_FLAGS"
-          "-DGPUSQZ_VERSION=${{ steps.version.outputs.version }}"
+          "-DGPUSQZ_VERSION=${{ needs.version.outputs.version }}"
 
       - name: Build
         run: cmake --build build
@@ -89,6 +142,7 @@ jobs:
           gpusqz_refdec tests/fixtures/text__c4k_lit0.gsz /tmp/out
           cmp /tmp/out tests/fixtures/text.orig
           gpusqz 2>&1 | grep -q usage:
+          gpusqz --version
           gpusqz c tests/fixtures/text.orig /tmp/t.gsz
           gpusqz d /tmp/t.gsz /tmp/t.out
           cmp /tmp/t.out tests/fixtures/text.orig
@@ -101,6 +155,7 @@ jobs:
 
   linux-rpm:
     name: Linux (rpm)
+    needs: version
     # Built on EL8 (glibc 2.28) so the package installs on RHEL/Rocky/Alma
     # 8 and 9 and on current Fedora.
     runs-on: ubuntu-latest
@@ -123,13 +178,15 @@ jobs:
           cmake --build /tmp/glslang-build --target glslang-standalone -j "$(nproc)"
 
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags, for git describe
 
-      - name: Version
-        id: version
-        shell: bash
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then v="${GITHUB_REF_NAME#v}"; else v=0.5.0; fi
-          echo "version=$v" >> "$GITHUB_OUTPUT"
+      # The container runs as root but the workspace belongs to the runner's
+      # user, so git refuses it ("dubious ownership") and CMake's
+      # `git describe` would fall back to 0.0.0-dev.
+      - name: Trust the workspace for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
 
       - name: Configure
         run: >
@@ -139,7 +196,7 @@ jobs:
           -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS"
           -DCMAKE_CUDA_FLAGS="$CUDA_FLAGS"
           -DGPUSQZ_GLSLANG=/tmp/glslang-build/StandAlone/glslang
-          "-DGPUSQZ_VERSION=${{ steps.version.outputs.version }}"
+          "-DGPUSQZ_VERSION=${{ needs.version.outputs.version }}"
 
       - name: Build
         run: cmake --build build -j "$(nproc)"
@@ -169,9 +226,12 @@ jobs:
 
   windows:
     name: Windows (zip, msi)
+    needs: version
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags, for git describe
 
       - name: Install CUDA compiler
         shell: pwsh
@@ -202,12 +262,6 @@ jobs:
             if ($_ -match '^([^=]+)=(.*)$') { "$($Matches[1])=$($Matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Append }
           }
 
-      - name: Version
-        id: version
-        shell: bash
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then v="${GITHUB_REF_NAME#v}"; else v=0.5.0; fi
-          echo "version=$v" >> "$GITHUB_OUTPUT"
 
       - name: Configure
         shell: pwsh
@@ -217,7 +271,7 @@ jobs:
           -DCMAKE_CUDA_COMPILER="$env:CUDA_PATH/bin/nvcc.exe"
           "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS"
           "-DCMAKE_CUDA_FLAGS=$env:CUDA_FLAGS"
-          "-DGPUSQZ_VERSION=${{ steps.version.outputs.version }}"
+          "-DGPUSQZ_VERSION=${{ needs.version.outputs.version }}"
 
       - name: Build
         run: cmake --build build
@@ -286,9 +340,12 @@ jobs:
 
   macos:
     name: macOS (Vulkan via MoltenVK, tar.gz, pkg)
+    needs: version
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags, for git describe
 
       - name: Install Vulkan headers, glslang and MoltenVK
         run: |
@@ -304,12 +361,6 @@ jobs:
           echo "MOLTENVK_LICENSE=$PWD/$license" >> "$GITHUB_ENV"
           lipo -info "$dylib"
 
-      - name: Version
-        id: version
-        shell: bash
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then v="${GITHUB_REF_NAME#v}"; else v=0.5.0; fi
-          echo "version=$v" >> "$GITHUB_OUTPUT"
 
       - name: Configure
         run: >
@@ -320,7 +371,7 @@ jobs:
           -DGPUSQZ_VULKAN_INCLUDE="$(brew --prefix vulkan-headers)/include"
           -DGPUSQZ_MOLTENVK_DYLIB="$MOLTENVK_DYLIB"
           -DGPUSQZ_MOLTENVK_LICENSE="$MOLTENVK_LICENSE"
-          "-DGPUSQZ_VERSION=${{ steps.version.outputs.version }}"
+          "-DGPUSQZ_VERSION=${{ needs.version.outputs.version }}"
 
       - name: Build
         run: cmake --build build -j "$(sysctl -n hw.ncpu)"
@@ -352,9 +403,10 @@ jobs:
         run: |
           cpack -G "TGZ;productbuild"
           tar tzf ./*.tar.gz
+          # The product must reference its package (CPack writes an empty
+          # one without an install component, see CMakeLists.txt).
           pkgutil --expand ./*.pkg pkg-expanded
-          cat pkg-expanded/Distribution
-          find pkg-expanded -maxdepth 2
+          grep -q "<pkg-ref" pkg-expanded/Distribution
           # Universal binaries: Apple silicon and Intel.
           for f in gpusqz gpusqz_refdec; do lipo "$f" -verify_arch arm64 x86_64; done
 
@@ -385,23 +437,44 @@ jobs:
 
   release:
     name: GitHub release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux-deb, linux-rpm, windows, macos]
+    needs: [version, linux-deb, linux-rpm, windows, macos]
+    if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --prefix release
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
-      - name: Publish release
+      # The packages were built for needs.version's version; refuse to
+      # publish them under any other (e.g. if a release happened meanwhile).
+      - name: Check the packages match the release
         env:
-          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           ls -l dist
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "gpusqz $GITHUB_REF_NAME" \
-            --generate-notes
+          next=$(node release/next-version.mjs)
+          if [ "$next" != "$VERSION" ]; then
+            echo "::error::next version is now '$next', packages were built as $VERSION"; exit 1
+          fi
+          for f in dist/*; do
+            case "$f" in *"$VERSION"*) ;; *) echo "::error::$f is not version $VERSION"; exit 1 ;; esac
+          done
+
+      # Tags the commit vX.Y.Z and publishes the GitHub release with
+      # generated notes and the packages (dist/*) attached.
+      - name: Publish
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./release/node_modules/.bin/semantic-release

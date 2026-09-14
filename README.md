@@ -76,6 +76,56 @@ by the GPU: under WSL2, decompression spends most of its time in
 `fwrite` (see *Known limitations*), and the kernels run 1.6–4x faster
 than the wall-clock rate.
 
+### enwik8 on an Apple M1 Max and the RTX 5060 Ti
+
+enwik8 (the first 100MB of a 2006 English Wikipedia dump, the corpus of
+the Large Text Compression Benchmark) on two machines, best of 3,
+wall-clock MB/s of original data, 2026-09-14:
+
+- **Apple M1 Max** (32GB, macOS): the macOS release package, Vulkan
+  backend through MoltenVK, native.
+- **RTX 5060 Ti** (16GB): CUDA backend under WSL2, GPU otherwise idle.
+
+| codec | M1 Max compress | M1 Max decompress | RTX 5060 Ti compress | RTX 5060 Ti decompress | ratio |
+|---|---|---|---|---|---|
+| gpusqz `speed` (default) | 386 | 704 | 347 | 357 | 0.3862 |
+| gpusqz `balance` | **442** | **751** | 323 | 344 | 0.3744 |
+| gpusqz `ratio` | 221 | 414 | 227 | 308 | 0.3592 |
+| gzip -1 | 113 | 621 | 112 | 218 | 0.4226 |
+| zstd -1 (1 thread) | 425 | 1041 | 442 | **1298** | 0.4067 |
+| zstd -3 (1 thread) | 250 | 892 | 284 | 1098 | **0.3544** |
+
+Both machines wrote identical `.gsz` files (same sizes to the byte), as
+the two backends should. On a 100MB input the wall figures are decided by
+fixed costs more than by the GPU. `GPUSQZ_VERBOSE=1` splits them out:
+
+| enwik8 | M1 Max | RTX 5060 Ti |
+|---|---|---|
+| setup (GPU context + allocation) | 0.05–0.085s | 0.18–0.23s |
+| `speed` compress kernels | 654 MB/s | 1834 MB/s |
+| `speed` decompress kernels | ~2700 MB/s | ~9700 MB/s |
+| `ratio` compress kernels | 265 MB/s | 481 MB/s |
+| `ratio` decompress kernels | ~650 MB/s | ~1800 MB/s |
+
+- **The Mac wins on wall time because it starts ~3x faster.** CUDA
+  context creation under WSL2 costs ~0.2s per run, a native Metal device
+  well under 0.1s. That outweighs the RTX's faster kernels on a file this
+  size, most of all when decompressing (kernels take 0.04s on the Mac,
+  0.01s on the RTX).
+- **The RTX kernels are 1.8–3.6x faster.** Part of that gap is the
+  backend, not the GPU: on the RTX itself the Vulkan decompress kernel
+  runs at 55–70% of CUDA's speed (see *GPU backends*).
+- **The M1 Max's kernel figures are approximate.** MoltenVK caps
+  timestamp query pools well below the size gpusqz asks for and falls
+  back to emulated timestamps (it logs a `VK_ERROR_OUT_OF_DEVICE_MEMORY`
+  line about `MTLCounterSampleBuffer`, which is harmless). Setup and wall
+  times are exact.
+- **The `ratio` profile needs larger inputs.** 100MB is only 96 of its
+  1MB chunks, far too few to fill either GPU.
+- **Against zstd:** `balance` on the M1 Max beats `zstd -1` on both
+  speed and ratio. `ratio` comes within 1.4% of `zstd -3`'s output size;
+  zstd still decompresses faster on both machines.
+
 ### What changed in this round
 
 Same machine, idle GPU, best of 3, previous version (d5073da) against
@@ -154,14 +204,15 @@ takes the lowest lane's position through `atomicMin`. That leaves the
 table exactly as CUDA does, which is why the output matches byte for
 byte.
 
-**Vulkan speed, measured on the one GPU available.** On the RTX 5060 Ti
-(Windows NVIDIA Vulkan driver) the Vulkan compress kernels ran at 90–96%
-of CUDA's throughput and the decompress kernel at 55–70% (283MB corpus;
-e.g. `speed` profile 2013 vs 2227 MB/s compress, 1874 vs 3323 MB/s
-decompress). Removing `coherent` from the scratch buffers and dropping
-a redundant memory barrier helped; the remaining decode gap is not
-understood yet. Speed on the RX 580 and the Apple chips has not been
-measured: nobody has run it on that hardware yet.
+**Vulkan speed.** On the RTX 5060 Ti (Windows NVIDIA Vulkan driver) the
+Vulkan compress kernels ran at 90–96% of CUDA's throughput and the
+decompress kernel at 55–70% (283MB corpus; e.g. `speed` profile 2013 vs
+2227 MB/s compress, 1874 vs 3323 MB/s decompress). Removing `coherent`
+from the scratch buffers and dropping a redundant memory barrier helped;
+the remaining decode gap is not understood yet. On an Apple M1 Max the
+Vulkan backend runs through MoltenVK in subgroup-lane mode and passes the
+round-trip suite; its speed is in *Results* (enwik8). The RX 580 has not
+been measured yet.
 
 ## How it works
 
@@ -316,9 +367,10 @@ that the payload runs exactly from the end of the directory to
 
 ## Installing
 
-Pre-built packages come from the `build` GitHub workflow
-(`.github/workflows/build.yml`): every push to `main` produces them as
-workflow artifacts, and a `v*` tag publishes them as a GitHub release.
+Pre-built packages are attached to each [GitHub
+release](https://github.com/Rihoj/gpusqz/releases) (see *Releases and
+versioning*). Every other build of the `build` workflow
+(`.github/workflows/build.yml`) leaves them as workflow artifacts too.
 
 | platform | installer | portable archive | backends |
 |---|---|---|---|
@@ -531,17 +583,59 @@ bash bench/run_bench.sh corpus_varied.txt
 size while keeping the content non-repeating. The 1GB corpus in
 *Results* was built that way.)
 
+## Releases and versioning
+
+gpusqz follows [semantic versioning](https://semver.org) and is released
+automatically by [semantic-release](https://semantic-release.gitbook.io)
+from the commit messages on `main`, which follow [Conventional
+Commits](https://www.conventionalcommits.org):
+
+| commit | example | release |
+|---|---|---|
+| `fix:` / `perf:` | `fix(vulkan): retry refused allocations` | patch (0.1.0 → 0.1.1) |
+| `feat:` | `feat: add --level` | minor (0.1.0 → 0.2.0) |
+| breaking: `!` after the type, or a `BREAKING CHANGE:` footer | `feat!: format v2` | minor while on 0.x; major from 1.0 on |
+| anything else (`docs:`, `test:`, `ci:`, `chore:`, `refactor:`, …) | `docs: fix typo` | none |
+
+While the version is 0.x, the `.gsz` format and the command line may
+still change between minor versions. Going to 1.0.0 is a deliberate step:
+remove the `"breaking": true → minor` rule from `.releaserc.json`, then
+merge a breaking change.
+
+On every push to `main` the `build` workflow asks semantic-release for the
+next version (dry run), builds and tests every package with it, and only
+when all of them pass tags the commit `vX.Y.Z` and publishes the GitHub
+release with generated notes and the packages attached. A push with
+nothing releasable just builds. Pull request titles are checked against
+Conventional Commits, because a squash merge turns the title into the
+commit message; use squash merges (or write every commit that way).
+
+`gpusqz --version` and `gpusqz_refdec --version` print the version. A
+release build prints `X.Y.Z`; any other build prints `git describe`'s
+view, e.g. `0.1.0-3-gabc1234` (3 commits after v0.1.0) with `-dirty` for
+uncommitted changes, fixed when CMake configures. Configure with
+`-DGPUSQZ_VERSION=X.Y.Z` to set it explicitly. The `v0.0.0` tag is not a
+release: it marks where the commit history starts to count.
+
+The release tooling is pinned in `release/package.json` (with its
+lockfile); `release/next-version.mjs` is the dry run CI uses.
+
 ## Known limitations and next steps
 
-- **Vulkan is untested on AMD and Apple hardware so far.** Everything
-  above was verified on lavapipe and on an NVIDIA GPU. The RX 580 and the
-  M1/M4 machines are the targets, and the first runs there should be
+- **Vulkan is untested on AMD hardware so far.** It has been verified on
+  lavapipe, on an NVIDIA GPU and on an Apple M1 Max (round-trip suite
+  passes, subgroup-lane mode; the M4 machines are expected to behave the
+  same but have not been run). The first runs on the RX 580 should be
   `gpusqz devices` (which reports the lane mode after the probe) and
-  `GPUSQZ_BACKEND=vulkan bash tests/round_trip.sh`. Known risks: GCN
+  `GPUSQZ_BACKEND=vulkan bash tests/round_trip.sh`. Known risk: GCN
   cards like the RX 580 run 32 of each 64-lane wavefront (half idle; two
   chunks per wavefront would use it fully, but barrier rules make that a
-  bigger change), and MoltenVK translates the shaders to Metal, which
-  SPIRV-Cross accepted for all of them offline.
+  bigger change).
+- **Timestamp pool too large for Metal.** gpusqz asks for a 65536-entry
+  timestamp query pool; Metal on the M1 Max allows 4096, so MoltenVK
+  logs an error and emulates timestamps. Harmless, but `GPUSQZ_VERBOSE`
+  kernel times on Apple are approximate until the pool is capped at the
+  device limit.
 - **Vulkan decodes slower than CUDA** on NVIDIA, 55–70% of the kernel
   throughput (see *GPU backends*). Compression is within 10%.
 - **Fixed startup cost.** CUDA context creation and allocation take
