@@ -1,0 +1,16 @@
+{
+  "name": "gpusqz-release",
+  "private": true,
+  "description": "semantic-release tooling for gpusqz's GitHub releases (see .releaserc.json and .github/workflows/build.yml)",
+  "type": "module",
+  "engines": {
+    "node": "^22.14.0 || >= 24.10.0"
+  },
+  "dependencies": {
+    "@semantic-release/commit-analyzer": "13.0.1",
+    "@semantic-release/github": "12.0.9",
+    "@semantic-release/release-notes-generator": "14.1.1",
+    "conventional-changelog-conventionalcommits": "9.3.1",
+    "semantic-release": "25.0.9"
+  }
+}

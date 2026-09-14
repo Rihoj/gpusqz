@@ -316,9 +316,10 @@ that the payload runs exactly from the end of the directory to
 
 ## Installing
 
-Pre-built packages come from the `build` GitHub workflow
-(`.github/workflows/build.yml`): every push to `main` produces them as
-workflow artifacts, and a `v*` tag publishes them as a GitHub release.
+Pre-built packages are attached to each [GitHub
+release](https://github.com/Rihoj/gpusqz/releases) (see *Releases and
+versioning*). Every other build of the `build` workflow
+(`.github/workflows/build.yml`) leaves them as workflow artifacts too.
 
 | platform | installer | portable archive | backends |
 |---|---|---|---|
@@ -530,6 +531,43 @@ bash bench/run_bench.sh corpus_varied.txt
 (Repeat `find`/`xargs cat` against more directories to reach a target
 size while keeping the content non-repeating. The 1GB corpus in
 *Results* was built that way.)
+
+## Releases and versioning
+
+gpusqz follows [semantic versioning](https://semver.org) and is released
+automatically by [semantic-release](https://semantic-release.gitbook.io)
+from the commit messages on `main`, which follow [Conventional
+Commits](https://www.conventionalcommits.org):
+
+| commit | example | release |
+|---|---|---|
+| `fix:` / `perf:` | `fix(vulkan): retry refused allocations` | patch (0.1.0 → 0.1.1) |
+| `feat:` | `feat: add --level` | minor (0.1.0 → 0.2.0) |
+| breaking: `!` after the type, or a `BREAKING CHANGE:` footer | `feat!: format v2` | minor while on 0.x; major from 1.0 on |
+| anything else (`docs:`, `test:`, `ci:`, `chore:`, `refactor:`, …) | `docs: fix typo` | none |
+
+While the version is 0.x, the `.gsz` format and the command line may
+still change between minor versions. Going to 1.0.0 is a deliberate step:
+remove the `"breaking": true → minor` rule from `.releaserc.json`, then
+merge a breaking change.
+
+On every push to `main` the `build` workflow asks semantic-release for the
+next version (dry run), builds and tests every package with it, and only
+when all of them pass tags the commit `vX.Y.Z` and publishes the GitHub
+release with generated notes and the packages attached. A push with
+nothing releasable just builds. Pull request titles are checked against
+Conventional Commits, because a squash merge turns the title into the
+commit message; use squash merges (or write every commit that way).
+
+`gpusqz --version` and `gpusqz_refdec --version` print the version. A
+release build prints `X.Y.Z`; any other build prints `git describe`'s
+view, e.g. `0.1.0-3-gabc1234` (3 commits after v0.1.0) with `-dirty` for
+uncommitted changes, fixed when CMake configures. Configure with
+`-DGPUSQZ_VERSION=X.Y.Z` to set it explicitly. The `v0.0.0` tag is not a
+release: it marks where the commit history starts to count.
+
+The release tooling is pinned in `release/package.json` (with its
+lockfile); `release/next-version.mjs` is the dry run CI uses.
 
 ## Known limitations and next steps
 
