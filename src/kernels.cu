@@ -83,7 +83,7 @@ parse_hist_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, 
   chunk_scratch(scratch, c, chunk_size, seqs, rep_code, lits);
   uint32_t hash_words = (1u << hash_bits) * (uint32_t)kBucketWays;
   SeqEmitter em{chunk_in, seqs, lits};
-  lz_parse_warp(chunk_in, in_len, htab + (size_t)c * hash_words, (int)hash_bits, em);
+  lz_parse_warp(chunk_in, in_len, htab + (size_t)c * hash_words, (int)hash_bits, rep_probes(chunk_size), em);
   if (lane == 0) {
     n_seq_arr[c] = em.n_seq;
     n_lit_arr[c] = em.n_lit;

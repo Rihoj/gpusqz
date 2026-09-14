@@ -12,10 +12,14 @@ layout(local_size_x = 32) in;
 const uint kProbe = 32;
 const uint kBucketWays = 4;
 const int kLazySteps = 2;
+const int kMaxRepProbes = 2; // see kernels.h's rep_probes()
 
 // This lane group's chunk: input base, scratch bases, and the running
 // SeqEmitter counts.
 uint g_in, g_seq, g_lit, g_ht, g_n_seq, g_n_lit;
+
+// kernels.h's rep_probes().
+int n_rep_probes() { return pc.chunk_size <= 65536u ? 1 : 2; } // 65536 = kDefaultChunkSize
 
 uint in_byte(uint p) { return uint(inb[g_in + p]); }
 
@@ -77,6 +81,9 @@ void lz_parse(uint n, uint hash_bits) {
 
   uint lit_start = 0;
   uint pos = 0;
+  int n_rep = n_rep_probes();
+  uint rep[kMaxRepProbes];
+  for (int r = 0; r < kMaxRepProbes; ++r) rep[r] = 0;
   while (pos + kMinMatch <= n) {
     uint p = pos + lane;
     bool valid = p + kMinMatch <= n;
@@ -86,7 +93,18 @@ void lz_parse(uint n, uint hash_bits) {
     if (valid) {
       h = hash_at(p, hash_bits);
       for (uint w = 0; w < kBucketWays; ++w) bucket[w] = htab[g_ht + kBucketWays * h + w];
-      probe_bucket(p, bucket, min(kProbe, n - p), best_len, best_off);
+      uint max_len = min(kProbe, n - p);
+      probe_bucket(p, bucket, max_len, best_len, best_off);
+      for (int r = kMaxRepProbes - 1; r >= 0; --r) {
+        uint off = rep[r];
+        if (r < n_rep && off != 0 && off <= p) {
+          uint l = match_len(p - off, p, max_len);
+          if (l >= kMinMatch && l >= best_len) {
+            best_len = l;
+            best_off = off;
+          }
+        }
+      }
     }
     lg_sync(); // all reads of htab precede any insert
 
@@ -126,6 +144,13 @@ void lz_parse(uint n, uint hash_bits) {
       emit(lit_start, pos + j - lit_start, off, len);
       lit_start = pos + j + len;
       cur = j + len;
+      uint carry = off;
+      for (int r = 0; r < kMaxRepProbes; ++r) {
+        uint t = rep[r];
+        rep[r] = carry;
+        carry = t;
+        if (t == off) break;
+      }
     }
     pos += cur > 32 ? cur : 32;
   }

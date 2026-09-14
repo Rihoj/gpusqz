@@ -178,16 +178,20 @@ __device__ inline bool tokens_from_seqs(const uint8_t* in, const SeqRec* seqs, u
 
 // Parses in[0..n) into sequences, calling emit(lit_start, lit_len, off, ml)
 // for each match and once more with ml = 0 for any trailing literals.
-// htab is this chunk's (1 << hash_bits) * kBucketWays-word table.
+// htab is this chunk's (1 << hash_bits) * kBucketWays-word table; n_rep
+// (at most kMaxRepProbes, see rep_probes() in kernels.h) is how many recent
+// match offsets each position also tries.
 //
 // The warp walks the chunk in 32-byte windows. Every lane hashes its own
-// position and probes its bucket's candidates (capped at kProbe bytes so
-// per-lane work is bounded). One lane per bucket then inserts its position,
+// position and probes its bucket's candidates and the recent offsets
+// (capped at kProbe bytes so per-lane work is bounded; zstd's parsers
+// check their repeat offsets too). One lane per bucket then inserts its position,
 // and lanes that found nothing probe again, which catches repeats within
 // the same window. The window's matches are selected warp-uniformly with a
 // kLazySteps lookahead; matches that hit the probe cap are extended
 // cooperatively.
-__device__ inline void lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* htab, int hash_bits, SeqEmitter& emit) {
+__device__ inline void lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* htab, int hash_bits, int n_rep,
+                                     SeqEmitter& emit) {
   int lane = threadIdx.x & 31;
   uint32_t hash_words = (1u << hash_bits) * (uint32_t)kBucketWays;
   for (uint32_t i = lane; i < hash_words; i += 32) htab[i] = kEmptyPos;
@@ -195,6 +199,7 @@ __device__ inline void lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* ht
 
   uint32_t lit_start = 0;
   uint32_t pos = 0;
+  uint32_t rep[kMaxRepProbes] = {}; // recent distinct offsets, most recent first; 0 = none yet
   while (pos + kMinMatch <= n) {
     uint32_t p = pos + lane;
     bool valid = p + kMinMatch <= n;
@@ -207,6 +212,20 @@ __device__ inline void lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* ht
       for (int w = 0; w < kBucketWays; ++w) bucket[w] = htab[kBucketWays * h + w];
       uint32_t max_len = min((uint32_t)kProbe, n - p);
       probe_bucket(in, p, bucket, max_len, best_len, best_off);
+      // The n_rep most recent match offsets too: a match there codes as a
+      // cheap repeat-offset code, so it wins ties with the bucket's
+      // candidates, and the more recent offset wins between them.
+#pragma unroll
+      for (int r = kMaxRepProbes - 1; r >= 0; --r) {
+        uint32_t off = rep[r];
+        if (r < n_rep && off != 0 && off <= p) {
+          uint32_t l = match_len(in, p - off, p, max_len);
+          if (l >= (uint32_t)kMinMatch && l >= best_len) {
+            best_len = l;
+            best_off = off;
+          }
+        }
+      }
     }
     __syncwarp(); // all reads of htab precede any insert
 
@@ -252,6 +271,16 @@ __device__ inline void lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* ht
       emit(lit_start, pos + j - lit_start, off, len);
       lit_start = pos + j + len;
       cur = j + len;
+      // Move off to the front of the recent offsets (warp-uniform): shift
+      // the others down until off's old slot, or the last, is overwritten.
+      uint32_t carry = off;
+#pragma unroll
+      for (int r = 0; r < kMaxRepProbes; ++r) {
+        uint32_t t = rep[r];
+        rep[r] = carry;
+        carry = t;
+        if (t == off) break;
+      }
     }
     pos += cur > 32 ? cur : 32;
   }
