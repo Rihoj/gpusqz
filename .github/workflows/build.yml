@@ -66,7 +66,7 @@ jobs:
           -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc
           -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS"
           -DCMAKE_CUDA_FLAGS="$CUDA_FLAGS"
-          -DGPUSQZ_VERSION=${{ steps.version.outputs.version }}
+          "-DGPUSQZ_VERSION=${{ steps.version.outputs.version }}"
 
       - name: Build
         run: cmake --build build
@@ -139,7 +139,7 @@ jobs:
           -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS"
           -DCMAKE_CUDA_FLAGS="$CUDA_FLAGS"
           -DGPUSQZ_GLSLANG=/tmp/glslang-build/StandAlone/glslang
-          -DGPUSQZ_VERSION=${{ steps.version.outputs.version }}
+          "-DGPUSQZ_VERSION=${{ steps.version.outputs.version }}"
 
       - name: Build
         run: cmake --build build -j "$(nproc)"
@@ -217,7 +217,7 @@ jobs:
           -DCMAKE_CUDA_COMPILER="$env:CUDA_PATH/bin/nvcc.exe"
           "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS"
           "-DCMAKE_CUDA_FLAGS=$env:CUDA_FLAGS"
-          -DGPUSQZ_VERSION=${{ steps.version.outputs.version }}
+          "-DGPUSQZ_VERSION=${{ steps.version.outputs.version }}"
 
       - name: Build
         run: cmake --build build
@@ -228,7 +228,13 @@ jobs:
       # WiX 3 is preinstalled on the runner (candle/light via %WIX%).
       - name: Package
         working-directory: build
-        run: cpack -G "ZIP;WIX"
+        shell: pwsh
+        run: |
+          cpack -G "ZIP;WIX"
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content _CPack_Packages\win64\WIX\wix.log -Tail 60 -ErrorAction SilentlyContinue
+            exit 1
+          }
 
       - name: Smoke-test the zip
         shell: pwsh
@@ -314,7 +320,7 @@ jobs:
           -DGPUSQZ_VULKAN_INCLUDE="$(brew --prefix vulkan-headers)/include"
           -DGPUSQZ_MOLTENVK_DYLIB="$MOLTENVK_DYLIB"
           -DGPUSQZ_MOLTENVK_LICENSE="$MOLTENVK_LICENSE"
-          -DGPUSQZ_VERSION=${{ steps.version.outputs.version }}
+          "-DGPUSQZ_VERSION=${{ steps.version.outputs.version }}"
 
       - name: Build
         run: cmake --build build -j "$(sysctl -n hw.ncpu)"
@@ -346,7 +352,9 @@ jobs:
         run: |
           cpack -G "TGZ;productbuild"
           tar tzf ./*.tar.gz
-          pkgutil --payload-files ./*.pkg
+          pkgutil --expand ./*.pkg pkg-expanded
+          cat pkg-expanded/Distribution
+          find pkg-expanded -maxdepth 2
           # Universal binaries: Apple silicon and Intel.
           for f in gpusqz gpusqz_refdec; do lipo "$f" -verify_arch arm64 x86_64; done
 
@@ -356,7 +364,7 @@ jobs:
         env:
           MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS: "0"
         run: |
-          sudo installer -pkg build/*.pkg -target /
+          sudo installer -verbose -pkg build/*.pkg -target /
           pkgutil --pkgs | grep -i gpusqz
           ls -l /usr/local/bin/gpusqz /usr/local/bin/gpusqz_refdec
           test -f /usr/local/gpusqz/lib/libMoltenVK.dylib

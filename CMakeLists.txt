@@ -277,8 +277,8 @@ set(CPACK_WIX_UPGRADE_GUID "456B3F95-0D42-4444-A110-16E047CCEA5D")
 set(CPACK_WIX_PATCH_FILE ${CMAKE_CURRENT_SOURCE_DIR}/packaging/wix-patch.xml)
 set(CPACK_WIX_PROPERTY_ARPURLINFOABOUT ${CPACK_PACKAGE_HOMEPAGE_URL})
 
-# macOS .pkg
-set(CPACK_PRODUCTBUILD_IDENTIFIER "io.github.rihoj.gpusqz")
+# macOS .pkg (package receipt id: com.gpusqz.gpusqz, CPack's default
+# com.<vendor>.<name>).
 set(CPACK_POSTFLIGHT_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/packaging/macos-postinstall.sh)
 
 set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)

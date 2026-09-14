@@ -341,7 +341,7 @@ MSVC runtime DLLs and the macOS ones `lib/libMoltenVK.dylib`.
   Settings → Privacy & Security → *Open Anyway*, or install from a
   terminal with `sudo installer -pkg gpusqz-<version>-Darwin.pkg -target /`.
   To uninstall: `sudo rm -rf /usr/local/gpusqz /usr/local/bin/gpusqz
-  /usr/local/bin/gpusqz_refdec && sudo pkgutil --forget io.github.rihoj.gpusqz`.
+  /usr/local/bin/gpusqz_refdec && sudo pkgutil --forget com.gpusqz.gpusqz`.
 - **Archives** (`.zip`, `.tar.gz`) need no installation: unpack and run
   from `bin/`. Keep `bin/` and `lib/` together on macOS, and clear the
   download quarantine there first: `xattr -dr com.apple.quarantine <unpacked dir>`.
