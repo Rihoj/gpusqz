@@ -18,8 +18,8 @@ given.
 - **Compare within a corpus, never across corpora.** Even the "same"
   corpus changed once: the 283MB file was rebuilt between 4b943e3 and
   473a54a (`zstd -1`'s ratio on it went from 0.252 to 0.2724), so ratios
-  before and after that line don't compare. Each table lists `zstd -1`'s
-  ratio on the same file as a fingerprint.
+  before and after that line don't compare. Each corpus section gives
+  `zstd -1`'s ratio on its file as a fingerprint.
 - **Conditions matter.** The GPU is shared with other work (often an
   `ollama` model holding 11–15GB of VRAM). Contention halved some kernel
   figures in the past (see [Corrected claims](#corrected-claims)). The
@@ -355,8 +355,10 @@ corpora, the change and its baseline run back to back.
    machine or backend gets its own table with the same columns. Always
    fill in the conditions: GPU, backend and driver, free VRAM and
    utilisation before the run, best of how many runs.
-3. If you rebuilt a corpus, add a *corpus rebuilt here* row and keep
-   `zstd -1`'s ratio on the new file in its column.
+3. Measure `zstd -1` on the same file and record its ratio (in the
+   table's `zstd -1` column where there is one, otherwise in the
+   section's text). If you rebuilt a corpus, add a *corpus rebuilt here*
+   row so older ratios aren't compared with newer ones.
 4. Put experiments that didn't pay off in [Measured and
    rejected](#measured-and-rejected), with the numbers.
 5. If a previous entry turns out wrong, don't edit the numbers: add it to
