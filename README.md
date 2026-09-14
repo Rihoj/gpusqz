@@ -115,11 +115,11 @@ fixed costs more than by the GPU. `GPUSQZ_VERBOSE=1` splits them out:
 - **The RTX kernels are 1.8–3.6x faster.** Part of that gap is the
   backend, not the GPU: on the RTX itself the Vulkan decompress kernel
   runs at 55–70% of CUDA's speed (see *GPU backends*).
-- **The M1 Max's kernel figures are approximate.** MoltenVK caps
-  timestamp query pools well below the size gpusqz asks for and falls
-  back to emulated timestamps (it logs a `VK_ERROR_OUT_OF_DEVICE_MEMORY`
-  line about `MTLCounterSampleBuffer`, which is harmless). Setup and wall
-  times are exact.
+- **The M1 Max's kernel figures are approximate.** The build measured
+  asked for a timestamp query pool larger than Metal's 4096 samples, so
+  MoltenVK emulated the timestamps (it logged a
+  `VK_ERROR_OUT_OF_DEVICE_MEMORY` line about `MTLCounterSampleBuffer`).
+  Later builds cap the pool at 4096. Setup and wall times are exact.
 - **The `ratio` profile needs larger inputs.** 100MB is only 96 of its
   1MB chunks, far too few to fill either GPU.
 - **Against zstd:** `balance` on the M1 Max beats `zstd -1` on both
@@ -631,11 +631,6 @@ lockfile); `release/next-version.mjs` is the dry run CI uses.
   cards like the RX 580 run 32 of each 64-lane wavefront (half idle; two
   chunks per wavefront would use it fully, but barrier rules make that a
   bigger change).
-- **Timestamp pool too large for Metal.** gpusqz asks for a 65536-entry
-  timestamp query pool; Metal on the M1 Max allows 4096, so MoltenVK
-  logs an error and emulates timestamps. Harmless, but `GPUSQZ_VERBOSE`
-  kernel times on Apple are approximate until the pool is capped at the
-  device limit.
 - **Vulkan decodes slower than CUDA** on NVIDIA, 55–70% of the kernel
   throughput (see *GPU backends*). Compression is within 10%.
 - **Fixed startup cost.** CUDA context creation and allocation take

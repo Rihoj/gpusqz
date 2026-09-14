@@ -402,8 +402,10 @@ class VkBackend : public Backend {
   VkDescriptorSetLayout compress_dsl = VK_NULL_HANDLE, decompress_dsl = VK_NULL_HANDLE;
   VkPipelineLayout compress_pl = VK_NULL_HANDLE, decompress_pl = VK_NULL_HANDLE;
   Pipeline parse_hist, build_table, rans_encode, scan, compact, decompress, expand_tables;
+  // Timestamp queries for timing events (create_event), made on first use.
   VkQueryPool queries = VK_NULL_HANDLE;
   uint32_t query_count = 0, next_query = 0;
+  bool queries_tried = false, queries_warned = false;
   bool budget_ext = false;
   // Semaphores of destroyed streams: events may still refer to them.
   std::vector<VkSemaphore> retired;
@@ -827,17 +829,6 @@ bool VkBackend::init(const DevInfo& d, std::string* why) {
     }
   }
 
-  if (d.timestamp_bits > 0) {
-    query_count = 1u << 16;
-    VkQueryPoolCreateInfo qpi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-    qpi.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    qpi.queryCount = query_count;
-    if (vkCreateQueryPool(dev, &qpi, nullptr, &queries) != VK_SUCCESS) {
-      queries = VK_NULL_HANDLE;
-      query_count = 0;
-    }
-  }
-
   // Pick the lane-group build: the subgroup one if the device qualifies
   // and passes the probe, else shared memory (which must pass too).
   if (info.subgroup_lanes && !probe_lanes(true)) {
@@ -933,7 +924,28 @@ std::unique_ptr<HostBuf> VkBackend::alloc_host(size_t bytes) {
 
 std::unique_ptr<Event> VkBackend::create_event(bool timing) {
   auto e = std::make_unique<VkEventImpl>();
-  if (timing && queries && next_query < query_count) e->query = (int)next_query++;
+  if (!timing) return e;
+  // Only GPUSQZ_VERBOSE times anything, so the pool is made on first use
+  // rather than for every run. 4096 queries: Metal's counter sample buffers
+  // hold 4096 samples, and for a bigger pool MoltenVK logs an error and
+  // emulates the timestamps. That is the origin plus 6 marks per batch for
+  // 682 batches; real runs use far fewer.
+  if (!queries_tried) {
+    queries_tried = true;
+    if (info.timestamp_bits > 0) {
+      VkQueryPoolCreateInfo qpi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+      qpi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+      qpi.queryCount = 4096;
+      if (vkCreateQueryPool(dev, &qpi, nullptr, &queries) == VK_SUCCESS) query_count = qpi.queryCount;
+      else queries = VK_NULL_HANDLE;
+    }
+  }
+  if (queries && next_query < query_count) {
+    e->query = (int)next_query++;
+  } else if (queries && !queries_warned) {
+    queries_warned = true;
+    std::fprintf(stderr, "gpusqz: GPU timing ran out of timestamp queries; later batches are not timed\n");
+  }
   return e;
 }
 
