@@ -7,3 +7,8 @@ build-*/
 # Test fixtures are compressed files on purpose (see tests/fixtures/make_fixtures.sh).
 !tests/fixtures/*.gsz
 release/node_modules/
+# Claude Code: the shared config (settings.json, hooks, skills) is committed;
+# worktrees and personal settings are local.
+.claude/worktrees/
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
