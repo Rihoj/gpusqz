@@ -291,10 +291,21 @@ jobs:
       - name: Test (no GPU)
         run: ctest --test-dir build -LE "gpu|vulkan" --output-on-failure
 
-      # Informational: hosted runners may not expose a Metal GPU.
-      - name: List GPUs
+      # Informational: the runner's GPU is Apple's paravirtualized VM device,
+      # which lacks Metal argument encoders (MoltenVK aborts on it unless
+      # argument buffers are turned off). A failure here is not a gpusqz bug.
+      - name: Vulkan round trip on the runner's Metal GPU
         continue-on-error: true
-        run: GPUSQZ_VULKAN_LIB="$MOLTENVK_DYLIB" ./build/gpusqz devices
+        env:
+          MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS: "0"
+        run: |
+          export GPUSQZ_VULKAN_LIB="$MOLTENVK_DYLIB"
+          # round_trip.sh uses GNU stat/base64.
+          brew install coreutils
+          export PATH="$(brew --prefix coreutils)/libexec/gnubin:$PATH"
+          ./build/gpusqz devices
+          # Fixture decoding plus the round-trip suite.
+          ctest --test-dir build -L vulkan --output-on-failure
 
       - name: Package
         working-directory: build

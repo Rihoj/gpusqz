@@ -1,0 +1,4 @@
+# Test fixtures are compared byte for byte: never convert line endings
+# (Windows checkouts would otherwise turn text.orig into CRLF).
+tests/fixtures/* binary
+*.sh text eol=lf
