@@ -227,6 +227,10 @@ endif()
 # live in packaging/.
 # ---------------------------------------------------------------------------
 include(GNUInstallDirs)
+# One install component for everything: CPack's productbuild (.pkg) writes
+# an empty product unless the install has components. The other generators
+# stay monolithic (packaging/CPackOptions.cmake).
+set(CMAKE_INSTALL_DEFAULT_COMPONENT_NAME gpusqz)
 if(GPUSQZ_BUILD_GPU)
   install(TARGETS gpusqz RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
@@ -277,9 +281,13 @@ set(CPACK_WIX_UPGRADE_GUID "456B3F95-0D42-4444-A110-16E047CCEA5D")
 set(CPACK_WIX_PATCH_FILE ${CMAKE_CURRENT_SOURCE_DIR}/packaging/wix-patch.xml)
 set(CPACK_WIX_PROPERTY_ARPURLINFOABOUT ${CPACK_PACKAGE_HOMEPAGE_URL})
 
-# macOS .pkg (package receipt id: com.gpusqz.gpusqz, CPack's default
-# com.<vendor>.<name>).
-set(CPACK_POSTFLIGHT_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/packaging/macos-postinstall.sh)
+# macOS .pkg: the product id, plus ".gpusqz" (the component) for the
+# package receipt that pkgutil lists.
+set(CPACK_PRODUCTBUILD_IDENTIFIER "io.github.rihoj")
+set(CPACK_COMPONENT_GPUSQZ_DISPLAY_NAME "gpusqz")
+set(CPACK_COMPONENT_GPUSQZ_DESCRIPTION "gpusqz, gpusqz_refdec and the MoltenVK library they use")
+set(CPACK_COMPONENT_GPUSQZ_REQUIRED ON)
+set(CPACK_POSTFLIGHT_GPUSQZ_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/packaging/macos-postinstall.sh)
 
 set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
 set(CPACK_DEBIAN_PACKAGE_MAINTAINER ${GPUSQZ_PACKAGE_MAINTAINER})
