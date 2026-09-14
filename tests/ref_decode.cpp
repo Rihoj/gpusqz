@@ -279,7 +279,11 @@ bool decode_lz(const uint8_t* in, size_t in_len, uint8_t* out, size_t orig) {
 } // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 3) fail("usage: gpusqz_refdec <input.gsz> <output>");
+  if (argc == 2 && std::strcmp(argv[1], "--version") == 0) {
+    std::printf("gpusqz_refdec %s\n", GPUSQZ_VERSION_STRING);
+    return 0;
+  }
+  if (argc != 3) fail("usage: gpusqz_refdec <input.gsz> <output> | --version");
   FILE* in = std::fopen(argv[1], "rb");
   if (!in) fail("cannot open input");
   FILE* out = std::fopen(argv[2], "wb");
