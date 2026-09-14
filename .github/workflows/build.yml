@@ -181,6 +181,12 @@ jobs:
         with:
           fetch-depth: 0 # tags, for git describe
 
+      # The container runs as root but the workspace belongs to the runner's
+      # user, so git refuses it ("dubious ownership") and CMake's
+      # `git describe` would fall back to 0.0.0-dev.
+      - name: Trust the workspace for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
 
       - name: Configure
         run: >
