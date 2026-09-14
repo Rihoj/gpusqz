@@ -23,7 +23,7 @@ constexpr uint32_t kVersion = 1;
 constexpr uint32_t kDefaultChunkSize = 65536;
 constexpr uint32_t kMaxChunkSize = 1u << 20;
 
-// Chunk sizes for `gpusqz c --profile speed|balance|ratio` (see README).
+// Chunk sizes for `gpusqz c --profile speed|balance|ratio` (see docs/usage.md).
 constexpr uint32_t kProfileSpeedChunkSize = 65536;
 constexpr uint32_t kProfileBalanceChunkSize = 262144;
 constexpr uint32_t kProfileRatioChunkSize = kMaxChunkSize;

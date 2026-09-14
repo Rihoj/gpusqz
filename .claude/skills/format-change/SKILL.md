@@ -14,8 +14,8 @@ old files simply stop decoding: bump the version, don't add compat paths.
 
 1. **Spec first**: `src/format.h` (header, `ChunkEntry`, `TableGroup`,
    `kVersion`) and `src/rans_codes.h`. Bump `kVersion` for any change a
-   previous decoder would misread. Update README *Container format* /
-   *rANS stage* in the same change.
+   previous decoder would misread. Update `docs/design.md` (*Container format*,
+   *rANS stage*) in the same change.
 2. **CPU decoder**: `tests/ref_decode.cpp` in lockstep. It must reject
    malformed input (the `*.gszbad` fixtures) rather than crash.
 3. **CUDA**: encoder and decoder in `src/kernels.cu`, `src/lz_warp.cuh`,

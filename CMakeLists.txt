@@ -269,6 +269,8 @@ if(GPUSQZ_BUILD_GPU)
 endif()
 install(TARGETS gpusqz_refdec RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES README.md DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/gpusqz)
+install(DIRECTORY docs/ DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/gpusqz/docs
+        FILES_MATCHING PATTERN "*.md")
 # macOS: MoltenVK (Vulkan on Metal) ships in lib/, where gpusqz looks for it
 # (@executable_path/../lib), with its Apache-2.0 license.
 set(GPUSQZ_MOLTENVK_DYLIB "" CACHE FILEPATH "libMoltenVK.dylib to install next to gpusqz (macOS packages)")
