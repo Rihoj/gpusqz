@@ -110,10 +110,18 @@ live only in device memory, in a ring of two buffer sets, each with its
 own stream (a CUDA stream, or a Vulkan queue with a timeline semaphore).
 File data moves through twelve fixed 8MB pinned staging buffers instead
 of pinned batch-sized ones: the main thread `fread`s into an input stage
-and copies it up asynchronously, and a writer thread drains output stages
+and copies it up asynchronously, and writer threads drain output stages
 that the main thread fills with asynchronous downloads. So batch *i+1*'s
 read and upload overlap batch *i*'s kernels, and batch *i−1*'s download
 and file write overlap both.
+
+Every output stage's place in the file is known when it is queued (a
+decompressed chunk *c* starts at *c* × chunk size; compressed batches
+follow each other in the payload), so into a regular file two writer
+threads write stages at their offsets in any order (`pwrite`, or
+`WriteFile` with an offset on Windows). One thread copying out of
+cache-cold staging memory was the limit on decompression. A pipe or a
+device gets one thread writing in order.
 
 Two measurements drove that design:
 

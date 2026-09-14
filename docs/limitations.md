@@ -31,11 +31,11 @@
   ~0.2s on this WSL2 machine, over half of the wall time on the 283MB
   corpus. It amortises on larger inputs and is mostly outside gpusqz's
   control. A native Metal device (M1 Max) starts in well under 0.1s.
-- **Decompression is `fwrite`-bound under WSL2.** Writing 1GB measured
-  0.5–1.2s depending on page-cache state, while the decompress kernel
-  needs ~0.25s, so the writer thread is almost always the bottleneck.
-  gpusqz would need a faster filesystem path to go further, not a faster
-  kernel.
+- **Decompression is bound by writing the file under WSL2.** Decompressing
+  1GB to `/dev/null` takes ~0.35s, and to a file 0.6–0.8s, even with two
+  writer threads (more measured no faster), while the decompress kernel
+  needs ~0.25s. Going further needs a faster filesystem path, not a
+  faster kernel.
 - **`compute_repeat_codes`' encode-side pass is serial**, one lane per
   chunk. Disabling it costs only a few percent of compress-kernel
   throughput on text. Struct-like binary data with recurring strides
