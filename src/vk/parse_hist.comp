@@ -1,0 +1,232 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Port of kernels.cu's parse_hist_kernel with lz_warp.cuh's lz_parse_warp:
+// one lane group per chunk. Chunks of at most 1 byte are stored raw right
+// here. Others are parsed into scratch and, if they could be rANS-coded,
+// counted into the batch histogram.
+#include "common.glsl"
+#include "compress.glsl"
+
+layout(local_size_x = 32) in;
+
+const uint kProbe = 32;
+const uint kBucketWays = 4;
+const int kLazySteps = 2;
+
+// This lane group's chunk: input base, scratch bases, and the running
+// SeqEmitter counts.
+uint g_in, g_seq, g_lit, g_ht, g_n_seq, g_n_lit;
+
+uint in_byte(uint p) { return uint(inb[g_in + p]); }
+
+uint hash_at(uint p, uint hash_bits) {
+  uint v = in_byte(p) | (in_byte(p + 1) << 8) | (in_byte(p + 2) << 16) | (in_byte(p + 3) << 24);
+  return (v * 2654435761u) >> (32 - hash_bits);
+}
+
+uint match_len(uint a, uint b, uint max_len) {
+  uint l = 0;
+  while (l < max_len && inb[g_in + a + l] == inb[g_in + b + l]) ++l;
+  return l;
+}
+
+void probe_bucket(uint p, uint bucket[kBucketWays], uint max_len, inout uint best_len, inout uint best_off) {
+  for (uint i = 0; i < kBucketWays; ++i) {
+    uint cand = bucket[i];
+    if (cand != kEmptyPos && cand < p) {
+      uint l = match_len(cand, p, max_len);
+      if (l > best_len) {
+        best_len = l;
+        best_off = p - cand;
+      }
+    }
+  }
+}
+
+uint lg_extend(uint p, uint off, uint n, uint len) {
+  uint lane = lg_lane();
+  uint max_len = n - p;
+  while (len < max_len) {
+    uint k = len + lane;
+    bool mism = k >= max_len || inb[g_in + p + k] != inb[g_in + p - off + k];
+    uint m = lg_ballot(mism);
+    if (m != 0) return len + uint(findLSB(m));
+    len += 32;
+  }
+  return len;
+}
+
+void emit(uint lit_start, uint lit_len, uint off, uint ml) {
+  uint lane = lg_lane();
+  if (lane == 0) seqs[g_seq + g_n_seq] = seq_pack(lit_len, off, ml);
+  for (uint k = lane; k < lit_len; k += 32) lits[g_lit + g_n_lit + k] = inb[g_in + lit_start + k];
+  ++g_n_seq;
+  g_n_lit += lit_len;
+}
+
+// See lz_parse_warp. One difference: CUDA picks each bucket's inserting
+// lane with __match_any_sync, which Vulkan lacks. Here every lane rewrites
+// its bucket's older ways (lanes sharing a bucket read the same old bucket,
+// so they write the same values), then way 0 takes the lowest lane's
+// position through atomicMin. The table ends up exactly as in CUDA.
+void lz_parse(uint n, uint hash_bits) {
+  uint lane = lg_lane();
+  uint hash_words = (1u << hash_bits) * kBucketWays;
+  for (uint i = lane; i < hash_words; i += 32) htab[g_ht + i] = kEmptyPos;
+  lg_sync();
+
+  uint lit_start = 0;
+  uint pos = 0;
+  while (pos + kMinMatch <= n) {
+    uint p = pos + lane;
+    bool valid = p + kMinMatch <= n;
+    uint h = 0;
+    uint bucket[kBucketWays];
+    uint best_len = 0, best_off = 0;
+    if (valid) {
+      h = hash_at(p, hash_bits);
+      for (uint w = 0; w < kBucketWays; ++w) bucket[w] = htab[g_ht + kBucketWays * h + w];
+      probe_bucket(p, bucket, min(kProbe, n - p), best_len, best_off);
+    }
+    lg_sync(); // all reads of htab precede any insert
+
+    uint hb = g_ht + kBucketWays * h;
+    if (valid) {
+      for (uint w = kBucketWays - 1; w > 0; --w) htab[hb + w] = bucket[w - 1];
+      htab[hb] = kEmptyPos;
+    }
+    lg_sync();
+    if (valid) atomicMin(htab[hb], p);
+    lg_sync();
+
+    if (valid && best_len < kMinMatch) {
+      for (uint w = 0; w < kBucketWays; ++w) bucket[w] = htab[hb + w];
+      probe_bucket(p, bucket, min(kProbe, n - p), best_len, best_off);
+    }
+
+    uint mask = lg_ballot(best_len >= kMinMatch);
+    uint cur = 0;
+    while (cur < 32) {
+      uint m = mask & (~0u << cur);
+      if (m == 0) break;
+      uint j = uint(findLSB(m));
+      uint lj = lg_shfl(best_len, j);
+      // Lazy matching: while the next position's match is longer by more
+      // than one byte, take it instead (up to kLazySteps positions on).
+      for (int step = 0; step < kLazySteps; ++step) {
+        if (j >= 31 || ((mask >> (j + 1)) & 1u) == 0) break;
+        uint lj1 = lg_shfl(best_len, j + 1);
+        if (lj1 <= lj + 1) break;
+        ++j;
+        lj = lj1;
+      }
+      uint off = lg_shfl(best_off, j);
+      uint len = lj;
+      if (len == kProbe) len = lg_extend(pos + j, off, n, len);
+      emit(lit_start, pos + j - lit_start, off, len);
+      lit_start = pos + j + len;
+      cur = j + len;
+    }
+    pos += cur > 32 ? cur : 32;
+  }
+  if (lit_start < n) emit(lit_start, n - lit_start, 0, 0);
+}
+
+// kernels.cu's rans_eligible.
+bool rans_eligible(uint n_seq, out uint token_bytes) {
+  uint tot = 0;
+  bool too_long = false;
+  for (uint i = lg_lane(); i < n_seq; i += 32) {
+    uvec2 r = seqs[g_seq + i];
+    tot += seq_size(seq_ll(r), seq_ml(r));
+    too_long = too_long || seq_ll(r) > kMaxLenValue;
+  }
+  tot = lg_sum(tot);
+  token_bytes = tot;
+  return !lg_any(too_long) && tot >= kRansHeaderBytes;
+}
+
+void compute_repeat_codes(uint n_seq) {
+  if (lg_lane() == 0) {
+    uvec3 rep = uvec3(0);
+    for (uint i = 0; i < n_seq; ++i) {
+      uvec2 r = seqs[g_seq + i];
+      uint off = seq_off(r);
+      uint code = 0;
+      if (seq_ml(r) != 0) {
+        uint slot = rep_find(rep, off);
+        if (slot != kRepNew) code = slot + 1;
+        rep_use(rep, slot, off);
+      }
+      rep_code[g_seq + i] = uint8_t(code);
+    }
+  }
+  lg_sync();
+}
+
+void accumulate_hist(uint n_seq, uint n_lit) {
+  uint lane = lg_lane();
+  uint run_len = lit_run_len(n_lit);
+  uint run0 = lane * run_len, run_end = min(n_lit, run0 + run_len);
+  uint prev = 0;
+  for (uint i = run0; i < run_end; ++i) {
+    uint sym = uint(lits[g_lit + i]);
+    atomicAdd(batch_cnt[lit_entry(lit_ctx(prev, kLitShiftByte), sym)], 1u);
+    prev = sym;
+  }
+  for (uint i = lane; i < n_seq; i += 32) {
+    uvec2 r = seqs[g_seq + i];
+    uint c, nb, b;
+    len_code(seq_ll(r), c, nb, b);
+    atomicAdd(batch_cnt[kLlBase + c], 1u);
+    uint ml = seq_ml(r);
+    len_code(ml != 0 ? ml - (kMinMatch - 1) : 0, c, nb, b);
+    atomicAdd(batch_cnt[kMlBase + c], 1u);
+    if (ml != 0) {
+      uint rc = uint(rep_code[g_seq + i]);
+      if (rc != 0) {
+        c = kOffRepBase + (rc - 1);
+      } else {
+        off_code(seq_off(r), c, nb, b);
+      }
+      atomicAdd(batch_cnt[kOffBase + c], 1u);
+    }
+  }
+}
+
+void main() {
+  uint c = gl_WorkGroupID.x;
+  if (c >= pc.chunk_count) return;
+  uint lane = lg_lane();
+  g_in = c * pc.chunk_size;
+  uint in_len = in_lens[c];
+  uint slot = c * pc.slot_stride;
+
+  if (in_len <= 1) {
+    for (uint k = lane; k < in_len; k += 32) slots[slot + 1 + k] = inb[g_in + k];
+    if (lane == 0) {
+      slots[slot] = uint8_t(kFlagRaw);
+      out_start[c] = 0;
+      out_sizes[c] = 1 + in_len;
+      n_seq_arr[c] = 0;
+      n_lit_arr[c] = 0;
+    }
+    return;
+  }
+
+  g_seq = c * pc.max_seq;
+  g_lit = c * pc.chunk_size;
+  g_ht = c * (kBucketWays << pc.hash_bits);
+  g_n_seq = 0;
+  g_n_lit = 0;
+  lz_parse(in_len, pc.hash_bits);
+  if (lane == 0) {
+    n_seq_arr[c] = g_n_seq;
+    n_lit_arr[c] = g_n_lit;
+  }
+  lg_sync();
+  uint token_bytes;
+  if (!rans_eligible(g_n_seq, token_bytes)) return;
+  compute_repeat_codes(g_n_seq);
+  accumulate_hist(g_n_seq, g_n_lit);
+}

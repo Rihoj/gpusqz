@@ -1,0 +1,23 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Startup check of the lane-group layer (common.glsl) on this device: the
+// Vulkan backend runs it once per build of the layer and uses the subgroup
+// build only if every result is what 32 lock-step lanes would produce.
+// Output per lane (4 words): lane id, a ballot, a shuffle and a sum.
+#include "common.glsl"
+
+layout(local_size_x = 32) in;
+layout(std430, binding = 0) buffer Out { uint res[]; };
+
+void main() {
+  uint base = gl_WorkGroupID.x * 32 * 4 + gl_LocalInvocationIndex * 4;
+  uint lane = lg_lane();
+  uint m = lg_ballot((lane & 1u) != 0);
+  uint sh = lg_shfl(lane * 3 + 1, 31 - lane);
+  uint s = lg_sum(lane + 1);
+  bool a = lg_any(lane == 17);
+  res[base] = lane;
+  res[base + 1] = m;
+  res[base + 2] = sh;
+  res[base + 3] = a ? s : 0;
+}

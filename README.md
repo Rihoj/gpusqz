@@ -1,7 +1,10 @@
-# gzp — a GPU file compressor
+# gpusqz — a GPU file compressor
 
-`gzp` compresses and decompresses files on an NVIDIA GPU with CUDA. Each
-chunk of the input (64KB by default, up to 1MB) is handled by one warp: an
+`gpusqz` (pronounced "GPU squeeze") compresses and decompresses files on
+the GPU; compressed files use the `.gsz` extension. It runs on NVIDIA GPUs
+with CUDA and on AMD, Apple silicon and Intel GPUs with Vulkan (see *GPU
+backends*); both produce the same files. Each chunk of the input (64KB by
+default, up to 1MB) is handled by one group of 32 lanes (a CUDA warp): an
 LZ parse where all 32 lanes search for matches together, followed by a
 32-way interleaved rANS entropy coder with order-1 literal contexts. It's
 a from-scratch, educational implementation — not a drop-in replacement for
@@ -12,15 +15,17 @@ profile lands within 0.5% of `zstd -3`'s output size while compressing
 
 ## Results
 
-RTX 5060 Ti (16GB) under WSL2, CPU tools single-threaded, best of 3–5 runs
+CUDA backend on an RTX 5060 Ti (16GB) under WSL2, CPU tools
+single-threaded, best of 3–5 runs
 per column (`REPEAT=<n>`, see *Benchmarking*). Wall figures are
-whole-process (file I/O, PCIe copies, and for gzp ~0.2s of CUDA context
+whole-process (file I/O, PCIe copies, and for gpusqz ~0.2s of CUDA context
 creation and allocation); the kernel columns are the wall-clock time any
-gzp kernel was running. Ratio is output/input, so **lower is better**.
+gpusqz kernel was running. Ratio is output/input, so **lower is better**.
 
 **Measurement conditions.** The GPU was otherwise idle (~1GB used by the
-desktop, 0–2% utilisation), so gzp's batch budget was its full 4GB. On
-the 283MB corpus about half of gzp's wall time is the ~0.2s fixed startup
+desktop, 0–2% utilisation), and gpusqz's batch budget was 4GB (the default
+at the time; it is now 80% of free GPU memory, see *Usage*). On
+the 283MB corpus about half of gpusqz's wall time is the ~0.2s fixed startup
 cost, which varies by ±15% between runs, so its wall figures there move
 by that much from run to run; the kernel figures and the 1GB corpus are
 the steadier comparison. An earlier set of runs with another process
@@ -31,9 +36,9 @@ without repetition; see *Benchmarking*):
 
 | codec | compress MB/s (wall) | kernel MB/s | decompress MB/s (wall) | kernel MB/s | ratio |
 |---|---|---|---|---|---|
-| **gzp** (default, `speed`, 64KB) | **1297** | 2983 | 1130 | 4567 | 0.2526 |
-| gzp `--profile balance` (256KB) | 989 | 1847 | 1267 | 3353 | 0.2387 |
-| gzp `--profile ratio` (1MB) | 873 | 1552 | 1176 | 1906 | 0.2255 |
+| **gpusqz** (default, `speed`, 64KB) | **1297** | 2983 | 1130 | 4567 | 0.2526 |
+| gpusqz `--profile balance` (256KB) | 989 | 1847 | 1267 | 3353 | 0.2387 |
+| gpusqz `--profile ratio` (1MB) | 873 | 1552 | 1176 | 1906 | 0.2255 |
 | gzip -1 | 145 | – | 250 | – | 0.2836 |
 | gzip -6 | 56 | – | 278 | – | 0.2306 |
 | zstd -1 (1 thread) | 516 | – | **1434** | – | 0.2518 |
@@ -44,9 +49,9 @@ friendlier shape for a match finder, see the caveat in *Benchmarking*):
 
 | codec | compress MB/s (wall) | kernel MB/s | decompress MB/s (wall) | kernel MB/s | ratio |
 |---|---|---|---|---|---|
-| **gzp** (default, `speed`, 64KB) | **664** | 2390 | 718 | 3805 | 0.2673 |
-| gzp `--profile balance` (256KB) | 552 | 1746 | 715 | 3414 | 0.2547 |
-| gzp `--profile ratio` (1MB) | 487 | 1232 | 657 | 1515 | **0.2423** |
+| **gpusqz** (default, `speed`, 64KB) | **664** | 2390 | 718 | 3805 | 0.2673 |
+| gpusqz `--profile balance` (256KB) | 552 | 1746 | 715 | 3414 | 0.2547 |
+| gpusqz `--profile ratio` (1MB) | 487 | 1232 | 657 | 1515 | **0.2423** |
 | gzip -1 | 140 | – | 249 | – | 0.2985 |
 | gzip -6 | 53 | – | 273 | – | 0.2457 |
 | zstd -1 (1 thread) | 482 | – | **1328** | – | 0.2724 |
@@ -54,19 +59,19 @@ friendlier shape for a match finder, see the caveat in *Benchmarking*):
 
 Against the CPU tools:
 
-- **Default profile vs `zstd -1`.** gzp compresses 1.4x (283MB) to 2.5x
+- **Default profile vs `zstd -1`.** gpusqz compresses 1.4x (283MB) to 2.5x
   (1GB) faster. Its output is 1.9% smaller on the repetitive corpus and
   0.3% larger on the varied one. `zstd -1` decompresses faster: 1.85x on
-  the smaller file, where gzp's fixed startup cost weighs more, and 1.3x
+  the smaller file, where gpusqz's fixed startup cost weighs more, and 1.3x
   on the 1GB file.
-- **`ratio` profile vs `zstd -3`.** gzp compresses 1.3–2.2x faster. Its
+- **`ratio` profile vs `zstd -3`.** gpusqz compresses 1.3–2.2x faster. Its
   output is 0.1% smaller on the repetitive corpus and 0.5% larger on the
   varied one. `zstd -3` decompresses 1.1–1.8x faster.
-- **vs `gzip`.** Every gzp profile beats `gzip -1` on both ratio and
+- **vs `gzip`.** Every gpusqz profile beats `gzip -1` on both ratio and
   speed. The `ratio` profile also beats `gzip -6`'s ratio on both corpora
   while compressing 9–16x faster; `balance` does not beat `gzip -6`.
 
-The gzp wall figures on the 1GB corpus are bounded by file I/O more than
+The gpusqz wall figures on the 1GB corpus are bounded by file I/O more than
 by the GPU: under WSL2, decompression spends most of its time in
 `fwrite` (see *Known limitations*), and the kernels run 1.6–4x faster
 than the wall-clock rate.
@@ -103,6 +108,60 @@ this one, run back to back:
 4. **Bigger match-finder tables** for `balance` and `ratio`, which had
    only been measured with ~32 warps in flight: 2–3% smaller at those
    profiles. See *Known limitations*.
+
+## GPU backends
+
+gpusqz has two backends behind one interface (`src/backend.h`); the host
+pipeline, the file format and every file they write are shared.
+
+| backend | GPUs | kernels | chosen when |
+|---|---|---|---|
+| CUDA | NVIDIA, compute capability 7.0+ | `src/kernels.cu`, `lz_warp.cuh`, `rans.cuh` | an NVIDIA GPU and driver are present |
+| Vulkan 1.2 | AMD (e.g. RX 580), Apple M1–M4 through MoltenVK, Intel, NVIDIA | `src/vk/*.comp` (GLSL, compiled to SPIR-V at build time) | otherwise |
+
+`--backend auto|cuda|vulkan` (or `GPUSQZ_BACKEND`) overrides the choice,
+and `gpusqz devices` lists what each backend finds, including which lane
+mode (below) a Vulkan device ends up in. The two backends' output is
+byte-identical: that was checked on lavapipe at subgroup sizes 8, 16, 32
+and 64 and on the RTX 5060 Ti through NVIDIA's Vulkan driver, and the
+tests decode each backend's files with the other and with the CPU
+reference decoder.
+
+**Lanes on non-NVIDIA hardware.** The format depends on exactly 32 lanes
+per chunk (32 interleaved rANS states, 32 literal runs), but GPUs group
+threads differently: 32 on NVIDIA and Apple, 64 on AMD GCN cards such as
+the RX 580, 32 or 64 on newer AMD cards, 8–32 on Intel. The Vulkan
+shaders run each chunk as a workgroup of 32 and go through a small
+lane-group layer (`src/vk/common.glsl`) with two builds:
+
+- *Subgroup lanes*, the fast one: ballots and shuffles are single
+  subgroup operations. Used where a 32-invocation workgroup is one
+  subgroup (size 32, or size 32 requested through subgroup size control)
+  or half of one (size 64, half the lanes idle).
+- *Shared-memory lanes*: ballots and shuffles go through shared memory and
+  workgroup barriers. Correct on any subgroup size, several times slower.
+
+At startup the backend runs a probe shader on the subgroup build and
+checks every lane's ballot, shuffle and sum; if anything is off, it falls
+back to shared-memory lanes rather than risk wrong output. (Mesa's lavapipe
+fails the probe at subgroup size 64, for example.) `GPUSQZ_VK_LANES=shared`
+forces the fallback.
+
+CUDA's `__match_any_sync`, which picks one lane per hash bucket to
+insert, has no Vulkan equivalent. Instead every lane rewrites its bucket's
+older ways (lanes sharing a bucket write identical values), and way 0
+takes the lowest lane's position through `atomicMin`. That leaves the
+table exactly as CUDA does, which is why the output matches byte for
+byte.
+
+**Vulkan speed, measured on the one GPU available.** On the RTX 5060 Ti
+(Windows NVIDIA Vulkan driver) the Vulkan compress kernels ran at 90–96%
+of CUDA's throughput and the decompress kernel at 55–70% (283MB corpus;
+e.g. `speed` profile 2013 vs 2227 MB/s compress, 1874 vs 3323 MB/s
+decompress). Removing `coherent` from the scratch buffers and dropping
+a redundant memory barrier helped; the remaining decode gap is not
+understood yet. Speed on the RX 580 and the Apple chips has not been
+measured: nobody has run it on that hardware yet.
 
 ## How it works
 
@@ -203,10 +262,11 @@ front, into a global buffer that each chunk finds through its group id.
 Malformed input sets an error flag that the host turns into an error
 rather than garbage output.
 
-### Host pipeline (`src/main.cu`)
+### Host pipeline (`src/main.cpp`)
 
 Batches live only in device memory, in a ring of two buffer sets, each
-with its own CUDA stream. File data moves through twelve fixed 8MB
+with its own stream (a CUDA stream, or a Vulkan queue with a timeline
+semaphore). File data moves through twelve fixed 8MB
 pinned staging buffers instead of pinned batch-sized ones: the main
 thread `fread`s into an input stage and copies it up asynchronously, and
 a writer thread drains output stages that the main thread fills with
@@ -224,16 +284,18 @@ Two measurements drove that design:
   flight are roughly one batch, and a bigger batch beats more sets.
 
 Batch size comes from free VRAM, since the GPU may be shared: at least
-1024 chunks and 32MB of input, within half of free VRAM up to 4GB. A
+1024 chunks and 32MB of input, within 80% of the free VRAM (or an
+explicit `--gpu-mem` budget). That memory is allocated once, at startup,
+and held until gpusqz exits, so another process can't take it mid-run. A
 file that fits in one or two batches gets the whole budget. Allocation
 retries with a halved batch on failure. Compressed output is compacted
-on the GPU (a CUB scan plus a pack kernel, writing into the batch's
-now-dead scratch), so the download moves only compressed bytes.
+on the GPU (a prefix sum plus a pack kernel, writing into memory the
+batch no longer needs), so the download moves only compressed bytes.
 
 ### Container format (`src/format.h`)
 
 ```
-FileHeader    { magic, version=5, chunk_size, original_size, chunk_count,
+FileHeader    { magic="GSQZ", version=1, chunk_size, original_size, chunk_count,
                 table_group_count, tables_offset }
 ChunkEntry[]  { offset, compressed_size, original_size }     -- one per chunk
 TableGroup[]  { start_chunk, chunk_count, lit_ctx_shift }    -- one per compression batch
@@ -252,23 +314,73 @@ come after the payload rather than in the directory. The decoder checks
 that the payload runs exactly from the end of the directory to
 `tables_offset` and that the table section ends the file.
 
+## Installing
+
+Pre-built packages come from the `build` GitHub workflow
+(`.github/workflows/build.yml`): every push to `main` produces them as
+workflow artifacts, and a `v*` tag publishes them as a GitHub release.
+
+| platform | package | backends | contents |
+|---|---|---|---|
+| Ubuntu 22.04+, Debian 12+ | `gpusqz_<version>_amd64.deb` | CUDA, Vulkan | `gpusqz`, `gpusqz_refdec` |
+| RHEL/Rocky/Alma 8+, Fedora | `gpusqz-<version>-1.x86_64.rpm` | CUDA, Vulkan | `gpusqz`, `gpusqz_refdec` |
+| Windows 10/11 x64 | `gpusqz-<version>-win64.zip` | CUDA, Vulkan | `gpusqz.exe`, `gpusqz_refdec.exe`, MSVC runtime DLLs |
+| macOS 11+ (Apple silicon and Intel) | `gpusqz-<version>-Darwin.tar.gz` | Vulkan (MoltenVK) | `bin/gpusqz`, `bin/gpusqz_refdec`, `lib/libMoltenVK.dylib` |
+
+What each GPU needs at run time:
+
+- **NVIDIA**: compute capability 7.0 (Volta) or newer and a driver that
+  supports CUDA 12. The CUDA runtime is linked in, so no toolkit is
+  needed. The packages carry native code for Volta through Blackwell plus
+  PTX that newer GPUs compile at load time.
+- **AMD** (e.g. Radeon RX 580): the driver's Vulkan support. On Linux
+  that is Mesa's RADV (`mesa-vulkan-drivers` on Debian/Ubuntu,
+  `mesa-vulkan-drivers` on Fedora/RHEL) with the Vulkan loader
+  (`libvulkan1` / `vulkan-loader`). On Windows it is the AMD Adrenalin
+  driver. (ROCm/HIP is not used: it dropped Polaris cards like the RX 580
+  and doesn't exist for them on Windows.)
+- **Apple silicon** (M1, M4 and later): nothing to install. The macOS
+  package ships MoltenVK, which runs the Vulkan backend on Metal, in
+  `lib/` next to `bin/`; keep that layout. A Homebrew `molten-vk` or the
+  Vulkan SDK also work. Downloaded binaries are unsigned, so macOS
+  quarantines them: `xattr -dr com.apple.quarantine <unpacked dir>`.
+- **Intel**: the driver's Vulkan support (Mesa ANV on Linux).
+
+Run `gpusqz devices` to see what gpusqz found. `gpusqz_refdec <in.gsz>
+<out>` decompresses on the CPU anywhere, with no GPU at all.
+
 ## Building
 
-Requires CUDA 12.8+ and CMake 3.20+. Targets sm_120 (RTX 5060 Ti /
-Blackwell) by default; override for other hardware:
+Requires CMake 3.20+, plus for each backend:
+
+- **CUDA** (`-DGPUSQZ_BUILD_CUDA=ON`, the default except on macOS): CUDA
+  12.8+. Targets sm_120 (RTX 5060 Ti / Blackwell) by default; override
+  with `-DCMAKE_CUDA_ARCHITECTURES=<arch>`.
+  (`CMAKE_CUDA_ARCHITECTURES=native` is not used because under WSL it
+  silently fell back to sm_52.) Release builds pass every generation:
+  see `CUDA_ARCHS` in the workflow.
+- **Vulkan** (`-DGPUSQZ_BUILD_VULKAN=ON`, the default): the Vulkan headers
+  and `glslangValidator` — the Vulkan SDK, or distro packages
+  (`libvulkan-dev glslang-tools` on Debian/Ubuntu; `brew install
+  vulkan-headers glslang` on macOS). The Vulkan library itself is loaded
+  at run time, not linked. Point CMake at them with
+  `-DGPUSQZ_VULKAN_INCLUDE=<dir>` / `-DGPUSQZ_GLSLANG=<path>` if they are
+  somewhere unusual.
 
 ```
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release [-DCMAKE_CUDA_ARCHITECTURES=<arch>]
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-(`CMAKE_CUDA_ARCHITECTURES=native` is not used because under WSL it
-silently fell back to sm_52 instead of detecting the GPU.)
+With both backends off only `gpusqz_refdec` is built. On macOS,
+`-DGPUSQZ_MOLTENVK_DYLIB=<libMoltenVK.dylib>` (and `_LICENSE`) makes the
+package ship MoltenVK. `cpack -G DEB`, `RPM`, `ZIP` or `TGZ` in the build
+directory produces the packages above.
 
-`GZP_MIN_BLOCKS_PER_SM=<n>` (a CMake cache var, not a runtime flag) sets
+`GPUSQZ_MIN_BLOCKS_PER_SM=<n>` (a CMake cache var, not a runtime flag) sets
 `__launch_bounds__`'s `minBlocksPerSM` hint on the per-chunk kernels, for
 A/B occupancy testing — see the comment above it in `CMakeLists.txt`. None
-of those kernels use shared memory, and at 38 (parse), 64 (encode) and 58
+of those kernels use shared memory, and at 40 (parse), 62 (encode) and 58
 (decode) registers per thread with no spills (`nvcc -Xptxas -v`), their
 one-warp blocks are limited by the per-SM block count rather than by
 registers, so this knob is mainly a regression check against future
@@ -277,28 +389,44 @@ register spilling.
 ## Usage
 
 ```
-./build/gzp c <input> <output> [chunk_size]                # compress (default chunk_size 65536)
-./build/gzp c <input> <output> --profile speed|balance|ratio  # ...or pick a chunk-size preset
-./build/gzp d <input> <output>                              # decompress
+./build/gpusqz c <input> <output> [chunk_size]                # compress (default chunk_size 65536)
+./build/gpusqz c <input> <output> --profile speed|balance|ratio  # ...or pick a chunk-size preset
+./build/gpusqz d <input> <output>                              # decompress
+./build/gpusqz c|d ... --gpu-mem 8G                            # GPU memory for batch buffers
+./build/gpusqz c|d ... --backend vulkan                        # pick the backend (auto, cuda, vulkan)
+./build/gpusqz devices                                         # list GPUs per backend
 ```
 
 `chunk_size` and `--profile` are mutually exclusive, and unrecognised
 arguments are rejected. See *Results* for what each profile costs and
 buys.
 
+`--gpu-mem SIZE` (or `GPUSQZ_GPU_MEM`) sets how much GPU memory gpusqz may use
+for its batch buffers: a number with a K, M, G or T suffix, or a bare
+number of MiB. By default gpusqz takes 80% of the GPU memory free when it
+starts; an explicit value may use all but 256MiB of the free
+memory and is reduced, with a note, if it asks for more. On GPUs that
+share system RAM (Apple silicon, integrated GPUs) "free GPU memory" is
+counted as at most half of that RAM, so the default stays at 40% of it. Host RAM use
+does not depend on it: gpusqz pins a fixed ~96MB of staging buffers.
+
 Environment variables, all optional:
 
 | variable | effect |
 |---|---|
-| `GZP_VERBOSE=1` | Per-stage timing on stderr: setup, fread, copies, kernel time (summed and wall-clock union), fwrite, staging stalls. |
-| `GZP_FORCE_BATCH=<n>` | Force chunks per batch (testing; see *Testing*). |
-| `GZP_FORCE_SETS=<1-3>` | Force the device buffer-set count (tuning). |
-| `GZP_FORCE_LIT_SHIFT=<0\|4\|8>` | Force every batch's literal-context rule (testing and tuning). |
-| `GZP_DUMP_LITS=<path>` | Dump each chunk's parsed literal stream, for evaluating literal models offline. Serialises the pipeline. |
+| `GPUSQZ_VERBOSE=1` | Per-stage timing on stderr: setup, fread, copies, kernel time (summed and wall-clock union), fwrite, staging stalls. |
+| `GPUSQZ_FORCE_BATCH=<n>` | Force chunks per batch (testing; see *Testing*). |
+| `GPUSQZ_FORCE_LIT_SHIFT=<0\|4\|8>` | Force every batch's literal-context rule (testing and tuning). |
+| `GPUSQZ_BACKEND=auto\|cuda\|vulkan` | Same as `--backend`. |
+| `GPUSQZ_VK_DEVICE=<n>` | Use Vulkan device *n* from `gpusqz devices` (default: the first discrete GPU, then integrated, then others). |
+| `GPUSQZ_VK_LANES=shared` | Force shared-memory lanes (testing). |
+| `GPUSQZ_VULKAN_LIB=<path>` | Load this Vulkan library instead of the system loader (or bundled MoltenVK). |
+| `GPUSQZ_VK_DEBUG=1` | Print why the subgroup-lane probe failed, if it does. |
 
 ## Testing
 
 ```
+ctest --test-dir build                   # everything below, per backend built
 bash tests/round_trip.sh                 # default chunk size, literal-context and --profile cases
 bash tests/round_trip.sh --extremes      # chunk sizes 1, 16, 4K, 8K, 32K, 65535, 65536,
                                           # 1048575, 1048576 (kMaxChunkSize), mismatched
@@ -313,12 +441,37 @@ a symmetric bug in the GPU encoder and decoder can't hide. That matters
 here because `compute-sanitizer` in CUDA 12.8 does not support this GPU,
 so memcheck was not available during development.
 
+`round_trip.sh` uses whatever backend `--backend`'s default picks; set
+`GPUSQZ_BACKEND=vulkan` to test the Vulkan one. `ctest` runs the suite
+once per backend built (labels `gpu` for CUDA and `vulkan`), plus
+committed fixtures in `tests/fixtures` decoded by the CPU decoder and by
+each backend: small files compressed by the GPU build that cover raw,
+token and rANS chunks, all three literal-context rules and several table
+groups, plus corrupt files that must be rejected. After any change to the
+file format, regenerate them on a GPU machine with
+`tests/fixtures/make_fixtures.sh` and commit the result.
+
+**Vulkan without a GPU.** Mesa's lavapipe is a Vulkan driver that runs on
+the CPU, and its subgroup size follows its vector width, so it can stand
+in for each kind of GPU:
+
+```
+export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json GPUSQZ_BACKEND=vulkan
+LP_NATIVE_VECTOR_WIDTH=1024 bash tests/round_trip.sh   # subgroup 32 (NVIDIA, Apple)
+LP_NATIVE_VECTOR_WIDTH=256  bash tests/round_trip.sh   # subgroup 8: shared-memory lanes
+```
+
+(2048 gives subgroup size 64, where lavapipe fails the lane probe and
+falls back to shared-memory lanes.) The Linux CI job runs the `vulkan`
+tests this way, so the Vulkan backend is exercised on every push.
+GitHub's runners have no GPU, so the `gpu` label (CUDA) is skipped there.
+
 Notable cases:
 
 - **Literal contexts.** Literal-heavy base64 and source-text inputs run
   at every forced literal-context rule, since the automatic choice would
   pick order-0 for most small test files.
-- **Mismatched batches.** `GZP_FORCE_BATCH` exists because a
+- **Mismatched batches.** `GPUSQZ_FORCE_BATCH` exists because a
   `TableGroup`'s boundaries are fixed at compress time, but decompression
   picks its own batch size independently. The extremes suite compresses
   and decompresses with deliberately different batch sizes, in both
@@ -334,16 +487,16 @@ Notable cases:
 ```
 find /usr/include -name '*.h' | head -400 | xargs cat > corpus.txt
 for i in $(seq 48); do cat corpus.txt; done > corpus_283mb.txt
-REPEAT=5 bash bench/run_bench.sh corpus_283mb.txt                     # gzp default vs gzip/zstd
-CPU=0 REPEAT=5 bash bench/run_bench.sh corpus_283mb.txt --profile ratio  # one gzp profile only
+REPEAT=5 bash bench/run_bench.sh corpus_283mb.txt                     # gpusqz default vs gzip/zstd
+CPU=0 REPEAT=5 bash bench/run_bench.sh corpus_283mb.txt --profile ratio  # one gpusqz profile only
 ```
 
-The script reports wall and kernel MB/s for gzp and compares against
+The script reports wall and kernel MB/s for gpusqz and compares against
 `gzip -1/-6` and single-threaded `zstd -1/-3` when available. On a shared
 GPU a single wall-clock measurement can be dominated by another process,
 so `REPEAT=<n>` runs each codec n times and reports the best run per
-column. Check `nvidia-smi` first: another process's memory shrinks gzp's
-batches, and its compute slows gzp's global-memory-latency-bound parse.
+column. Check `nvidia-smi` first: another process's memory shrinks gpusqz's
+batches, and its compute slows gpusqz's global-memory-latency-bound parse.
 
 **The 283MB recipe repeats one 5.4MB block 48x, which is not a neutral
 choice of large file.** It once hid a real regression: a match-finding
@@ -362,18 +515,29 @@ size while keeping the content non-repeating. The 1GB corpus in
 
 ## Known limitations and next steps
 
+- **Vulkan is untested on AMD and Apple hardware so far.** Everything
+  above was verified on lavapipe and on an NVIDIA GPU. The RX 580 and the
+  M1/M4 machines are the targets, and the first runs there should be
+  `gpusqz devices` (which reports the lane mode after the probe) and
+  `GPUSQZ_BACKEND=vulkan bash tests/round_trip.sh`. Known risks: GCN
+  cards like the RX 580 run 32 of each 64-lane wavefront (half idle; two
+  chunks per wavefront would use it fully, but barrier rules make that a
+  bigger change), and MoltenVK translates the shaders to Metal, which
+  SPIRV-Cross accepted for all of them offline.
+- **Vulkan decodes slower than CUDA** on NVIDIA, 55–70% of the kernel
+  throughput (see *GPU backends*). Compression is within 10%.
 - **Fixed startup cost.** CUDA context creation and allocation take
   ~0.2s on this WSL2 machine, over half of the wall time on the 283MB
-  corpus. It amortises on larger inputs and is mostly outside gzp's
+  corpus. It amortises on larger inputs and is mostly outside gpusqz's
   control.
 - **Decompression is `fwrite`-bound under WSL2.** Writing 1GB measured
   0.5–1.2s depending on page-cache state, while the decompress kernel
   needs ~0.25s, so the writer thread is almost always the bottleneck.
-  gzp would need a faster filesystem path to go further, not a faster
+  gpusqz would need a faster filesystem path to go further, not a faster
   kernel.
-- **Ratio vs zstd.** zstd's parser is more sophisticated than gzp's hash
+- **Ratio vs zstd.** zstd's parser is more sophisticated than gpusqz's hash
   match finder with a two-step lazy lookahead: `zstd -3`'s output is ~0.5%
-  smaller than gzp's `ratio` profile on the varied corpus. An optimal parser, or
+  smaller than gpusqz's `ratio` profile on the varied corpus. An optimal parser, or
   a match finder with longer chains, would be the next ratio lever. A
   third lazy step and a 64-byte probe cap were measured and did nothing
   useful (see the comments at `kLazySteps` and `kProbe`).
@@ -399,11 +563,18 @@ size while keeping the content non-repeating. The 1GB corpus in
   sensitive to a *concurrent* GPU process than shared memory was. Under
   ~40% contention, the `ratio` compress kernel measured at half its
   actual speed.
-- **The 4GB batch budget cap binds at `ratio`.** Even with 15GB of VRAM
-  free, a 1GB file at the 1MB profile gets batches of ~350 chunks,
-  because each chunk needs ~6MB of device memory. Kernel throughput
-  follows chunks in flight, so raising `kMaxBudgetBytes` (`main.cu`) on
-  large GPUs is the next thing to measure for that profile.
+- **A bigger GPU-memory budget doesn't make `ratio` faster.** Each 1MB
+  chunk needs ~6MB of device memory. With the old 4GB default, a 1GB file
+  ran as three batches of ~350 chunks; the current 80%-of-free default
+  fits it in one batch on an idle 16GB GPU. Both measured the same kernel
+  throughput (~1550 MB/s, the GPU is saturated) and wall throughput within
+  run-to-run noise (851 vs 869 MB/s compress). Going much lower does cost:
+  a 2G budget measured 900 MB/s of kernel throughput.
+- **No exclusive GPU access.** gpusqz holds its batch memory for the whole
+  run, but it can't stop other processes from using the rest of the GPU's
+  memory or its compute; exclusive use needs the system-wide compute mode
+  (`nvidia-smi -c EXCLUSIVE_PROCESS`, administrator rights, not available
+  under WSL2).
 - **Literal-context choice is per batch, estimated from the histogram.**
   It is exact about which chunks can't use rANS, but not about which
   chunks will lose to plain tokens later, so a batch can occasionally

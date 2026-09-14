@@ -1,9 +1,9 @@
-// Independent CPU decoder for the gzp container, used by the tests to
+// Independent CPU decoder for the gpusqz container, used by the tests to
 // check that GPU-compressed files decode correctly by an implementation
 // that shares no code with the GPU path (a symmetric bug in the GPU
 // encoder and decoder would still round-trip on the GPU alone).
 //
-//   gzp_refdec <input.gzp> <output>
+//   gpusqz_refdec <input.gsz> <output>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
@@ -11,15 +11,16 @@
 #include <vector>
 #include <string>
 
+#include "file_io.h"
 #include "format.h"
 #include "rans_codes.h"
 
-using namespace gzp;
+using namespace gpusqz;
 
 namespace {
 
 [[noreturn]] void fail(const std::string& msg) {
-  std::fprintf(stderr, "gzp_refdec: %s\n", msg.c_str());
+  std::fprintf(stderr, "gpusqz_refdec: %s\n", msg.c_str());
   std::exit(1);
 }
 
@@ -31,11 +32,6 @@ struct Seq {
   uint32_t lit_len, ml, off;
 };
 
-// Serial emulation of the GPU's 32-lane interleaved rANS decoder. The GPU
-// runs each sub-step for all lanes at once and lets the lanes that need a
-// word take one in lane order, so visiting lanes 0..31 within each
-// sub-step, reading a word whenever that lane needs one, consumes the
-// stream identically.
 // One TableGroup's tables, expanded from its quantised counts: the three
 // small alphabets, then one literal table per context (layout in
 // rans_codes.h).
@@ -57,6 +53,11 @@ struct Tables {
   }
 };
 
+// Serial emulation of the GPU's 32-lane interleaved rANS decoder. The GPU
+// runs each sub-step for all lanes at once, and the lanes that need a word
+// take one in lane order, so visiting lanes 0..31 within each sub-step and
+// reading a word whenever that lane needs one consumes the stream
+// identically.
 struct RansDecoder {
   const uint8_t* p;
   size_t len, rp;
@@ -106,19 +107,9 @@ struct RansDecoder {
     x[l] = t.freq[e] * (x[l] >> kProbBits) + slot - t.cum[e];
     renorm(l);
   }
-  // Mirrors the GPU's rans_dec_bits16 exactly: extracts at most 16 bits
-  // for lane l (0 if !on), then renorms -- but renorm's word-need check
-  // is itself gated by `on`, so an inactive/width-0 call never consumes a
-  // word for lane l regardless of its x[l]. Must be called for every lane
-  // 0..31 at this same logical step even when on(l) is false for some of
-  // them: the GPU's ballot-based word consumption is a per-step, whole-
-  // warp operation, so which lanes participate at THIS step (not just
-  // which lanes are active overall) determines the shared stream's word
-  // order. See bits_pass() below for why a per-lane serial bits(l, nb)
-  // (extracting nb up to 32 bits for lane l immediately, before moving to
-  // lane l+1) does NOT reproduce this: it interleaves lane l's low-16
-  // step with lane (l+1)'s high step in the wrong order whenever nb > 16
-  // for only some lanes in the group.
+  // Mirrors the GPU's rans_dec_bits16: extracts at most 16 bits for lane l
+  // (0 if !on), then renormalises only if on. Called for every lane at the
+  // same step, like the GPU's whole-warp ballot (see bits_pass).
   uint32_t bits16(int l, bool on, uint32_t nb) {
     on = on && nb != 0;
     uint32_t b = on ? (x[l] & ((1u << nb) - 1)) : 0;
@@ -135,14 +126,10 @@ struct RansDecoder {
   }
 };
 
-// Decodes nb[l] raw bypass bits for every lane 0..31 (out[l] = 0 for
-// !active(l) or nb[l] == 0), as two whole-warp phases -- all 32 lanes'
-// high (nb-16, when nb>16) bits first, then all 32 lanes' low (<=16)
-// bits -- exactly mirroring rans_dec_bits/rans_dec_bits16 on the GPU,
-// where each phase is one ballot-gated word-consumption step shared by
-// the whole warp. Splitting per-lane (extract lane l's full nb bits
-// before moving to lane l+1) would consume the shared stream's words in
-// the wrong order whenever lanes in the same group have different nb.
+// Decodes nb[l] raw bits for every lane in two whole-warp phases, all
+// lanes' high parts (nb > 16) first, then all lanes' low 16 bits, as the
+// GPU does. Doing one lane's full nb before the next would consume the
+// shared stream's words in the wrong order.
 void bits_pass(RansDecoder& d, bool active[32], const uint32_t nb[32], uint32_t out[32]) {
   uint32_t hi[32];
   for (int l = 0; l < 32; ++l) {
@@ -166,12 +153,8 @@ bool decode_lzrans(const uint8_t* in, size_t in_len, uint8_t* out, size_t orig, 
   std::vector<uint8_t> lits(n_lit);
   uint32_t llc[32], mlc[32], oc[32], llb[32], mlb[32], ob[32], ml[32], nb[32], off[32];
   bool active[32], has_off[32];
-  // Repeat-offset MRU state (see kOffRepBase, rans_codes.h), carried
-  // across groups -- mirrors rans_decode_warp's rep0/rep1/rep2 exactly,
-  // just as a plain sequential walk instead of a shuffle-based replay
-  // (this decoder has no lanes to shuffle between; visiting l = 0..31 in
-  // order after each group's codes are already known reproduces the same
-  // forward-order state machine compute_repeat_codes built on encode).
+  // Recent-offset state for repeat codes (kOffRepBase), carried across
+  // groups; walking lanes 0..31 in order reproduces the GPU's replay.
   uint32_t rep0 = 0, rep1 = 0, rep2 = 0;
 
   for (uint32_t g = 0; g < (n_seq + 31) / 32; ++g) {
@@ -296,7 +279,7 @@ bool decode_lz(const uint8_t* in, size_t in_len, uint8_t* out, size_t orig) {
 } // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 3) fail("usage: gzp_refdec <input.gzp> <output>");
+  if (argc != 3) fail("usage: gpusqz_refdec <input.gsz> <output>");
   FILE* in = std::fopen(argv[1], "rb");
   if (!in) fail("cannot open input");
   FILE* out = std::fopen(argv[2], "wb");
@@ -318,13 +301,13 @@ int main(int argc, char** argv) {
       std::fread(groups.data(), sizeof(TableGroup), h.table_group_count, in) != h.table_group_count) {
     fail("truncated table group directory");
   }
-  long payload_start = std::ftell(in);
+  uint64_t payload_start = file_tell(in);
   // The table section: each group's quantised counts, in group order, at
   // tables_offset (after the payload). Each group has its own
   // literal-context rule and so its own size.
   std::vector<Tables> tables;
   tables.reserve(h.table_group_count);
-  if (std::fseek(in, (long)h.tables_offset, SEEK_SET) != 0) fail("bad tables_offset");
+  if (!file_seek(in, h.tables_offset)) fail("bad tables_offset");
   for (const TableGroup& g : groups) {
     if (!lit_shift_valid(g.lit_ctx_shift)) fail("bad lit_ctx_shift");
     std::vector<uint8_t> q(group_quant_bytes(g));
@@ -352,7 +335,7 @@ int main(int argc, char** argv) {
     const ChunkEntry& e = entries[c];
     if (e.original_size > h.chunk_size || e.compressed_size < 1) fail("bad chunk entry");
     cbuf.resize(e.compressed_size);
-    if (std::fseek(in, payload_start + (long)e.offset, SEEK_SET) != 0) fail("seek failed");
+    if (!file_seek(in, payload_start + e.offset)) fail("seek failed");
     if (std::fread(cbuf.data(), 1, e.compressed_size, in) != e.compressed_size) fail("short payload read");
 
     bool ok = false;

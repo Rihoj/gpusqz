@@ -1,27 +1,27 @@
 #!/usr/bin/env bash
-# Compares gzp (GPU) against CPU compressors on one file.
+# Compares gpusqz (GPU) against CPU compressors on one file.
 #
 #   bench/run_bench.sh <file> [chunk_size | --profile speed|balance|ratio]
 #
 # Wall times cover the whole process (file I/O, host<->device copies and,
-# for gzp, ~0.2s of CUDA context creation and allocation on WSL2), so they
+# for gpusqz, ~0.2s of CUDA context creation and allocation on WSL2), so they
 # favour large inputs. The "kernel" column is GPU time only, from
-# cudaEvents -- the wall-clock time during which any gzp kernel was running
-# (GZP_VERBOSE's "kbusy") -- and is what the codec itself sustains once
+# cudaEvents -- the wall-clock time during which any gpusqz kernel was running
+# (GPUSQZ_VERBOSE's "kbusy") -- and is what the codec itself sustains once
 # the fixed costs are paid. CPU tools run single-threaded.
 #
 # Env:
 #   REPEAT=<n>   run each codec n times (default 1) and report the best
 #                (highest-throughput) run per column, since on a shared
 #                GPU a single run's wall time can be dominated by another
-#                process's contention rather than by gzp itself.
-#   CPU=0        skip the CPU compressors (gzp only).
+#                process's contention rather than by gpusqz itself.
+#   CPU=0        skip the CPU compressors (gpusqz only).
 set -euo pipefail
 
-GZP="${GZP:-./build/gzp}"
+GPUSQZ="${GPUSQZ:-./build/gpusqz}"
 FILE="${1:?usage: run_bench.sh <file> [chunk_size | --profile speed|balance|ratio]}"
 shift
-GZP_ARGS=("$@")
+GPUSQZ_ARGS=("$@")
 REPEAT="${REPEAT:-1}"
 SIZE=$(stat -c%s "$FILE")
 TMP="$(mktemp -d)"
@@ -43,18 +43,18 @@ best() {
   echo "$m"
 }
 
-run_gzp() {
+run_gpusqz() {
   local label="$1"
   local cw=() ck=() dw=() dk=() csize=0
   for ((i = 0; i < REPEAT; i++)); do
     local t0 t1 t2
     t0=$(date +%s.%N)
-    GZP_VERBOSE=1 "$GZP" c "$FILE" "$TMP/out.gzp" ${GZP_ARGS[@]+"${GZP_ARGS[@]}"} 2>"$TMP/c.log"
+    GPUSQZ_VERBOSE=1 "$GPUSQZ" c "$FILE" "$TMP/out.gsz" ${GPUSQZ_ARGS[@]+"${GPUSQZ_ARGS[@]}"} 2>"$TMP/c.log"
     t1=$(date +%s.%N)
-    GZP_VERBOSE=1 "$GZP" d "$TMP/out.gzp" "$TMP/out.dec" 2>"$TMP/d.log"
+    GPUSQZ_VERBOSE=1 "$GPUSQZ" d "$TMP/out.gsz" "$TMP/out.dec" 2>"$TMP/d.log"
     t2=$(date +%s.%N)
     cmp -s "$FILE" "$TMP/out.dec" || { echo "ROUND-TRIP MISMATCH ($label)"; exit 1; }
-    csize=$(stat -c%s "$TMP/out.gzp")
+    csize=$(stat -c%s "$TMP/out.gsz")
     cw+=("$(mbps "$SIZE" "$(echo "$t1 - $t0" | bc)")")
     ck+=("$(kern "$TMP/c.log")")
     dw+=("$(mbps "$SIZE" "$(echo "$t2 - $t1" | bc)")")
@@ -85,7 +85,7 @@ run_cpu() {
     "$(echo "scale=4; $csize / $SIZE" | bc)"
 }
 
-run_gzp "gzp ${GZP_ARGS[*]:-(default)}"
+run_gpusqz "gpusqz ${GPUSQZ_ARGS[*]:-(default)}"
 [ "${CPU:-1}" = "0" ] && exit 0
 run_cpu "gzip -1" "gzip -1 -c" "gzip -d -c"
 run_cpu "gzip -6" "gzip -6 -c" "gzip -d -c"
