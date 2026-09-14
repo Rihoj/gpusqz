@@ -263,6 +263,55 @@ Removing `coherent` from the scratch buffers improved Vulkan
 decompression by about 25%, and dropping a redundant memory barrier helped
 too. The rest of the gap is not understood yet.
 
+## Survey follow-up measurements (2026-09-14)
+
+Measured at 92901a5 while checking the [compression
+survey](compression-survey.md) against gpusqz, to rank what to try next.
+An `ollama` model held 10–12.5GB of VRAM at 14–15% utilisation the whole
+time, so the I/O and output-size figures below are sound but the kernel
+MB/s are not A/B quality.
+
+**Decompression waits on the output file.** 1GB corpus, `speed`:
+
+| output | wall | writer thread busy | stalled waiting for an output stage |
+|---|---|---|---|
+| `/dev/null` | 0.33–0.39s | 0.00s | 0.09–0.10s |
+| a file (WSL2 ext4) | 0.70–0.94s | 0.51–0.75s | 0.44–0.67s |
+
+A standalone `pwrite` test (1000MB in 8MB blocks from a 128MB source
+buffer, so the source is out of cache as it is in gpusqz) wrote 1.7–1.9
+GB/s from one thread and 2.8–2.9 GB/s from two; four were no faster.
+Output offsets are known in advance (chunk *c* goes to *c* × chunk
+size), so two writer threads could `pwrite` in parallel. Reading the
+same way scaled from 4–7.6 GB/s (one thread, page cache warm) to 11 GB/s
+(two).
+
+**Incompressible input is the slowest case.** 1GB of `/dev/urandom`
+against the 1GB corpus (every random chunk ends up stored raw):
+
+| profile | random, compress kbusy | text, compress kbusy |
+|---|---|---|
+| `speed` | 2107 | 2895 |
+| `ratio` | 609 | 1507 |
+
+With no matches the parse probes all four candidates at every position
+and advances only 32 bytes per step.
+
+**Match-finder variants.** Output size with `--gpu-mem 2G` (a fixed batch
+split, so every build saw the same batches), change against 92901a5.
+Every output decoded correctly with `gpusqz_refdec`:
+
+| variant | 1GB `speed` / `balance` / `ratio` | 283MB | enwik8 | compress kbusy |
+|---|---|---|---|---|
+| Also probe the last match offset (ties go to it) | −0.31 / −0.33 / −0.30% | −0.23 / −0.24 / −0.25% | −0.11 / −0.11 / −0.09% | 0–4% slower |
+| … and the second-last offset | −0.40 / −0.42 / −0.39% | −0.29 / −0.32 / −0.33% | −0.14 / −0.13 / −0.12% | 2–7% slower |
+| Hash the last 32 positions of matches longer than a window | −0.11 / −0.13 / −0.14% | −0.10 / −0.11 / −0.12% | −0.02 / −0.02 / −0.03% | 1–13% slower |
+
+**Where the rest of the output goes.** The rANS tables take 0.16–0.20% of
+the 1GB corpus's output (0.34% of enwik8's), and zstd shrinks them
+4–27x, mostly by exploiting how alike the groups' tables are. The chunk directory, 16 bytes per chunk, takes 0.10% at
+`speed`.
+
 ## Sizing the match-finder table
 
 The hash table took four rounds to size, and each failure was
@@ -309,6 +358,10 @@ because each explains a rule in [Benchmarks](benchmarks.md).
   at afaa7bc). A misreading of lower-is-better: at that point gpusqz beat
   `zstd -1` only at `balance` and `ratio`, and never beat `zstd -3` or
   `gzip -6`. Corrected in 80fb50d.
+- **"The 8-bit quantised counts are the limit"** (8c9ddcc, given as the
+  reason 14- and 15-bit probabilities didn't help). Coding against the
+  exact counts saved only 0.06–0.23% (92901a5), before paying for
+  storing them, so the table precision isn't holding much back.
 - **A `balance` regression and a half-speed `ratio` kernel** while
   developing d5073da. Both came from ~40% contention by another process
   and vanished on an idle GPU.
@@ -339,6 +392,8 @@ Tried, measured, and not kept. Check here before re-running one.
 | Three buffer sets instead of two | 7012791 | within noise at `speed`, slower at `ratio` |
 | 14- and 15-bit rANS probabilities (instead of 12) | 8c9ddcc | under 0.05% smaller: the 8-bit quantised counts are the limit |
 | 64 frequency-ranked literal contexts | 8c9ddcc | about the same as 256, but needs a stored class map |
+| Encoder tables from exact counts instead of 8-bit quantised ones | 92901a5 | 0.06–0.23% smaller before paying for bigger stored tables; 0.07–0.33% with 14-bit probabilities as well |
+| Hashing the positions a long match skipped | 92901a5 | 0.02–0.14% smaller for up to 13% of compress kernel throughput |
 | Token-only coding (`--mode lz`) | c9f4ebe | 0.370 vs 0.272 at the same compress speed, decompress kernel 5498 vs 3759 MB/s; rANS won on ratio, so the mode was removed |
 
 ## Adding an entry
