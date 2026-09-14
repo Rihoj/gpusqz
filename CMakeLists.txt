@@ -140,47 +140,81 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
-# Tests (ctest). Labelled "gpu" if they need an NVIDIA GPU; CI runners have
-# none, so they run `ctest -LE gpu`.
+# Tests (ctest). Labels: "gpu" needs an NVIDIA GPU (CUDA); "vulkan" needs a
+# Vulkan device, which can be Mesa's CPU driver lavapipe (the Linux CI job
+# installs it). Runners without either run `ctest -LE "gpu|vulkan"`.
 # ---------------------------------------------------------------------------
 enable_testing()
+find_program(BASH_PROGRAM bash)
 
-# Every tests/fixtures/<name>__<variant>.gsz must decode, with the CPU
-# reference decoder, to tests/fixtures/<name>.orig. The fixtures were
-# made by the GPU compressor (tests/fixtures/make_fixtures.sh), so this
-# checks the file format and the decoder on every platform, GPU or not.
+# Every tests/fixtures/<name>__<variant>.gsz must decode to
+# tests/fixtures/<name>.orig, and every corrupt *.gszbad must be rejected:
+# by the CPU reference decoder on every platform, and by gpusqz with each
+# backend built. The fixtures were made by the CUDA compressor
+# (tests/fixtures/make_fixtures.sh).
+set(GPUSQZ_DECODERS refdec)
+if(GPUSQZ_BUILD_CUDA)
+  list(APPEND GPUSQZ_DECODERS cuda)
+endif()
+if(GPUSQZ_BUILD_VULKAN)
+  list(APPEND GPUSQZ_DECODERS vulkan)
+endif()
 file(GLOB GPUSQZ_FIXTURES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/*.gsz)
-foreach(fixture ${GPUSQZ_FIXTURES})
-  get_filename_component(fname ${fixture} NAME_WE)
-  string(REGEX REPLACE "__.*$" "" orig_name ${fname})
-  add_test(NAME refdec_${fname}
-           COMMAND ${CMAKE_COMMAND}
-                   -DREFDEC=$<TARGET_FILE:gpusqz_refdec>
-                   -DINPUT=${fixture}
-                   -DEXPECTED=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/${orig_name}.orig
-                   -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/fixture_${fname}.out
-                   -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/refdec_check.cmake)
-endforeach()
-# ...and corrupt ones (*.gszbad) must be rejected.
 file(GLOB GPUSQZ_BAD_FIXTURES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/*.gszbad)
-foreach(fixture ${GPUSQZ_BAD_FIXTURES})
-  get_filename_component(fname ${fixture} NAME_WE)
-  add_test(NAME refdec_rejects_${fname}
-           COMMAND gpusqz_refdec ${fixture} ${CMAKE_CURRENT_BINARY_DIR}/fixture_${fname}.bad.out)
-  set_tests_properties(refdec_rejects_${fname} PROPERTIES WILL_FAIL TRUE)
+foreach(dec ${GPUSQZ_DECODERS})
+  if(dec STREQUAL "refdec")
+    set(cmd $<TARGET_FILE:gpusqz_refdec>)
+    set(mode "")
+    set(label "")
+  else()
+    set(cmd $<TARGET_FILE:gpusqz>)
+    set(mode d)
+    if(dec STREQUAL "cuda")
+      set(label gpu)
+    else()
+      set(label vulkan)
+    endif()
+  endif()
+  foreach(fixture ${GPUSQZ_FIXTURES})
+    get_filename_component(fname ${fixture} NAME_WE)
+    string(REGEX REPLACE "__.*$" "" orig_name ${fname})
+    add_test(NAME ${dec}_decode_${fname}
+             COMMAND ${CMAKE_COMMAND}
+                     -DDECODER=${cmd} -DMODE=${mode}
+                     -DINPUT=${fixture}
+                     -DEXPECTED=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/${orig_name}.orig
+                     -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/fixture_${dec}_${fname}.out
+                     -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/decode_check.cmake)
+    set_tests_properties(${dec}_decode_${fname} PROPERTIES LABELS "${label}" ENVIRONMENT GPUSQZ_BACKEND=${dec})
+  endforeach()
+  foreach(fixture ${GPUSQZ_BAD_FIXTURES})
+    get_filename_component(fname ${fixture} NAME_WE)
+    if(mode)
+      add_test(NAME ${dec}_rejects_${fname} COMMAND ${cmd} d ${fixture} ${CMAKE_CURRENT_BINARY_DIR}/fixture_${dec}_${fname}.bad.out)
+    else()
+      add_test(NAME ${dec}_rejects_${fname} COMMAND ${cmd} ${fixture} ${CMAKE_CURRENT_BINARY_DIR}/fixture_${dec}_${fname}.bad.out)
+    endif()
+    set_tests_properties(${dec}_rejects_${fname} PROPERTIES WILL_FAIL TRUE LABELS "${label}" ENVIRONMENT GPUSQZ_BACKEND=${dec})
+  endforeach()
 endforeach()
 
 if(GPUSQZ_BUILD_GPU)
-  # Runs without a GPU: argument errors are reported before any CUDA call.
+  # Runs without a GPU: argument errors are reported before any GPU call.
   add_test(NAME gpusqz_usage COMMAND gpusqz)
   set_tests_properties(gpusqz_usage PROPERTIES PASS_REGULAR_EXPRESSION "usage:")
 
-  # The full GPU round-trip suite (needs an NVIDIA GPU and bash).
-  find_program(BASH_PROGRAM bash)
+  # The full round-trip suite, per backend (needs bash).
   if(BASH_PROGRAM AND NOT WIN32)
-    add_test(NAME round_trip
-             COMMAND ${BASH_PROGRAM} ${CMAKE_CURRENT_SOURCE_DIR}/tests/round_trip.sh $<TARGET_FILE:gpusqz>)
-    set_tests_properties(round_trip PROPERTIES LABELS gpu)
+    if(GPUSQZ_BUILD_CUDA)
+      add_test(NAME round_trip_cuda
+               COMMAND ${BASH_PROGRAM} ${CMAKE_CURRENT_SOURCE_DIR}/tests/round_trip.sh $<TARGET_FILE:gpusqz>)
+      set_tests_properties(round_trip_cuda PROPERTIES LABELS gpu ENVIRONMENT GPUSQZ_BACKEND=cuda)
+    endif()
+    if(GPUSQZ_BUILD_VULKAN)
+      add_test(NAME round_trip_vulkan
+               COMMAND ${BASH_PROGRAM} ${CMAKE_CURRENT_SOURCE_DIR}/tests/round_trip.sh $<TARGET_FILE:gpusqz>)
+      set_tests_properties(round_trip_vulkan PROPERTIES LABELS vulkan ENVIRONMENT GPUSQZ_BACKEND=vulkan)
+    endif()
   endif()
 endif()
 
@@ -193,6 +227,17 @@ if(GPUSQZ_BUILD_GPU)
 endif()
 install(TARGETS gpusqz_refdec RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES README.md DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/gpusqz)
+# macOS: MoltenVK (Vulkan on Metal) ships in lib/, where gpusqz looks for it
+# (@executable_path/../lib), with its Apache-2.0 license.
+set(GPUSQZ_MOLTENVK_DYLIB "" CACHE FILEPATH "libMoltenVK.dylib to install next to gpusqz (macOS packages)")
+set(GPUSQZ_MOLTENVK_LICENSE "" CACHE FILEPATH "MoltenVK's LICENSE file, installed with it")
+if(GPUSQZ_MOLTENVK_DYLIB)
+  install(FILES ${GPUSQZ_MOLTENVK_DYLIB} DESTINATION ${CMAKE_INSTALL_LIBDIR})
+  if(GPUSQZ_MOLTENVK_LICENSE)
+    install(FILES ${GPUSQZ_MOLTENVK_LICENSE} DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/gpusqz
+            RENAME MoltenVK-LICENSE)
+  endif()
+endif()
 if(MSVC)
   # Ship the MSVC runtime DLLs next to the executables so the zip runs on
   # machines without the Visual C++ redistributable.
@@ -203,7 +248,7 @@ endif()
 set(GPUSQZ_PACKAGE_MAINTAINER "gpusqz maintainers" CACHE STRING "Maintainer field for the deb/rpm packages")
 if(GPUSQZ_BUILD_GPU)
   set(CPACK_PACKAGE_NAME "gpusqz")
-  set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "GPU (CUDA) file compressor")
+  set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "GPU file compressor (CUDA and Vulkan)")
 else()
   set(CPACK_PACKAGE_NAME "gpusqz-refdec")
   set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "CPU decoder for files made by the gpusqz GPU compressor")
@@ -212,7 +257,7 @@ set(CPACK_PACKAGE_VENDOR "gpusqz")
 set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
 set(CPACK_PACKAGE_CONTACT ${GPUSQZ_PACKAGE_MAINTAINER})
 set(CPACK_PACKAGE_DESCRIPTION
-    "gpusqz compresses and decompresses files on an NVIDIA GPU with CUDA: a warp-parallel LZ parse and a 32-way interleaved rANS coder. It needs an NVIDIA GPU of compute capability 7.0 or newer and an NVIDIA driver that supports CUDA 12 (the CUDA runtime is linked in). gpusqz_refdec is a CPU-only decoder for the same format.")
+    "gpusqz compresses and decompresses files on the GPU: a lane-parallel LZ parse and a 32-way interleaved rANS coder. NVIDIA GPUs of compute capability 7.0 or newer use CUDA (driver supporting CUDA 12; the runtime is linked in); AMD, Apple, Intel and other GPUs use Vulkan 1.2 (the GPU driver's Vulkan support, loaded at run time). gpusqz_refdec is a CPU-only decoder for the same format.")
 set(CPACK_RESOURCE_FILE_README ${CMAKE_CURRENT_SOURCE_DIR}/README.md)
 set(CPACK_STRIP_FILES ON)
 
@@ -220,9 +265,12 @@ set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
 set(CPACK_DEBIAN_PACKAGE_MAINTAINER ${GPUSQZ_PACKAGE_MAINTAINER})
 set(CPACK_DEBIAN_PACKAGE_SECTION utils)
 set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+# The Vulkan loader is opened at run time, so shlibdeps doesn't see it.
+set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "libvulkan1")
 
 set(CPACK_RPM_FILE_NAME RPM-DEFAULT)
 set(CPACK_RPM_PACKAGE_GROUP "Applications/Archiving")
 set(CPACK_RPM_PACKAGE_LICENSE "Unspecified")
+set(CPACK_RPM_PACKAGE_SUGGESTS "vulkan-loader")
 
 include(CPack)

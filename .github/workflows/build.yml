@@ -2,15 +2,17 @@
 # the tests that don't need a GPU, and on a v* tag publishes the packages
 # as a GitHub release.
 #
-# GitHub-hosted runners have no NVIDIA GPU, so CI compiles the CUDA code
-# and runs only the GPU-free tests (`ctest -LE gpu`): the CPU reference
-# decoder against committed fixtures made by the real GPU build
-# (tests/fixtures), and gpusqz's argument handling. The GPU round trip
-# (tests/round_trip.sh, ctest label "gpu") has to run on a machine with a
-# GPU before tagging a release.
+# gpusqz has two backends (src/backend.h): CUDA for NVIDIA GPUs and Vulkan
+# for AMD, Apple, Intel and NVIDIA GPUs. Linux and Windows packages carry
+# both; macOS carries Vulkan with MoltenVK (CUDA does not exist on macOS).
 #
-# macOS gets only gpusqz_refdec, the CPU decoder: CUDA does not exist on
-# macOS, so the compressor cannot be built or run there.
+# GitHub-hosted runners have no GPU. The Linux deb job installs lavapipe,
+# Mesa's CPU Vulkan driver, so there the Vulkan backend runs for real: the
+# round-trip suite and fixture decoding (ctest label "vulkan"). Everywhere
+# else CI runs what needs no device (`ctest -LE "gpu|vulkan"`): the CPU
+# reference decoder against the committed fixtures and gpusqz's argument
+# handling. The CUDA tests (label "gpu") have to run on a machine with an
+# NVIDIA GPU before tagging a release.
 name: build
 
 on:
@@ -46,7 +48,8 @@ jobs:
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cuda-nvcc-12-8 cuda-cudart-dev-12-8 cuda-cccl-12-8 cmake ninja-build dpkg-dev
+            cuda-nvcc-12-8 cuda-cudart-dev-12-8 cuda-cccl-12-8 cmake ninja-build dpkg-dev \
+            libvulkan-dev glslang-tools mesa-vulkan-drivers
 
       - name: Version
         id: version
@@ -67,8 +70,10 @@ jobs:
       - name: Build
         run: cmake --build build
 
-      - name: Test (no GPU)
-        run: ctest --test-dir build -LE gpu --output-on-failure
+      - name: Test (Vulkan on lavapipe; no CUDA)
+        run: |
+          ./build/gpusqz devices
+          ctest --test-dir build -LE gpu --output-on-failure
 
       - name: Package
         working-directory: build
@@ -83,6 +88,9 @@ jobs:
           gpusqz_refdec tests/fixtures/text__c4k_lit0.gsz /tmp/out
           cmp /tmp/out tests/fixtures/text.orig
           gpusqz 2>&1 | grep -q usage:
+          gpusqz c tests/fixtures/text.orig /tmp/t.gsz
+          gpusqz d /tmp/t.gsz /tmp/t.out
+          cmp /tmp/t.out tests/fixtures/text.orig
 
       - uses: actions/upload-artifact@v4
         with:
@@ -101,8 +109,17 @@ jobs:
         run: |
           dnf install -y dnf-plugins-core
           dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo
-          dnf install -y git gcc-c++ make cmake rpm-build \
+          dnf install -y git gcc-c++ make cmake rpm-build python3 vulkan-headers \
             cuda-nvcc-12-8 cuda-cudart-devel-12-8 cuda-cccl-12-8
+
+      # EL8 has no glslang package: build just the compiler (the Vulkan
+      # backend's shaders are compiled at build time).
+      - name: Build glslangValidator
+        run: |
+          curl -sL https://github.com/KhronosGroup/glslang/archive/refs/tags/16.6.0.tar.gz | tar -xz -C /tmp
+          cmake -S /tmp/glslang-16.6.0 -B /tmp/glslang-build -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_OPT=OFF -DGLSLANG_TESTS=OFF -DENABLE_HLSL=OFF
+          cmake --build /tmp/glslang-build --target glslang-standalone -j "$(nproc)"
 
       - uses: actions/checkout@v4
 
@@ -120,13 +137,14 @@ jobs:
           -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc
           -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS"
           -DCMAKE_CUDA_FLAGS="$CUDA_FLAGS"
+          -DGPUSQZ_GLSLANG=/tmp/glslang-build/StandAlone/glslang
           -DGPUSQZ_VERSION=${{ steps.version.outputs.version }}
 
       - name: Build
         run: cmake --build build -j "$(nproc)"
 
       - name: Test (no GPU)
-        run: ctest --test-dir build -LE gpu --output-on-failure
+        run: ctest --test-dir build -LE "gpu|vulkan" --output-on-failure
 
       - name: Package
         working-directory: build
@@ -166,6 +184,15 @@ jobs:
           "CUDA_PATH=$cuda" | Out-File -FilePath $env:GITHUB_ENV -Append
           "$cuda\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk.exe" -OutFile vulkan_sdk.exe
+          $p = Start-Process -Wait -PassThru -FilePath .\vulkan_sdk.exe -ArgumentList "--root C:\VulkanSDK --accept-licenses --default-answer --confirm-command install"
+          if ($p.ExitCode -ne 0) { throw "Vulkan SDK installer exited with $($p.ExitCode)" }
+          if (-not (Test-Path "C:\VulkanSDK\Bin\glslangValidator.exe")) { throw "glslangValidator.exe not found" }
+          "VULKAN_SDK=C:\VulkanSDK" | Out-File -FilePath $env:GITHUB_ENV -Append
+
       - name: Set up MSVC environment
         shell: pwsh
         run: |
@@ -195,7 +222,7 @@ jobs:
         run: cmake --build build
 
       - name: Test (no GPU)
-        run: ctest --test-dir build -LE gpu --output-on-failure
+        run: ctest --test-dir build -LE "gpu|vulkan" --output-on-failure
 
       - name: Package
         working-directory: build
@@ -221,10 +248,24 @@ jobs:
           if-no-files-found: error
 
   macos:
-    name: macOS (decoder only, tar.gz)
+    name: macOS (Vulkan via MoltenVK, tar.gz)
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Vulkan headers, glslang and MoltenVK
+        run: |
+          brew install vulkan-headers glslang
+          # The official MoltenVK release is a universal (arm64 + x86_64)
+          # dylib; it ships next to gpusqz (lib/ in the package).
+          curl -sL -o moltenvk.tar https://github.com/KhronosGroup/MoltenVK/releases/latest/download/MoltenVK-macos.tar
+          tar -xf moltenvk.tar
+          dylib=$(find MoltenVK -path '*dynamic*' -name libMoltenVK.dylib | head -1)
+          license=$(find MoltenVK -maxdepth 2 -name LICENSE | head -1)
+          test -n "$dylib" && test -n "$license"
+          echo "MOLTENVK_DYLIB=$PWD/$dylib" >> "$GITHUB_ENV"
+          echo "MOLTENVK_LICENSE=$PWD/$license" >> "$GITHUB_ENV"
+          lipo -info "$dylib"
 
       - name: Version
         id: version
@@ -237,23 +278,31 @@ jobs:
         run: >
           cmake -S . -B build
           -DCMAKE_BUILD_TYPE=Release
-          -DGPUSQZ_BUILD_GPU=OFF
           "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"
           -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+          -DGPUSQZ_VULKAN_INCLUDE="$(brew --prefix vulkan-headers)/include"
+          -DGPUSQZ_MOLTENVK_DYLIB="$MOLTENVK_DYLIB"
+          -DGPUSQZ_MOLTENVK_LICENSE="$MOLTENVK_LICENSE"
           -DGPUSQZ_VERSION=${{ steps.version.outputs.version }}
 
       - name: Build
         run: cmake --build build -j "$(sysctl -n hw.ncpu)"
 
-      - name: Test
-        run: ctest --test-dir build --output-on-failure
+      - name: Test (no GPU)
+        run: ctest --test-dir build -LE "gpu|vulkan" --output-on-failure
+
+      # Informational: hosted runners may not expose a Metal GPU.
+      - name: List GPUs
+        continue-on-error: true
+        run: GPUSQZ_VULKAN_LIB="$MOLTENVK_DYLIB" ./build/gpusqz devices
 
       - name: Package
         working-directory: build
         run: |
           cpack -G TGZ
           tar tzf ./*.tar.gz
-          lipo -verify_arch gpusqz_refdec arm64 x86_64  # universal binary: Apple silicon and Intel
+          # Universal binaries: Apple silicon and Intel.
+          for f in gpusqz gpusqz_refdec; do lipo "$f" -verify_arch arm64 x86_64; done
 
       - uses: actions/upload-artifact@v4
         with:
