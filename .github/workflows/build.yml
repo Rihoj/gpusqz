@@ -302,9 +302,6 @@ jobs:
           MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS: "0"
         run: |
           export GPUSQZ_VULKAN_LIB="$MOLTENVK_DYLIB"
-          # round_trip.sh uses GNU stat/base64.
-          brew install coreutils
-          export PATH="$(brew --prefix coreutils)/libexec/gnubin:$PATH"
           GPUSQZ_VK_DEBUG=1 ./build/gpusqz devices
           # Fixture decoding plus the round-trip suite.
           ctest --test-dir build -L vulkan --output-on-failure

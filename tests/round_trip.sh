@@ -22,13 +22,28 @@ GPUSQZ="${1:-./build/gpusqz}"
 REFDEC="${REFDEC:-$(dirname "$GPUSQZ")/gpusqz_refdec}"
 [ -x "$REFDEC" ] || REFDEC=""
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+# Keep the script's exit status: bash 3.2 (macOS) would otherwise report
+# the trap's own status when set -e ends the script.
+trap 'st=$?; rm -rf "$TMP"; exit $st' EXIT
 
 # Word-split on purpose so a multi-word prefix works.
 # shellcheck disable=SC2206
 PREFIX=(${GPUSQZ_PREFIX:-})
 
+# Runs gpusqz under the prefix. Expanding an empty array is an error under
+# set -u before bash 4.4, hence the length check.
+run_gpusqz() {
+  if [ "${#PREFIX[@]}" -gt 0 ]; then
+    "${PREFIX[@]}" "$GPUSQZ" "$@"
+  else
+    "$GPUSQZ" "$@"
+  fi
+}
+
 fail=0
+
+# Portable (GNU and BSD/macOS) file size in bytes.
+file_size() { wc -c < "$1" | tr -d ' '; }
 
 make_case() {
   local name="$1" size="$2" kind="$3"
@@ -39,17 +54,19 @@ make_case() {
     text) yes "the quick brown fox jumps over the lazy dog" | head -c "$size" > "$f" ;;
     # Literal-heavy text: 64 symbols, no long repeats, so most of it reaches
     # the literal coder (the `text` case above is almost all matches).
-    base64) head -c $((size * 3 / 4)) /dev/urandom | base64 -w 76 | head -c "$size" > "$f" ;;
+    base64) head -c $((size * 3 / 4)) /dev/urandom | base64 | tr -d '\n' | fold -w 76 | head -c "$size" > "$f" ;;
     # Real prose-like text with ordinary literal/match mix: this repo's own
     # sources, repeated up to size.
     source)
       local here
       here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-      while [ "$(stat -c%s "$f" 2>/dev/null || echo 0)" -lt "$size" ]; do
-        find "$here/src" -type f -exec cat {} + >> "$f"
-        cat "$here"/tests/*.cpp "$here"/README.md >> "$f"
+      : > "$f.all"
+      while [ "$(file_size "$f.all")" -lt "$size" ]; do
+        find "$here/src" -type f -exec cat {} + >> "$f.all"
+        cat "$here"/tests/*.cpp "$here"/README.md >> "$f.all"
       done
-      truncate -s "$size" "$f" ;;
+      head -c "$size" "$f.all" > "$f"
+      rm -f "$f.all" ;;
     empty) : > "$f" ;;
   esac
   echo "$f"
@@ -58,8 +75,12 @@ make_case() {
 run_case() {
   local chunk="$1" name="$2" f="$3"
   local comp="$TMP/$name.gsz" dec="$TMP/$name.out"
-  "${PREFIX[@]}" "$GPUSQZ" c "$f" "$comp" "$chunk" 2>>"$TMP/log"
-  "${PREFIX[@]}" "$GPUSQZ" d "$comp" "$dec" 2>>"$TMP/log"
+  if ! run_gpusqz c "$f" "$comp" "$chunk" 2>>"$TMP/log" || ! run_gpusqz d "$comp" "$dec" 2>>"$TMP/log"; then
+    printf "FAIL chunk=%-6d %-20s gpusqz exited with an error\n" "$chunk" "$name"
+    fail=1
+    rm -f "$comp" "$dec"
+    return
+  fi
   local ref_ok=1
   if [ -n "$REFDEC" ]; then
     if ! "$REFDEC" "$comp" "$TMP/$name.ref" 2>>"$TMP/log" || ! cmp -s "$f" "$TMP/$name.ref"; then
@@ -72,8 +93,8 @@ run_case() {
     fail=1
   elif cmp -s "$f" "$dec"; then
     local in_sz comp_sz
-    in_sz=$(stat -c%s "$f")
-    comp_sz=$(stat -c%s "$comp")
+    in_sz=$(file_size "$f")
+    comp_sz=$(file_size "$comp")
     printf "PASS chunk=%-6d %-20s in=%-10d comp=%-10d ratio=%.3f\n" "$chunk" "$name" "$in_sz" "$comp_sz" \
       "$(echo "scale=3; $comp_sz / ($in_sz + 0.0001)" | bc)"
   else
@@ -91,8 +112,13 @@ run_case() {
 run_case_mismatched_batch() {
   local name="$1" f="$2" enc_batch="$3" dec_batch="$4"
   local comp="$TMP/$name.gsz" dec="$TMP/$name.out"
-  GPUSQZ_FORCE_BATCH="$enc_batch" "${PREFIX[@]}" "$GPUSQZ" c "$f" "$comp" 2>>"$TMP/log"
-  GPUSQZ_FORCE_BATCH="$dec_batch" "${PREFIX[@]}" "$GPUSQZ" d "$comp" "$dec" 2>>"$TMP/log"
+  if ! GPUSQZ_FORCE_BATCH="$enc_batch" run_gpusqz c "$f" "$comp" 2>>"$TMP/log" ||
+     ! GPUSQZ_FORCE_BATCH="$dec_batch" run_gpusqz d "$comp" "$dec" 2>>"$TMP/log"; then
+    printf "FAIL %-28s gpusqz exited with an error\n" "$name"
+    fail=1
+    rm -f "$comp" "$dec"
+    return
+  fi
   local ref_ok=1
   if [ -n "$REFDEC" ]; then
     if ! "$REFDEC" "$comp" "$TMP/$name.ref" 2>>"$TMP/log" || ! cmp -s "$f" "$TMP/$name.ref"; then
@@ -120,9 +146,8 @@ run_profile_cases() {
   for prof in speed balance ratio; do
     comp="$TMP/profile_$prof.gsz"
     dec="$TMP/profile_$prof.out"
-    "${PREFIX[@]}" "$GPUSQZ" c "$f" "$comp" --profile "$prof" 2>>"$TMP/log"
-    "${PREFIX[@]}" "$GPUSQZ" d "$comp" "$dec" 2>>"$TMP/log"
-    if cmp -s "$f" "$dec"; then
+    if run_gpusqz c "$f" "$comp" --profile "$prof" 2>>"$TMP/log" &&
+       run_gpusqz d "$comp" "$dec" 2>>"$TMP/log" && cmp -s "$f" "$dec"; then
       printf "PASS %-28s --profile %s\n" "profile" "$prof"
     else
       printf "FAIL %-28s --profile %s round-trip mismatch\n" "profile" "$prof"
@@ -130,13 +155,13 @@ run_profile_cases() {
     fi
     rm -f "$comp" "$dec"
   done
-  if "${PREFIX[@]}" "$GPUSQZ" c "$f" "$TMP/profile_both.gsz" 65536 --profile speed 2>>"$TMP/log"; then
+  if run_gpusqz c "$f" "$TMP/profile_both.gsz" 65536 --profile speed 2>>"$TMP/log"; then
     printf "FAIL %-28s chunk_size + --profile should be rejected\n" "profile"
     fail=1
   else
     printf "PASS %-28s chunk_size + --profile rejected\n" "profile"
   fi
-  if "${PREFIX[@]}" "$GPUSQZ" c "$f" "$TMP/profile_bogus.gsz" --profile bogus 2>>"$TMP/log"; then
+  if run_gpusqz c "$f" "$TMP/profile_bogus.gsz" --profile bogus 2>>"$TMP/log"; then
     printf "FAIL %-28s unknown --profile should be rejected\n" "profile"
     fail=1
   else
@@ -147,14 +172,14 @@ run_profile_cases() {
   # --gpu-mem: a tiny budget forces many small batches on both sides.
   comp="$TMP/gpumem.gsz"
   dec="$TMP/gpumem.out"
-  if "${PREFIX[@]}" "$GPUSQZ" c "$f" "$comp" 4096 --gpu-mem 64M 2>>"$TMP/log" &&
-     "${PREFIX[@]}" "$GPUSQZ" d "$comp" "$dec" --gpu-mem 48M 2>>"$TMP/log" && cmp -s "$f" "$dec"; then
+  if run_gpusqz c "$f" "$comp" 4096 --gpu-mem 64M 2>>"$TMP/log" &&
+     run_gpusqz d "$comp" "$dec" --gpu-mem 48M 2>>"$TMP/log" && cmp -s "$f" "$dec"; then
     printf "PASS %-28s --gpu-mem 64M / 48M\n" "gpu_mem"
   else
     printf "FAIL %-28s --gpu-mem round-trip mismatch\n" "gpu_mem"
     fail=1
   fi
-  if "${PREFIX[@]}" "$GPUSQZ" c "$f" "$comp" --gpu-mem 8Q 2>>"$TMP/log"; then
+  if run_gpusqz c "$f" "$comp" --gpu-mem 8Q 2>>"$TMP/log"; then
     printf "FAIL %-28s bad --gpu-mem unit should be rejected\n" "gpu_mem"
     fail=1
   else
