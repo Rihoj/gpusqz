@@ -284,6 +284,8 @@ set(CPACK_WIX_PROPERTY_ARPURLINFOABOUT ${CPACK_PACKAGE_HOMEPAGE_URL})
 # macOS .pkg: the product id, plus ".gpusqz" (the component) for the
 # package receipt that pkgutil lists.
 set(CPACK_PRODUCTBUILD_IDENTIFIER "io.github.rihoj")
+# Explicit: CPack ignores a lone install component unless it is named here.
+set(CPACK_COMPONENTS_ALL gpusqz)
 set(CPACK_COMPONENT_GPUSQZ_DISPLAY_NAME "gpusqz")
 set(CPACK_COMPONENT_GPUSQZ_DESCRIPTION "gpusqz, gpusqz_refdec and the MoltenVK library they use")
 set(CPACK_COMPONENT_GPUSQZ_REQUIRED ON)
