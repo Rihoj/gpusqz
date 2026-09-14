@@ -297,6 +297,12 @@ against the 1GB corpus (every random chunk ends up stored raw):
 With no matches the parse probes all four candidates at every position
 and advances only 32 bytes per step.
 
+**Compression at `speed` is GPU-bound once the input is cached.** Three
+warm runs on the 1GB corpus (`ollama` idle, 1% utilisation): 0.54–0.57s
+steady against 0.35s of kernel time, with the main thread's reads
+(0.16–0.20s) overlapping the kernels. Earlier runs at 0.9–1.0s steady
+were reading a cold page cache (`fread` 0.77s).
+
 **Match-finder variants.** Output size with `--gpu-mem 2G` (a fixed batch
 split, so every build saw the same batches), change against 92901a5.
 Every output decoded correctly with `gpusqz_refdec`:
@@ -358,10 +364,6 @@ because each explains a rule in [Benchmarks](benchmarks.md).
   at afaa7bc). A misreading of lower-is-better: at that point gpusqz beat
   `zstd -1` only at `balance` and `ratio`, and never beat `zstd -3` or
   `gzip -6`. Corrected in 80fb50d.
-- **"The 8-bit quantised counts are the limit"** (8c9ddcc, given as the
-  reason 14- and 15-bit probabilities didn't help). Coding against the
-  exact counts saved only 0.06–0.23% (92901a5), before paying for
-  storing them, so the table precision isn't holding much back.
 - **A `balance` regression and a half-speed `ratio` kernel** while
   developing d5073da. Both came from ~40% contention by another process
   and vanished on an idle GPU.
@@ -392,7 +394,7 @@ Tried, measured, and not kept. Check here before re-running one.
 | Three buffer sets instead of two | 7012791 | within noise at `speed`, slower at `ratio` |
 | 14- and 15-bit rANS probabilities (instead of 12) | 8c9ddcc | under 0.05% smaller: the 8-bit quantised counts are the limit |
 | 64 frequency-ranked literal contexts | 8c9ddcc | about the same as 256, but needs a stored class map |
-| Encoder tables from exact counts instead of 8-bit quantised ones | 92901a5 | 0.06–0.23% smaller before paying for bigger stored tables; 0.07–0.33% with 14-bit probabilities as well |
+| Encoder tables from exact counts instead of 8-bit quantised ones | 92901a5 | 0.06–0.23% smaller before paying for bigger stored tables; 0.07–0.33% with 14-bit probabilities as well. The 8-bit counts did cap the 14-bit test above, but lifting them isn't worth much either |
 | Hashing the positions a long match skipped | 92901a5 | 0.02–0.14% smaller for up to 13% of compress kernel throughput |
 | Token-only coding (`--mode lz`) | c9f4ebe | 0.370 vs 0.272 at the same compress speed, decompress kernel 5498 vs 3759 MB/s; rANS won on ratio, so the mode was removed |
 
