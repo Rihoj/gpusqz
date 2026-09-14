@@ -34,6 +34,22 @@ constexpr int kWarpsPerBlock = 1;
 // How many positions ahead lz_parse_warp's lazy matching looks before
 // committing to a match (zstd's "lazy2"; a third step never paid off).
 constexpr int kLazySteps = 2;
+// Acceleration on data that doesn't match (LZ4's and zstd's "skip ahead"):
+// after 2^kSkipTrigger windows in a row without a match, the window's 32
+// lanes sample every stride-th position, the stride growing by one every
+// 2^kSkipTrigger further windows up to kMaxSkip, and the first match found
+// is extended back over the positions skipped. Only sampled positions are
+// hashed, so a later copy of sampled data is found only if some sample in
+// it lines up with one in the original: short copies of random-looking
+// data get missed (2.4% bigger output on random runs followed by copies of
+// their tails). Measured, against no sampling: random data 3.0x (`speed`)
+// to 6.7x (`ratio`) faster compress kernel; text unchanged; shared
+// libraries at most 0.02% bigger; already-compressed files (gz, png, jpg,
+// ...) -0.22% to +0.11% and 14-61% faster. Waiting 2 or 4 windows instead
+// of 8 lost more; skipping whole windows instead of spreading the lanes
+// lost 8-12% on the copies.
+constexpr int kSkipTrigger = 3;
+constexpr int kMaxSkip = 32;
 constexpr unsigned kFullMask = 0xFFFFFFFFu;
 constexpr uint32_t kEmptyPos = 0xFFFFFFFFu;
 
@@ -147,6 +163,20 @@ __device__ __forceinline__ uint32_t warp_extend(const uint8_t* in, uint32_t p, u
   return len;
 }
 
+// How far a match at p (backward distance off) also extends backwards,
+// 32 bytes per step, without reaching before `floor` or the chunk start.
+__device__ __forceinline__ uint32_t warp_extend_back(const uint8_t* in, uint32_t p, uint32_t off, uint32_t floor) {
+  int lane = threadIdx.x & 31;
+  uint32_t max_back = min(p - floor, p - off);
+  for (uint32_t back = 0; back < max_back; back += 32) {
+    uint32_t k = back + lane; // compares the byte at p - 1 - k
+    bool mism = k >= max_back || in[p - 1 - k] != in[p - 1 - k - off];
+    unsigned m = __ballot_sync(kFullMask, mism);
+    if (m) return back + (__ffs(m) - 1);
+  }
+  return max_back;
+}
+
 // Records sequences and copies literals into the chunk's scratch.
 struct SeqEmitter {
   const uint8_t* in;
@@ -185,11 +215,12 @@ __device__ inline bool tokens_from_seqs(const uint8_t* in, const SeqRec* seqs, u
 // The warp walks the chunk in 32-byte windows. Every lane hashes its own
 // position and probes its bucket's candidates and the recent offsets
 // (capped at kProbe bytes so per-lane work is bounded; zstd's parsers
-// check their repeat offsets too). One lane per bucket then inserts its position,
-// and lanes that found nothing probe again, which catches repeats within
-// the same window. The window's matches are selected warp-uniformly with a
-// kLazySteps lookahead; matches that hit the probe cap are extended
-// cooperatively.
+// check their repeat offsets too). One lane per bucket then inserts its
+// position, and lanes that found nothing probe again, which catches repeats
+// within the same window. The window's matches are selected warp-uniformly
+// with a kLazySteps lookahead; matches that hit the probe cap are extended
+// cooperatively. After a long stretch without matches the lanes sample
+// positions kSkipTrigger-style (see above) until one matches.
 __device__ inline void lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* htab, int hash_bits, int n_rep,
                                      SeqEmitter& emit) {
   int lane = threadIdx.x & 31;
@@ -200,8 +231,22 @@ __device__ inline void lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* ht
   uint32_t lit_start = 0;
   uint32_t pos = 0;
   uint32_t rep[kMaxRepProbes] = {}; // recent distinct offsets, most recent first; 0 = none yet
+  // Moves off to the front of rep (warp-uniform): shifts the others down
+  // until off's old slot, or the last, is overwritten.
+  auto use_offset = [&](uint32_t off) {
+    uint32_t carry = off;
+#pragma unroll
+    for (int r = 0; r < kMaxRepProbes; ++r) {
+      uint32_t t = rep[r];
+      rep[r] = carry;
+      carry = t;
+      if (t == off) break;
+    }
+  };
+  uint32_t miss = 0; // windows in a row without a match
   while (pos + kMinMatch <= n) {
-    uint32_t p = pos + lane;
+    uint32_t stride = min(1u + (miss >> kSkipTrigger), (uint32_t)kMaxSkip);
+    uint32_t p = pos + lane * stride;
     bool valid = p + kMinMatch <= n;
     uint32_t h = 0;
     uint32_t bucket[kBucketWays]; // only read after being populated below, when valid
@@ -241,7 +286,7 @@ __device__ inline void lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* ht
     }
     __syncwarp();
 
-    if (valid && best_len < (uint32_t)kMinMatch) {
+    if (stride == 1 && valid && best_len < (uint32_t)kMinMatch) {
 #pragma unroll
       for (int w = 0; w < kBucketWays; ++w) bucket[w] = htab[kBucketWays * h + w];
       uint32_t max_len = min((uint32_t)kProbe, n - p);
@@ -249,6 +294,30 @@ __device__ inline void lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* ht
     }
 
     unsigned mask = __ballot_sync(kFullMask, best_len >= (uint32_t)kMinMatch);
+    if (stride > 1) {
+      // Sampling: take the first match, extend it back over the positions
+      // the stride skipped, and resume one position at a time after it.
+      if (!mask) {
+        pos += 32 * stride;
+        ++miss;
+        continue;
+      }
+      uint32_t j = __ffs(mask) - 1;
+      uint32_t len = __shfl_sync(kFullMask, best_len, j);
+      uint32_t off = __shfl_sync(kFullMask, best_off, j);
+      uint32_t start = pos + j * stride;
+      if (len == (uint32_t)kProbe) len = warp_extend(in, start, off, n, len);
+      uint32_t back = warp_extend_back(in, start, off, lit_start);
+      start -= back;
+      len += back;
+      emit(lit_start, start - lit_start, off, len);
+      lit_start = start + len;
+      use_offset(off);
+      pos = lit_start;
+      miss = 0;
+      continue;
+    }
+    miss = mask ? 0 : miss + 1;
     uint32_t cur = 0;
     while (cur < 32) {
       unsigned m = mask & (~0u << cur);
@@ -271,16 +340,7 @@ __device__ inline void lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* ht
       emit(lit_start, pos + j - lit_start, off, len);
       lit_start = pos + j + len;
       cur = j + len;
-      // Move off to the front of the recent offsets (warp-uniform): shift
-      // the others down until off's old slot, or the last, is overwritten.
-      uint32_t carry = off;
-#pragma unroll
-      for (int r = 0; r < kMaxRepProbes; ++r) {
-        uint32_t t = rep[r];
-        rep[r] = carry;
-        carry = t;
-        if (t == off) break;
-      }
+      use_offset(off);
     }
     pos += cur > 32 ? cur : 32;
   }

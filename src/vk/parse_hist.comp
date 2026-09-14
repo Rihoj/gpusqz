@@ -13,6 +13,8 @@ const uint kProbe = 32;
 const uint kBucketWays = 4;
 const int kLazySteps = 2;
 const int kMaxRepProbes = 2; // see kernels.h's rep_probes()
+const uint kSkipTrigger = 3;  // see lz_warp.cuh
+const uint kMaxSkip = 32;
 
 // This lane group's chunk: input base, scratch bases, and the running
 // SeqEmitter counts.
@@ -60,12 +62,36 @@ uint lg_extend(uint p, uint off, uint n, uint len) {
   return len;
 }
 
+// lz_warp.cuh's warp_extend_back.
+uint lg_extend_back(uint p, uint off, uint floor_pos) {
+  uint lane = lg_lane();
+  uint max_back = min(p - floor_pos, p - off);
+  for (uint back = 0; back < max_back; back += 32) {
+    uint k = back + lane;
+    bool mism = k >= max_back || inb[g_in + p - 1 - k] != inb[g_in + p - 1 - k - off];
+    uint m = lg_ballot(mism);
+    if (m != 0) return back + uint(findLSB(m));
+  }
+  return max_back;
+}
+
 void emit(uint lit_start, uint lit_len, uint off, uint ml) {
   uint lane = lg_lane();
   if (lane == 0) seqs[g_seq + g_n_seq] = seq_pack(lit_len, off, ml);
   for (uint k = lane; k < lit_len; k += 32) lits[g_lit + g_n_lit + k] = inb[g_in + lit_start + k];
   ++g_n_seq;
   g_n_lit += lit_len;
+}
+
+// lz_parse_warp's use_offset: moves off to the front of rep.
+void use_offset(inout uint rep[kMaxRepProbes], uint off) {
+  uint carry = off;
+  for (int r = 0; r < kMaxRepProbes; ++r) {
+    uint t = rep[r];
+    rep[r] = carry;
+    carry = t;
+    if (t == off) break;
+  }
 }
 
 // See lz_parse_warp. One difference: CUDA picks each bucket's inserting
@@ -84,8 +110,10 @@ void lz_parse(uint n, uint hash_bits) {
   int n_rep = n_rep_probes();
   uint rep[kMaxRepProbes];
   for (int r = 0; r < kMaxRepProbes; ++r) rep[r] = 0;
+  uint miss = 0;
   while (pos + kMinMatch <= n) {
-    uint p = pos + lane;
+    uint stride = min(1u + (miss >> kSkipTrigger), kMaxSkip);
+    uint p = pos + lane * stride;
     bool valid = p + kMinMatch <= n;
     uint h = 0;
     uint bucket[kBucketWays];
@@ -117,12 +145,34 @@ void lz_parse(uint n, uint hash_bits) {
     if (valid) atomicMin(htab[hb], p);
     lg_sync();
 
-    if (valid && best_len < kMinMatch) {
+    if (stride == 1 && valid && best_len < kMinMatch) {
       for (uint w = 0; w < kBucketWays; ++w) bucket[w] = htab[hb + w];
       probe_bucket(p, bucket, min(kProbe, n - p), best_len, best_off);
     }
 
     uint mask = lg_ballot(best_len >= kMinMatch);
+    if (stride > 1) {
+      if (mask == 0) {
+        pos += 32 * stride;
+        ++miss;
+        continue;
+      }
+      uint j = uint(findLSB(mask));
+      uint len = lg_shfl(best_len, j);
+      uint off = lg_shfl(best_off, j);
+      uint start = pos + j * stride;
+      if (len == kProbe) len = lg_extend(start, off, n, len);
+      uint back = lg_extend_back(start, off, lit_start);
+      start -= back;
+      len += back;
+      emit(lit_start, start - lit_start, off, len);
+      lit_start = start + len;
+      use_offset(rep, off);
+      pos = lit_start;
+      miss = 0;
+      continue;
+    }
+    miss = mask != 0 ? 0 : miss + 1;
     uint cur = 0;
     while (cur < 32) {
       uint m = mask & (~0u << cur);
@@ -144,13 +194,7 @@ void lz_parse(uint n, uint hash_bits) {
       emit(lit_start, pos + j - lit_start, off, len);
       lit_start = pos + j + len;
       cur = j + len;
-      uint carry = off;
-      for (int r = 0; r < kMaxRepProbes; ++r) {
-        uint t = rep[r];
-        rep[r] = carry;
-        carry = t;
-        if (t == off) break;
-      }
+      use_offset(rep, off);
     }
     pos += cur > 32 ? cur : 32;
   }
