@@ -219,7 +219,12 @@ if(GPUSQZ_BUILD_GPU)
 endif()
 
 # ---------------------------------------------------------------------------
-# Install and packages (cpack -G DEB | RPM | ZIP | TGZ)
+# Install and packages
+#   cpack -G DEB | RPM        Linux
+#   cpack -G "ZIP;WIX"        Windows: portable zip and .msi installer
+#   cpack -G "TGZ;productbuild"  macOS: tarball and .pkg installer
+# Installer-only files (license page, macOS postinstall, MSI PATH entry)
+# live in packaging/.
 # ---------------------------------------------------------------------------
 include(GNUInstallDirs)
 if(GPUSQZ_BUILD_GPU)
@@ -258,8 +263,23 @@ set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
 set(CPACK_PACKAGE_CONTACT ${GPUSQZ_PACKAGE_MAINTAINER})
 set(CPACK_PACKAGE_DESCRIPTION
     "gpusqz compresses and decompresses files on the GPU: a lane-parallel LZ parse and a 32-way interleaved rANS coder. NVIDIA GPUs of compute capability 7.0 or newer use CUDA (driver supporting CUDA 12; the runtime is linked in); AMD, Apple, Intel and other GPUs use Vulkan 1.2 (the GPU driver's Vulkan support, loaded at run time). gpusqz_refdec is a CPU-only decoder for the same format.")
-set(CPACK_RESOURCE_FILE_README ${CMAKE_CURRENT_SOURCE_DIR}/README.md)
+set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/Rihoj/gpusqz")
+set(CPACK_PACKAGE_INSTALL_DIRECTORY "gpusqz")
+# Pages shown by the .msi and .pkg installers.
+set(CPACK_RESOURCE_FILE_README ${CMAKE_CURRENT_SOURCE_DIR}/packaging/readme.txt)
+set(CPACK_RESOURCE_FILE_LICENSE ${CMAKE_CURRENT_SOURCE_DIR}/packaging/license.txt)
+set(CPACK_PROJECT_CONFIG_FILE ${CMAKE_CURRENT_SOURCE_DIR}/packaging/CPackOptions.cmake)
 set(CPACK_STRIP_FILES ON)
+
+# Windows .msi (WiX 3). The upgrade GUID identifies the product across
+# versions, so a new .msi replaces an installed older one: never change it.
+set(CPACK_WIX_UPGRADE_GUID "456B3F95-0D42-4444-A110-16E047CCEA5D")
+set(CPACK_WIX_PATCH_FILE ${CMAKE_CURRENT_SOURCE_DIR}/packaging/wix-patch.xml)
+set(CPACK_WIX_PROPERTY_ARPURLINFOABOUT ${CPACK_PACKAGE_HOMEPAGE_URL})
+
+# macOS .pkg
+set(CPACK_PRODUCTBUILD_IDENTIFIER "io.github.rihoj.gpusqz")
+set(CPACK_POSTFLIGHT_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/packaging/macos-postinstall.sh)
 
 set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
 set(CPACK_DEBIAN_PACKAGE_MAINTAINER ${GPUSQZ_PACKAGE_MAINTAINER})

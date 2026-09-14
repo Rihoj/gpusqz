@@ -1,6 +1,7 @@
-# Builds gpusqz for Linux (deb, rpm), Windows (zip) and macOS (tar.gz), runs
-# the tests that don't need a GPU, and on a v* tag publishes the packages
-# as a GitHub release.
+# Builds gpusqz for Linux (deb, rpm), Windows (zip, msi installer) and macOS
+# (tar.gz, pkg installer), runs the tests that don't need a GPU, installs
+# and uninstalls the installers, and on a v* tag publishes the packages as a
+# GitHub release.
 #
 # gpusqz has two backends (src/backend.h): CUDA for NVIDIA GPUs and Vulkan
 # for AMD, Apple, Intel and NVIDIA GPUs. Linux and Windows packages carry
@@ -167,7 +168,7 @@ jobs:
           if-no-files-found: error
 
   windows:
-    name: Windows (zip)
+    name: Windows (zip, msi)
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -224,11 +225,12 @@ jobs:
       - name: Test (no GPU)
         run: ctest --test-dir build -LE "gpu|vulkan" --output-on-failure
 
+      # WiX 3 is preinstalled on the runner (candle/light via %WIX%).
       - name: Package
         working-directory: build
-        run: cpack -G ZIP
+        run: cpack -G "ZIP;WIX"
 
-      - name: Smoke-test the package
+      - name: Smoke-test the zip
         shell: pwsh
         run: |
           $zip = Get-ChildItem build\*.zip | Select-Object -First 1
@@ -243,14 +245,41 @@ jobs:
           # Printing usage exits non-zero, and the runner would report that.
           exit 0
 
+      # Installs the .msi silently, checks the programs and the PATH entry,
+      # then uninstalls and checks both are gone.
+      - name: Smoke-test the installer
+        shell: pwsh
+        run: |
+          $msi = (Get-ChildItem build\*.msi | Select-Object -First 1).FullName
+          $dir = "$env:ProgramFiles\gpusqz\bin"
+          $envKey = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/i `"$msi`" /qn /l*v install.log"
+          if ($p.ExitCode -ne 0) { Get-Content install.log -Tail 40; throw "install exited with $($p.ExitCode)" }
+          if (-not (Test-Path "$dir\gpusqz.exe")) { throw "gpusqz.exe not installed in $dir" }
+          $path = (Get-ItemProperty $envKey).Path
+          if ($path -notlike "*$dir*") { throw "$dir not added to the system PATH: $path" }
+          & "$dir\gpusqz_refdec.exe" tests\fixtures\text__c4k_lit0.gsz out2.txt
+          if ($LASTEXITCODE -ne 0) { throw "installed gpusqz_refdec failed" }
+          if ((Get-FileHash out2.txt).Hash -ne (Get-FileHash tests\fixtures\text.orig).Hash) { throw "decode mismatch" }
+          $usage = & "$dir\gpusqz.exe" 2>&1 | Out-String
+          if ($usage -notmatch "usage:") { throw "installed gpusqz.exe did not print usage: $usage" }
+          $p = Start-Process msiexec -Wait -PassThru -ArgumentList "/x `"$msi`" /qn /l*v uninstall.log"
+          if ($p.ExitCode -ne 0) { Get-Content uninstall.log -Tail 40; throw "uninstall exited with $($p.ExitCode)" }
+          if (Test-Path "$dir\gpusqz.exe") { throw "gpusqz.exe left behind after uninstall" }
+          $path = (Get-ItemProperty $envKey).Path
+          if ($path -like "*$dir*") { throw "$dir left in the system PATH after uninstall" }
+          exit 0
+
       - uses: actions/upload-artifact@v4
         with:
-          name: gpusqz-windows-zip
-          path: build/*.zip
+          name: gpusqz-windows
+          path: |
+            build/*.zip
+            build/*.msi
           if-no-files-found: error
 
   macos:
-    name: macOS (Vulkan via MoltenVK, tar.gz)
+    name: macOS (Vulkan via MoltenVK, tar.gz, pkg)
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -315,15 +344,35 @@ jobs:
       - name: Package
         working-directory: build
         run: |
-          cpack -G TGZ
+          cpack -G "TGZ;productbuild"
           tar tzf ./*.tar.gz
+          pkgutil --payload-files ./*.pkg
           # Universal binaries: Apple silicon and Intel.
           for f in gpusqz gpusqz_refdec; do lipo "$f" -verify_arch arm64 x86_64; done
 
+      # Installs the .pkg, then runs the programs through the /usr/local/bin
+      # links: gpusqz must still find the MoltenVK bundled next to it.
+      - name: Smoke-test the installer
+        env:
+          MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS: "0"
+        run: |
+          sudo installer -pkg build/*.pkg -target /
+          pkgutil --pkgs | grep -i gpusqz
+          ls -l /usr/local/bin/gpusqz /usr/local/bin/gpusqz_refdec
+          test -f /usr/local/gpusqz/lib/libMoltenVK.dylib
+          cd "$RUNNER_TEMP"
+          gpusqz_refdec "$GITHUB_WORKSPACE/tests/fixtures/text__c4k_lit0.gsz" out.txt
+          cmp out.txt "$GITHUB_WORKSPACE/tests/fixtures/text.orig"
+          gpusqz 2>&1 | grep -q "usage:"
+          gpusqz devices 2>&1 | tee devices.txt
+          grep -q "Vulkan 0:" devices.txt || { echo "gpusqz did not load its bundled MoltenVK"; exit 1; }
+
       - uses: actions/upload-artifact@v4
         with:
-          name: gpusqz-macos-tgz
-          path: build/*.tar.gz
+          name: gpusqz-macos
+          path: |
+            build/*.tar.gz
+            build/*.pkg
           if-no-files-found: error
 
   release:

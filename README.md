@@ -320,12 +320,31 @@ Pre-built packages come from the `build` GitHub workflow
 (`.github/workflows/build.yml`): every push to `main` produces them as
 workflow artifacts, and a `v*` tag publishes them as a GitHub release.
 
-| platform | package | backends | contents |
+| platform | installer | portable archive | backends |
 |---|---|---|---|
-| Ubuntu 22.04+, Debian 12+ | `gpusqz_<version>_amd64.deb` | CUDA, Vulkan | `gpusqz`, `gpusqz_refdec` |
-| RHEL/Rocky/Alma 8+, Fedora | `gpusqz-<version>-1.x86_64.rpm` | CUDA, Vulkan | `gpusqz`, `gpusqz_refdec` |
-| Windows 10/11 x64 | `gpusqz-<version>-win64.zip` | CUDA, Vulkan | `gpusqz.exe`, `gpusqz_refdec.exe`, MSVC runtime DLLs |
-| macOS 11+ (Apple silicon and Intel) | `gpusqz-<version>-Darwin.tar.gz` | Vulkan (MoltenVK) | `bin/gpusqz`, `bin/gpusqz_refdec`, `lib/libMoltenVK.dylib` |
+| Ubuntu 22.04+, Debian 12+ | `gpusqz_<version>_amd64.deb` | – | CUDA, Vulkan |
+| RHEL/Rocky/Alma 8+, Fedora | `gpusqz-<version>-1.x86_64.rpm` | – | CUDA, Vulkan |
+| Windows 10/11 x64 | `gpusqz-<version>-win64.msi` | `gpusqz-<version>-win64.zip` | CUDA, Vulkan |
+| macOS 11+ (Apple silicon and Intel) | `gpusqz-<version>-Darwin.pkg` | `gpusqz-<version>-Darwin.tar.gz` | Vulkan (MoltenVK) |
+
+Every package has `gpusqz` and `gpusqz_refdec`; the Windows ones add the
+MSVC runtime DLLs and the macOS ones `lib/libMoltenVK.dylib`.
+
+- **Windows `.msi`** installs to `C:\Program Files\gpusqz\bin` and adds
+  that to the system PATH (open a new terminal afterwards). Uninstall it
+  from Settings → Apps. The installer is not code-signed yet, so
+  SmartScreen asks first: *More info* → *Run anyway*. Silent install:
+  `msiexec /i gpusqz-<version>-win64.msi /qn`.
+- **macOS `.pkg`** installs to `/usr/local/gpusqz` and links `gpusqz` and
+  `gpusqz_refdec` into `/usr/local/bin`. It is not signed or notarized
+  yet, so Gatekeeper refuses a double-click: allow it under System
+  Settings → Privacy & Security → *Open Anyway*, or install from a
+  terminal with `sudo installer -pkg gpusqz-<version>-Darwin.pkg -target /`.
+  To uninstall: `sudo rm -rf /usr/local/gpusqz /usr/local/bin/gpusqz
+  /usr/local/bin/gpusqz_refdec && sudo pkgutil --forget io.github.rihoj.gpusqz`.
+- **Archives** (`.zip`, `.tar.gz`) need no installation: unpack and run
+  from `bin/`. Keep `bin/` and `lib/` together on macOS, and clear the
+  download quarantine there first: `xattr -dr com.apple.quarantine <unpacked dir>`.
 
 What each GPU needs at run time:
 
@@ -339,11 +358,10 @@ What each GPU needs at run time:
   (`libvulkan1` / `vulkan-loader`). On Windows it is the AMD Adrenalin
   driver. (ROCm/HIP is not used: it dropped Polaris cards like the RX 580
   and doesn't exist for them on Windows.)
-- **Apple silicon** (M1, M4 and later): nothing to install. The macOS
-  package ships MoltenVK, which runs the Vulkan backend on Metal, in
-  `lib/` next to `bin/`; keep that layout. A Homebrew `molten-vk` or the
-  Vulkan SDK also work. Downloaded binaries are unsigned, so macOS
-  quarantines them: `xattr -dr com.apple.quarantine <unpacked dir>`.
+- **Apple silicon** (M1, M4 and later): nothing else to install. The macOS
+  packages ship MoltenVK, which runs the Vulkan backend on Metal, in
+  `lib/` next to `bin/`. A Homebrew `molten-vk` or the Vulkan SDK also
+  work.
 - **Intel**: the driver's Vulkan support (Mesa ANV on Linux).
 
 Run `gpusqz devices` to see what gpusqz found. `gpusqz_refdec <in.gsz>

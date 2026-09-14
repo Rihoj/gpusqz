@@ -1,0 +1,11 @@
+gpusqz has not been published under an open-source license yet.
+Until it is, ask the author before redistributing it.
+
+Bundled third-party software
+
+  MoltenVK (macOS package only): Vulkan on Apple's Metal. Apache
+  License 2.0; its license file is installed as
+  share/doc/gpusqz/MoltenVK-LICENSE.
+
+  Microsoft Visual C++ runtime (Windows package only), redistributed
+  under the Visual Studio redistribution terms.
