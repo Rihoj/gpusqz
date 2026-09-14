@@ -240,6 +240,8 @@ jobs:
           $gpusqz = Join-Path $bin.DirectoryName gpusqz.exe
           $usage = & $gpusqz 2>&1 | Out-String
           if ($usage -notmatch "usage:") { throw "gpusqz.exe did not print usage: $usage" }
+          # Printing usage exits non-zero, and the runner would report that.
+          exit 0
 
       - uses: actions/upload-artifact@v4
         with:
@@ -303,7 +305,7 @@ jobs:
           # round_trip.sh uses GNU stat/base64.
           brew install coreutils
           export PATH="$(brew --prefix coreutils)/libexec/gnubin:$PATH"
-          ./build/gpusqz devices
+          GPUSQZ_VK_DEBUG=1 ./build/gpusqz devices
           # Fixture decoding plus the round-trip suite.
           ctest --test-dir build -L vulkan --output-on-failure
 

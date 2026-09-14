@@ -452,7 +452,6 @@ class VkBackend : public Backend {
   VkPipelineLayout make_pl(VkDescriptorSetLayout dsl);
   Pipeline make_pipeline(const uint32_t* code, size_t bytes, VkPipelineLayout layout, bool require32);
   bool probe_lanes(bool subgroup);
-  int find_memory(uint32_t type_bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid = 0);
 };
 
 Buf::~Buf() {
@@ -584,14 +583,6 @@ VkStreamImpl& raw(Stream& s) { return static_cast<VkStreamImpl&>(s); }
 // VkBackend
 // ---------------------------------------------------------------------------
 
-int VkBackend::find_memory(uint32_t type_bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid) {
-  for (uint32_t i = 0; i < mem.memoryTypeCount; ++i) {
-    VkMemoryPropertyFlags f = mem.memoryTypes[i].propertyFlags;
-    if ((type_bits & (1u << i)) && (f & want) == want && (f & avoid) == 0) return (int)i;
-  }
-  return -1;
-}
-
 bool VkBackend::alloc_buf(Buf& b, VkDeviceSize size, bool host) {
   b.be = this;
   b.size = std::max<VkDeviceSize>(16, (size + 15) & ~(VkDeviceSize)15);
@@ -603,26 +594,43 @@ bool VkBackend::alloc_buf(Buf& b, VkDeviceSize size, bool host) {
   if (vkCreateBuffer(dev, &bci, nullptr, &b.b) != VK_SUCCESS) return false;
   VkMemoryRequirements req;
   vkGetBufferMemoryRequirements(dev, b.b, &req);
-  int type;
-  if (host) {
-    type = find_memory(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-                                               VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
-    if (type < 0) {
-      type = find_memory(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  // Memory types in order of preference. Every type that qualifies is
+  // tried, because a type can refuse a buffer its flags would suggest it
+  // takes (MoltenVK's private storage on Apple's paravirtualized VM GPU).
+  // Lazily allocated (tile memory) and protected types never back buffers.
+  const VkMemoryPropertyFlags hv = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+  const VkMemoryPropertyFlags never = VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT;
+  std::vector<uint32_t> order;
+  auto add = [&](VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid) {
+    for (uint32_t i = 0; i < mem.memoryTypeCount; ++i) {
+      VkMemoryPropertyFlags f = mem.memoryTypes[i].propertyFlags;
+      if ((req.memoryTypeBits & (1u << i)) && (f & want) == want && (f & (avoid | never)) == 0 &&
+          std::find(order.begin(), order.end(), i) == order.end()) {
+        order.push_back(i);
+      }
     }
+  };
+  if (host) {
+    add(hv | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0);
+    add(hv, 0);
   } else {
-    type = find_memory(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (type < 0) type = find_memory(req.memoryTypeBits, 0);
+    add(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    add(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+    add(0, 0);
   }
-  if (type < 0) return false;
   VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
   ai.allocationSize = req.size;
-  ai.memoryTypeIndex = (uint32_t)type;
-  if (vkAllocateMemory(dev, &ai, nullptr, &b.m) != VK_SUCCESS) {
+  for (uint32_t type : order) {
+    ai.memoryTypeIndex = type;
+    VkResult r = vkAllocateMemory(dev, &ai, nullptr, &b.m);
+    if (r == VK_SUCCESS) return vkBindBufferMemory(dev, b.b, b.m, 0) == VK_SUCCESS;
     b.m = VK_NULL_HANDLE;
-    return false;
+    if (std::getenv("GPUSQZ_VK_DEBUG")) {
+      std::fprintf(stderr, "gpusqz: %llu-byte %s buffer: memory type %u refused (VkResult %d)\n",
+                   (unsigned long long)req.size, host ? "host" : "device", type, (int)r);
+    }
   }
-  return vkBindBufferMemory(dev, b.b, b.m, 0) == VK_SUCCESS;
+  return false;
 }
 
 VkDescriptorSetLayout VkBackend::make_dsl(uint32_t bindings) {
@@ -715,6 +723,9 @@ bool VkBackend::probe_lanes(bool subgroup) {
   constexpr uint32_t kGroups = 8, kWords = kGroups * kLanes * 4;
   Buf out, host;
   bool ok = alloc_buf(out, kWords * 4, false) && alloc_buf(host, kWords * 4, true);
+  if (!ok && std::getenv("GPUSQZ_VK_DEBUG")) {
+    std::fprintf(stderr, "gpusqz: %s lane probe could not allocate its buffers\n", subgroup ? "subgroup" : "shared");
+  }
   if (ok) {
     VkDescriptorPool pool = make_pool(1);
     VkDescriptorSet set = make_set(pool, dsl);
@@ -727,6 +738,9 @@ bool VkBackend::probe_lanes(bool subgroup) {
       st.dispatch(p, pl, set, pc, kPcBytes, kGroups);
       st.copy(out, 0, host, 0, kWords * 4);
       ok = st.wait_value(st.submit(-1));
+    }
+    if (!ok && std::getenv("GPUSQZ_VK_DEBUG")) {
+      std::fprintf(stderr, "gpusqz: %s lane probe did not complete on the GPU\n", subgroup ? "subgroup" : "shared");
     }
     void* mapped = nullptr;
     if (ok && vkMapMemory(dev, host.m, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS) {
@@ -802,6 +816,16 @@ bool VkBackend::init(const DevInfo& d, std::string* why) {
     queues.push_back(q);
   }
   vkGetPhysicalDeviceMemoryProperties(d.pd, &mem);
+  if (std::getenv("GPUSQZ_VK_DEBUG")) {
+    for (uint32_t i = 0; i < mem.memoryHeapCount; ++i) {
+      std::fprintf(stderr, "gpusqz: memory heap %u: %llu MiB, flags %#x\n", i,
+                   (unsigned long long)(mem.memoryHeaps[i].size >> 20), (unsigned)mem.memoryHeaps[i].flags);
+    }
+    for (uint32_t i = 0; i < mem.memoryTypeCount; ++i) {
+      std::fprintf(stderr, "gpusqz: memory type %u: heap %u, flags %#x\n", i, mem.memoryTypes[i].heapIndex,
+                   (unsigned)mem.memoryTypes[i].propertyFlags);
+    }
+  }
 
   if (d.timestamp_bits > 0) {
     query_count = 1u << 16;
@@ -821,7 +845,7 @@ bool VkBackend::init(const DevInfo& d, std::string* why) {
     info.require32 = false;
   }
   if (!info.subgroup_lanes && !probe_lanes(false)) {
-    *why = std::string(d.props.deviceName) + ": the lane-group self-test failed";
+    *why = std::string(d.props.deviceName) + ": the lane-group self-test failed (GPUSQZ_VK_DEBUG=1 shows why)";
     return false;
   }
 
