@@ -46,12 +46,13 @@
 
 ## Ratio
 
-- **Ratio vs zstd.** zstd's parser is more sophisticated than gpusqz's hash
-  match finder with a two-step lazy lookahead: `zstd -3`'s output is ~0.5%
-  smaller than gpusqz's `ratio` profile on the varied corpus. An optimal
-  parser, or a match finder with longer chains, would be the next ratio
-  lever. A third lazy step and a 64-byte probe cap were measured and did
-  nothing useful (see [Measured and
+- **Ratio vs zstd.** The `ratio` profile now edges `zstd -3` on both
+  benchmark corpora (0.1% and 0.6% smaller), but zstd's parser is still
+  the more sophisticated one, and `zstd -19` is far out of reach. An
+  optimal parser, a second longer-key hash table (zstd's dfast, which is
+  what levels 3–4 use), or a match finder with longer chains would be the
+  next ratio levers. A third lazy step and a 64-byte probe cap were
+  measured and did nothing useful (see [Measured and
   rejected](performance-history.md#measured-and-rejected)).
 - **Literal-context choice is per batch, estimated from the histogram.**
   It is exact about which chunks can't use rANS, but not about which

@@ -86,6 +86,11 @@ are the corpora the change was measured on (see the sections below).
 | 2026-09-14 | 35a5ca7 | v0.1.0 | First release | same code paths as above |
 | 2026-09-14 | 6dd18e4 | | enwik8 on an Apple M1 Max and the RTX 5060 Ti | see [enwik8](#enwik8) |
 | 2026-09-14 | d8f68b8 | v0.1.1 | Vulkan timestamp pool capped at 4096 | no speed change; MoltenVK kernel timings exact from here on |
+| 2026-09-14 | f5283bf | | Output written by two threads at known file offsets | 1GB: decompress wall 0.79–0.86s → 0.65–0.81s at `speed`; output identical |
+| 2026-09-14 | 0c5280a | | Recent match offsets tried at every parse position | 0.11–0.47% smaller at 2–7% of compress kernel throughput |
+| 2026-09-14 | ba9705f | | Positions sampled after 8 windows without a match | random data: compress kernel 3.0–6.7x faster; text unchanged |
+| 2026-09-15 | a7eeb42 | | Format 2: coded tables, 4-byte chunk directory, density-aware context choice | 0.004–1.6% smaller; no kernel change |
+| 2026-09-15 | a7eeb42 | | Re-measurement of everything on format 2 | the [current results](benchmarks.md) |
 
 ## The occupancy round (2026-09-13)
 
@@ -115,6 +120,40 @@ order of impact:
 The before/after measurements are the back-to-back rows in the two
 corpus tables below.
 
+## The survey round (2026-09-14 to 2026-09-15)
+
+Four changes measured against the [compression
+survey](compression-survey.md), in the order they landed:
+
+1. **Two writer threads** (f5283bf). Decompression was waiting on one
+   thread copying cache-cold staging memory into the page cache. Every
+   output stage's file offset is known when it is queued, so two threads
+   now write them in any order. `speed` decompression of the 1GB corpus
+   went from 0.79–0.86s to 0.65–0.81s; the `ratio` profile, whose output
+   all arrives after one batch, didn't move.
+2. **Recent match offsets tried at every position** (0c5280a). zstd's
+   parsers check their repeat offsets before the hash table and gpusqz
+   didn't: 0.11–0.47% smaller output for 2–7% of compress kernel
+   throughput. `speed` tries one offset, the other profiles two.
+3. **Sampling after long runs without a match** (ba9705f), as in LZ4 and
+   zstd. Incompressible input was the slowest case; it is now 3.0x
+   (`speed`) to 6.7x (`ratio`) faster on the compress kernel, and
+   already-compressed files 13–60% faster, with text output unchanged.
+4. **Format 2** (a7eeb42): the rANS tables coded with an adaptive binary
+   range coder (~10x smaller), the chunk directory cut from 16 bytes to
+   4, and the literal-context chooser charging what the coded tables
+   actually cost. 0.004% to 1.6% smaller output, most of it on small
+   files and at `speed`, where the tables and directory weigh most.
+
+Together, on the 1GB corpus: 0.5% smaller at `speed`, 0.6% at `balance`
+and 0.5% at `ratio`, which puts the `ratio` profile just past `zstd -3`
+(0.2243 against 0.2245). Compression costs 4–6% of both kernel and wall
+throughput, all of it the offset probes. The decompress kernel is within
+3% at `speed` and `balance`; `ratio`'s reads much higher than the
+ec7aae3 row (3087 against 1906 MB/s), but that is the batch layout the
+free VRAM allowed on the day, not a change here — the A/B pairs at a
+fixed budget moved decompression by under 1%.
+
 ## 283MB repetitive corpus
 
 One 5.4MB block of `/usr/include` headers repeated 48 times (the recipe
@@ -135,6 +174,7 @@ Default profile (`speed`, 64KB chunks), MB/s:
 | 2026-09-13 | d5073da | idle, best of 3, back to back with the next row | 614 | 2474 | 707 | 3054 | 0.2775 | 0.2724 |
 | 2026-09-13 | ec7aae3 (7012791, 61f4a78, 8c9ddcc) | idle, best of 3, back to back with the previous row | 647 | 2382 | 769 | 3804 | 0.2673 | 0.2724 |
 | 2026-09-13 | ec7aae3 | idle, best of 3–5 (the [current results](benchmarks.md)) | 664 | 2390 | 718 | 3805 | 0.2673 | 0.2724 |
+| 2026-09-15 | a7eeb42 | idle (0.5GB used, 2–6%), best of 3–5 (the [current results](benchmarks.md)) | 643 | 2319 | 778 | 3700 | 0.2657 | 0.2724 |
 
 `balance` (256KB) and `ratio` (1MB), kernel MB/s:
 
@@ -148,6 +188,7 @@ Default profile (`speed`, 64KB chunks), MB/s:
 | d5073da (back to back with the next row) | 809 | 837 | 0.2687 | 216 | 206 | 0.2500 |
 | ec7aae3 (back to back with the previous row) | 1737 | 3416 | 0.2547 | 1233 | 1515 | 0.2423 |
 | ec7aae3 (current results) | 1746 | 3414 | 0.2547 | 1232 | 1515 | 0.2423 |
+| a7eeb42 (current results) | 1699 | 3410 | 0.2535 | 1142 | 1492 | 0.2411 |
 
 Wall MB/s for the back-to-back pair: `balance` compress 409 → 579 and
 decompress 679 → 746, `ratio` compress 171 → 499 and decompress 425 →
@@ -187,6 +228,9 @@ Full measurements, MB/s:
 | 2026-09-13 | ec7aae3 | idle, best of 3–5 (the [current results](benchmarks.md)) | `speed` | 1297 | 2983 | 1130 | 4567 | 0.2526 |
 | | | | `balance` | 989 | 1847 | 1267 | 3353 | 0.2387 |
 | | | | `ratio` | 873 | 1552 | 1176 | 1906 | 0.2255 |
+| 2026-09-15 | a7eeb42 | idle (0.5GB used, 2–6%), best of 3–5 (the [current results](benchmarks.md)) | `speed` | 1217 | 2801 | 1234 | 4440 | 0.2512 |
+| | | | `balance` | 946 | 1744 | 1120 | 3283 | 0.2373 |
+| | | | `ratio` | 837 | 1484 | 1058 | 3087 | 0.2243 |
 
 The two ec7aae3 runs differ in decompress wall by up to 30%: decompression
 on this machine is bound by `fwrite` into the WSL2 page cache, which

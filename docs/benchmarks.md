@@ -13,70 +13,69 @@ whole-process (file I/O, PCIe copies, and for gpusqz ~0.2s of CUDA context
 creation and allocation); the kernel columns are the wall-clock time any
 gpusqz kernel was running. Ratio is output/input, so **lower is better**.
 
-Measured at commit ec7aae3 (2026-09-13), before the 0.1 releases. None of
-the changes since then was expected to move these numbers; the one that
-touched a kernel measured ~1.2–1.5% faster decompression (see [Performance
-history](performance-history.md#1gb-varied-corpus)).
+Measured at commit a7eeb42 (2026-09-15), on `.gsz` format 2.
 
-**Measurement conditions.** The GPU was otherwise idle (~1GB used by the
-desktop, 0–2% utilisation), and gpusqz's batch budget was 4GB (the default
-at the time; it is now 80% of free GPU memory, see [Usage](usage.md#gpu-memory)). On
-the 283MB corpus about half of gpusqz's wall time is the ~0.2s fixed startup
-cost, which varies by ±15% between runs, so its wall figures there move
-by that much from run to run; the kernel figures and the 1GB corpus are
-the steadier comparison. An earlier set of runs with another process
-holding 11.5GB of VRAM gave kernel figures and ratios within 1% of these.
+**Measurement conditions.** The GPU was otherwise idle (~0.5GB used by the
+desktop, 2–6% utilisation) and gpusqz used its default budget, 80% of the
+free GPU memory (see [Usage](usage.md#gpu-memory)). On the 283MB corpus
+about half of gpusqz's wall time is the ~0.2s fixed startup cost, which
+varies by ±15% between runs, so its wall figures there move by that much
+from run to run; the kernel figures and the 1GB corpus are the steadier
+comparison.
 
 Varied 1GB corpus (every distinct `/usr/include` header, concatenated
 without repetition; see [Corpora](#corpora)):
 
 | codec | compress MB/s (wall) | kernel MB/s | decompress MB/s (wall) | kernel MB/s | ratio |
 |---|---|---|---|---|---|
-| **gpusqz** (default, `speed`, 64KB) | **1297** | 2983 | 1130 | 4567 | 0.2526 |
-| gpusqz `--profile balance` (256KB) | 989 | 1847 | 1267 | 3353 | 0.2387 |
-| gpusqz `--profile ratio` (1MB) | 873 | 1552 | 1176 | 1906 | 0.2255 |
-| gzip -1 | 145 | – | 250 | – | 0.2836 |
-| gzip -6 | 56 | – | 278 | – | 0.2306 |
-| zstd -1 (1 thread) | 516 | – | **1434** | – | 0.2518 |
-| zstd -3 (1 thread) | 401 | – | 1335 | – | **0.2245** |
+| **gpusqz** (default, `speed`, 64KB) | **1217** | 2801 | 1234 | 4440 | 0.2512 |
+| gpusqz `--profile balance` (256KB) | 946 | 1744 | 1120 | 3283 | 0.2373 |
+| gpusqz `--profile ratio` (1MB) | 837 | 1484 | 1058 | 3087 | **0.2243** |
+| gzip -1 | 147 | – | 251 | – | 0.2836 |
+| gzip -6 | 56 | – | 266 | – | 0.2306 |
+| zstd -1 (1 thread) | 509 | – | **1384** | – | 0.2518 |
+| zstd -3 (1 thread) | 400 | – | 1293 | – | 0.2245 |
 
 Repetitive 283MB corpus (one 5.4MB block of headers repeated 48 times — a
 friendlier shape for a match finder, see [Corpora](#corpora)):
 
 | codec | compress MB/s (wall) | kernel MB/s | decompress MB/s (wall) | kernel MB/s | ratio |
 |---|---|---|---|---|---|
-| **gpusqz** (default, `speed`, 64KB) | **664** | 2390 | 718 | 3805 | 0.2673 |
-| gpusqz `--profile balance` (256KB) | 552 | 1746 | 715 | 3414 | 0.2547 |
-| gpusqz `--profile ratio` (1MB) | 487 | 1232 | 657 | 1515 | **0.2423** |
-| gzip -1 | 140 | – | 249 | – | 0.2985 |
-| gzip -6 | 53 | – | 273 | – | 0.2457 |
-| zstd -1 (1 thread) | 482 | – | **1328** | – | 0.2724 |
-| zstd -3 (1 thread) | 373 | – | 1188 | – | 0.2426 |
+| **gpusqz** (default, `speed`, 64KB) | **643** | 2319 | 778 | 3700 | 0.2657 |
+| gpusqz `--profile balance` (256KB) | 572 | 1699 | 698 | 3410 | 0.2535 |
+| gpusqz `--profile ratio` (1MB) | 530 | 1142 | 702 | 1492 | **0.2411** |
+| gzip -1 | 145 | – | 255 | – | 0.2985 |
+| gzip -6 | 55 | – | 280 | – | 0.2457 |
+| zstd -1 (1 thread) | 516 | – | **1342** | – | 0.2724 |
+| zstd -3 (1 thread) | 366 | – | 1240 | – | 0.2426 |
 
 Against the CPU tools:
 
-- **Default profile vs `zstd -1`.** gpusqz compresses 1.4x (283MB) to 2.5x
-  (1GB) faster. Its output is 1.9% smaller on the repetitive corpus and
-  0.3% larger on the varied one. `zstd -1` decompresses faster: 1.85x on
-  the smaller file, where gpusqz's fixed startup cost weighs more, and 1.3x
-  on the 1GB file.
-- **`ratio` profile vs `zstd -3`.** gpusqz compresses 1.3–2.2x faster. Its
-  output is 0.1% smaller on the repetitive corpus and 0.5% larger on the
-  varied one. `zstd -3` decompresses 1.1–1.8x faster.
+- **Default profile vs `zstd -1`.** gpusqz compresses 1.25x (283MB) to
+  2.4x (1GB) faster, and its output is smaller on both: 2.5% on the
+  repetitive corpus, 0.2% on the varied one. `zstd -1` decompresses
+  faster: 1.7x on the smaller file, where gpusqz's fixed startup cost
+  weighs more, and 1.1x on the 1GB file.
+- **`ratio` profile vs `zstd -3`.** gpusqz compresses 1.4x (283MB) to
+  2.1x (1GB) faster, for output 0.6% smaller on the repetitive corpus and
+  0.1% smaller on the varied one. `zstd -3` decompresses 1.2–1.8x faster.
 - **vs `gzip`.** Every gpusqz profile beats `gzip -1` on both ratio and
   speed. The `ratio` profile also beats `gzip -6`'s ratio on both corpora
-  while compressing 9–16x faster; `balance` does not beat `gzip -6`.
+  while compressing 10–15x faster; `balance` does not beat `gzip -6`.
 
-The gpusqz wall figures on the 1GB corpus are bounded by file I/O more than
-by the GPU: under WSL2, decompression spends most of its time in
-`fwrite` (see [Known limitations](limitations.md)), and the kernels run
-1.6–4x faster than the wall-clock rate.
+The gpusqz wall figures on the 1GB corpus are bounded by file I/O more
+than by the GPU: under WSL2, decompression spends most of its time
+writing the output (see [Known limitations](limitations.md)), and the
+kernels run 1.8–3.6x faster than the wall-clock rate.
 
 ## enwik8 on an Apple M1 Max and the RTX 5060 Ti
 
 enwik8 (the first 100MB of a 2006 English Wikipedia dump, the corpus of
 the Large Text Compression Benchmark) on two machines, best of 3,
-wall-clock MB/s of original data, 2026-09-14:
+wall-clock MB/s of original data, 2026-09-14 (v0.1.1, `.gsz` format 1).
+The two machines' comparison still holds, but the ratios have moved
+since: at a7eeb42 the same file compresses to 0.3846 (`speed`), 0.3734
+(`balance`) and 0.3583 (`ratio`).
 
 - **Apple M1 Max** (32GB, macOS): the macOS release package, Vulkan
   backend through MoltenVK, native.
