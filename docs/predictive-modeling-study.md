@@ -18,10 +18,10 @@ the time). The tools are in `study/predictive/` and
 
 - **Pure prediction beats today's files by a lot.** A small
   context-mixing model coding raw bytes, reset every chunk, with each chunk
-  split into 32 lanes that share one model in lockstep, makes enwik8 21%
+  split into 32 lanes that share one model in lockstep, makes enwik8 20%
   (64KB chunks) to 28% (1MB) smaller than `gpusqz`, and the headers corpus
   22% to 27% smaller. With under 2MB of model state per chunk the gain is
-  still 16–17% at 64KB.
+  still 15–17% at 64KB.
 - **That lands near zstd -19 and xz -9, not beyond them.** The best
   GPU-shaped configuration (1MB chunks, 85MB of model per chunk) sits
   between `xz -9` and `zstd -19` on both corpora. The small one that fits
@@ -99,7 +99,7 @@ Change in *whole-file* size against today's literal coding:
   decode.
 - **Adaptive models inside one lane lose.** At 64KB, each lane's run holds
   at most about 2KB of literals, too few to learn from.
-- What is decodable today saves under 0.7%. That is not worth a format
+- What is decodable today saves at most 0.6%. That is not worth a format
   change.
 
 ## Drop LZ: context mixing on raw bytes
@@ -111,18 +111,22 @@ would need. It is reset at every chunk, or never. With `--lanes 32` a chunk
 is split into 32 segments coded in lockstep, as gpusqz's lanes step. All
 32 share one model. Each segment's contexts come from its own bytes, and
 matches may only point at bytes already decoded. Update order within a
-step is lane order, with no delay, which is slightly optimistic.
+step is lane order, with no delay, which is slightly optimistic. The match
+model's hash index has one slot per chunk byte (2^16 entries at 64KB).
+The mixer learning rate (0.01) and adaptation cap (60) were picked from a
+small grid on enwik8's first 10MB, part of the same corpus reported here.
+The differences across that grid were about 1%.
 
-Sanity check: with no resets, enwik8 codes to 0.2161 (1.73 bpc), in the
+Sanity check: with no resets, enwik8 codes to 0.2156 (1.72 bpc), in the
 range of lpaq-class models, which is what this model is.
 
 | corpus, chunk | gpusqz | CM, one stream per chunk | CM, 32 lanes in lockstep |
 |---|---|---|---|
-| enwik8, 64KB | 0.3846 | 0.3001 (−22%) | 0.3057 (−21%) |
-| enwik8, 256KB | 0.3734 | 0.2724 (−27%) | 0.2790 (−25%) |
-| enwik8, 1MB | 0.3583 | 0.2515 (−30%) | 0.2593 (−28%) |
-| enwik8, never reset | – | 0.2161 | – |
-| headers, 64KB | 0.2041 | 0.1513 (−26%) | 0.1593 (−22%) |
+| enwik8, 64KB | 0.3846 | 0.3002 (−22%) | 0.3059 (−20%) |
+| enwik8, 256KB | 0.3734 | 0.2724 (−27%) | 0.2792 (−25%) |
+| enwik8, 1MB | 0.3583 | 0.2516 (−30%) | 0.2594 (−28%) |
+| enwik8, never reset | – | 0.2156 | – |
+| headers, 64KB | 0.2041 | 0.1513 (−26%) | 0.1594 (−22%) |
 | headers, 256KB | 0.1907 | 0.1313 (−31%) | 0.1411 (−26%) |
 | headers, 1MB | 0.1808 | 0.1201 (−34%) | 0.1318 (−27%) |
 | headers, never reset | – | 0.1065 | – |
@@ -140,7 +144,7 @@ speeds are rough, measured with eight runs sharing six cores):
 | `zstd -19` | 0.2695 | 0.1337 | ~2 MB/s |
 | `bzip2 -9` | 0.2900 | 0.1481 | ~18 MB/s |
 
-The 32-lane model at 1MB (0.2593, 0.1318) falls between `xz -9` and
+The 32-lane model at 1MB (0.2594, 0.1318) falls between `xz -9` and
 `zstd -19`.
 
 ### Model size
@@ -154,12 +158,12 @@ chunk byte. All runs below use 32 lanes.
 
 | chunk, hash slots | state per chunk | chunks in 4GB | enwik8 | headers |
 |---|---|---|---|---|
-| 64KB, 2^16 | ~1.9MB | ~2100 | 0.3245 (−16%) | 0.1685 (−17%) |
-| 64KB, 2^16, orders 0,1,2,4, no word | ~1.4MB | ~2900 | 0.3441 (−11%) | 0.1798 (−12%) |
-| 64KB, 2^18 | ~5.6MB | ~700 | 0.3111 (−19%) | 0.1618 (−21%) |
-| 64KB, 2^20 | ~21MB | ~190 | 0.3057 (−21%) | 0.1593 (−22%) |
-| 1MB, 2^18 | ~9.4MB | ~430 | 0.2773 (−23%) | 0.1404 (−22%) |
-| 1MB, 2^22 | ~85MB | ~48 | 0.2593 (−28%) | 0.1318 (−27%) |
+| 64KB, 2^16 | ~1.9MB | ~2100 | 0.3251 (−15%) | 0.1688 (−17%) |
+| 64KB, 2^16, orders 0,1,2,4, no word | ~1.4MB | ~2900 | 0.3452 (−10%) | 0.1802 (−12%) |
+| 64KB, 2^18 | ~5.6MB | ~700 | 0.3114 (−19%) | 0.1619 (−21%) |
+| 64KB, 2^20 | ~21MB | ~190 | 0.3059 (−20%) | 0.1594 (−22%) |
+| 1MB, 2^18 | ~9.4MB | ~430 | 0.2776 (−23%) | 0.1405 (−22%) |
+| 1MB, 2^22 | ~85MB | ~48 | 0.2594 (−28%) | 0.1318 (−27%) |
 
 The 64KB, 2^16 configuration fits the ~1000-chunks-in-flight target that
 gpusqz's throughput depends on, and keeps most of the gain over gpusqz.
@@ -177,10 +181,10 @@ domain" trains on the other corpus.
 | run | no prior | with prior |
 |---|---|---|
 | enwik8 2nd half, 64KB, 2^20, 1 stream | 0.2999 | 0.2472 (−18%) |
-| enwik8 2nd half, 1MB, 2^22, 1 stream | 0.2516 | 0.2298 (−9%) |
-| enwik8 2nd half, 64KB, 2^16, 32 lanes | 0.3243 | 0.3051 (−6%) |
-| enwik8, 64KB, prior from headers | 0.3001 | 0.3188 (+6%) |
-| headers, 64KB, prior from enwik8 | 0.1513 | 0.1620 (+7%) |
+| enwik8 2nd half, 1MB, 2^22, 1 stream | 0.2516 | 0.2299 (−9%) |
+| enwik8 2nd half, 64KB, 2^16, 32 lanes | 0.3248 | 0.3057 (−6%) |
+| enwik8, 64KB, prior from headers | 0.3002 | 0.3191 (+6%) |
+| headers, 64KB, prior from enwik8 | 0.1513 | 0.1622 (+7%) |
 
 A matched prior gives 64KB chunks most of what 1MB chunks get, which
 matters because small chunks are what keep the GPU busy. A mismatched one
@@ -224,9 +228,9 @@ None of this is measured. It is the reasoning for what to test next.
 ## Recommendation
 
 1. **Don't pursue better literal models on top of LZ.** What today's
-   decoder can use is worth under 0.7%. The rest needs a decoder
+   decoder can use is worth at most 0.6%. The rest needs a decoder
    restructure for 1–4%.
-2. **The prize is a context-mixing profile.** Expect 16–28% smaller than
+2. **The prize is a context-mixing profile.** Expect 15–28% smaller than
    today's profiles on text, reaching roughly `zstd -19` / `xz -9` ratios
    only with big chunks and models. It is worth building only if the GPU
    runs it well above the 1–3 MB/s those compress at. Its decode speed

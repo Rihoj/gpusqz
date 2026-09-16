@@ -177,7 +177,10 @@ int main(int argc, char** argv) {
   std::vector<uint8_t> data = read_file(path);
   if (chunk == 0) chunk = data.size();
   if (to > data.size()) to = data.size();
-  int hbits = 22;
+  // The match index gets one 4-byte slot per chunk byte (rounded down to a
+  // power of two), as a GPU version would size it; capped for no-reset runs.
+  int hbits = 16;
+  while (hbits < 24 && ((uint64_t)1 << (hbits + 1)) <= chunk) ++hbits;
 
   auto t0 = std::chrono::steady_clock::now();
   cm::Model model(cfg);
