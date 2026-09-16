@@ -86,6 +86,11 @@ are the corpora the change was measured on (see the sections below).
 | 2026-09-14 | 35a5ca7 | v0.1.0 | First release | same code paths as above |
 | 2026-09-14 | 6dd18e4 | | enwik8 on an Apple M1 Max and the RTX 5060 Ti | see [enwik8](#enwik8) |
 | 2026-09-14 | d8f68b8 | v0.1.1 | Vulkan timestamp pool capped at 4096 | no speed change; MoltenVK kernel timings exact from here on |
+| 2026-09-14 | f5283bf | | Output written by two threads at known file offsets | 1GB: decompress wall 0.79–0.86s → 0.65–0.81s at `speed`; output identical |
+| 2026-09-14 | 0c5280a | | Recent match offsets tried at every parse position | 0.11–0.47% smaller at 2–7% of compress kernel throughput |
+| 2026-09-14 | ba9705f | | Positions sampled after 8 windows without a match | random data: compress kernel 3.0–6.7x faster; text unchanged |
+| 2026-09-15 | a7eeb42 | | Format 2: coded tables, 4-byte chunk directory, density-aware context choice | 0.004–1.6% smaller; no kernel change |
+| 2026-09-15 | a7eeb42 | | Re-measurement of everything on format 2 | the [current results](benchmarks.md) |
 
 ## The occupancy round (2026-09-13)
 
@@ -115,6 +120,40 @@ order of impact:
 The before/after measurements are the back-to-back rows in the two
 corpus tables below.
 
+## The survey round (2026-09-14 to 2026-09-15)
+
+Four changes measured against the [compression
+survey](compression-survey.md), in the order they landed:
+
+1. **Two writer threads** (f5283bf). Decompression was waiting on one
+   thread copying cache-cold staging memory into the page cache. Every
+   output stage's file offset is known when it is queued, so two threads
+   now write them in any order. `speed` decompression of the 1GB corpus
+   went from 0.79–0.86s to 0.65–0.81s; the `ratio` profile, whose output
+   all arrives after one batch, didn't move.
+2. **Recent match offsets tried at every position** (0c5280a). zstd's
+   parsers check their repeat offsets before the hash table and gpusqz
+   didn't: 0.11–0.47% smaller output for 2–7% of compress kernel
+   throughput. `speed` tries one offset, the other profiles two.
+3. **Sampling after long runs without a match** (ba9705f), as in LZ4 and
+   zstd. Incompressible input was the slowest case; it is now 3.0x
+   (`speed`) to 6.7x (`ratio`) faster on the compress kernel, and
+   already-compressed files 13–60% faster, with text output unchanged.
+4. **Format 2** (a7eeb42): the rANS tables coded with an adaptive binary
+   range coder (~10x smaller), the chunk directory cut from 16 bytes to
+   4, and the literal-context chooser charging what the coded tables
+   actually cost. 0.004% to 1.6% smaller output, most of it on small
+   files and at `speed`, where the tables and directory weigh most.
+
+Together, on the 1GB corpus: 0.5% smaller at `speed`, 0.6% at `balance`
+and 0.5% at `ratio`, which puts the `ratio` profile just past `zstd -3`
+(0.2243 against 0.2245). Compression costs 4–6% of both kernel and wall
+throughput, all of it the offset probes. The decompress kernel is within
+3% at `speed` and `balance`; `ratio`'s reads much higher than the
+ec7aae3 row (3087 against 1906 MB/s), but that is the batch layout the
+free VRAM allowed on the day, not a change here — the A/B pairs at a
+fixed budget moved decompression by under 1%.
+
 ## 283MB repetitive corpus
 
 One 5.4MB block of `/usr/include` headers repeated 48 times (the recipe
@@ -135,6 +174,7 @@ Default profile (`speed`, 64KB chunks), MB/s:
 | 2026-09-13 | d5073da | idle, best of 3, back to back with the next row | 614 | 2474 | 707 | 3054 | 0.2775 | 0.2724 |
 | 2026-09-13 | ec7aae3 (7012791, 61f4a78, 8c9ddcc) | idle, best of 3, back to back with the previous row | 647 | 2382 | 769 | 3804 | 0.2673 | 0.2724 |
 | 2026-09-13 | ec7aae3 | idle, best of 3–5 (the [current results](benchmarks.md)) | 664 | 2390 | 718 | 3805 | 0.2673 | 0.2724 |
+| 2026-09-15 | a7eeb42 | idle (0.5GB used, 2–6%), best of 3–5 (the [current results](benchmarks.md)) | 643 | 2319 | 778 | 3700 | 0.2657 | 0.2724 |
 
 `balance` (256KB) and `ratio` (1MB), kernel MB/s:
 
@@ -148,6 +188,7 @@ Default profile (`speed`, 64KB chunks), MB/s:
 | d5073da (back to back with the next row) | 809 | 837 | 0.2687 | 216 | 206 | 0.2500 |
 | ec7aae3 (back to back with the previous row) | 1737 | 3416 | 0.2547 | 1233 | 1515 | 0.2423 |
 | ec7aae3 (current results) | 1746 | 3414 | 0.2547 | 1232 | 1515 | 0.2423 |
+| a7eeb42 (current results) | 1699 | 3410 | 0.2535 | 1142 | 1492 | 0.2411 |
 
 Wall MB/s for the back-to-back pair: `balance` compress 409 → 579 and
 decompress 679 → 746, `ratio` compress 171 → 499 and decompress 425 →
@@ -187,6 +228,9 @@ Full measurements, MB/s:
 | 2026-09-13 | ec7aae3 | idle, best of 3–5 (the [current results](benchmarks.md)) | `speed` | 1297 | 2983 | 1130 | 4567 | 0.2526 |
 | | | | `balance` | 989 | 1847 | 1267 | 3353 | 0.2387 |
 | | | | `ratio` | 873 | 1552 | 1176 | 1906 | 0.2255 |
+| 2026-09-15 | a7eeb42 | idle (0.5GB used, 2–6%), best of 3–5 (the [current results](benchmarks.md)) | `speed` | 1217 | 2801 | 1234 | 4440 | 0.2512 |
+| | | | `balance` | 946 | 1744 | 1120 | 3283 | 0.2373 |
+| | | | `ratio` | 837 | 1484 | 1058 | 3087 | 0.2243 |
 
 The two ec7aae3 runs differ in decompress wall by up to 30%: decompression
 on this machine is bound by `fwrite` into the WSL2 page cache, which
@@ -262,6 +306,61 @@ driver, a Windows build run from WSL2), 283MB corpus, kernel MB/s,
 Removing `coherent` from the scratch buffers improved Vulkan
 decompression by about 25%, and dropping a redundant memory barrier helped
 too. The rest of the gap is not understood yet.
+
+## Survey follow-up measurements (2026-09-14)
+
+Measured at 92901a5 while checking the [compression
+survey](compression-survey.md) against gpusqz, to rank what to try next.
+An `ollama` model held 10–12.5GB of VRAM at 14–15% utilisation the whole
+time, so the I/O and output-size figures below are sound but the kernel
+MB/s are not A/B quality.
+
+**Decompression waits on the output file.** 1GB corpus, `speed`:
+
+| output | wall | writer thread busy | stalled waiting for an output stage |
+|---|---|---|---|
+| `/dev/null` | 0.33–0.39s | 0.00s | 0.09–0.10s |
+| a file (WSL2 ext4) | 0.70–0.94s | 0.51–0.75s | 0.44–0.67s |
+
+A standalone `pwrite` test (1000MB in 8MB blocks from a 128MB source
+buffer, so the source is out of cache as it is in gpusqz) wrote 1.7–1.9
+GB/s from one thread and 2.8–2.9 GB/s from two; four were no faster.
+Output offsets are known in advance (chunk *c* goes to *c* × chunk
+size), so two writer threads could `pwrite` in parallel. Reading the
+same way scaled from 4–7.6 GB/s (one thread, page cache warm) to 11 GB/s
+(two).
+
+**Incompressible input is the slowest case.** 1GB of `/dev/urandom`
+against the 1GB corpus (every random chunk ends up stored raw):
+
+| profile | random, compress kbusy | text, compress kbusy |
+|---|---|---|
+| `speed` | 2107 | 2895 |
+| `ratio` | 609 | 1507 |
+
+With no matches the parse probes all four candidates at every position
+and advances only 32 bytes per step.
+
+**Compression at `speed` is GPU-bound once the input is cached.** Three
+warm runs on the 1GB corpus (`ollama` idle, 1% utilisation): 0.54–0.57s
+steady against 0.35s of kernel time, with the main thread's reads
+(0.16–0.20s) overlapping the kernels. Earlier runs at 0.9–1.0s steady
+were reading a cold page cache (`fread` 0.77s).
+
+**Match-finder variants.** Output size with `--gpu-mem 2G` (a fixed batch
+split, so every build saw the same batches), change against 92901a5.
+Every output decoded correctly with `gpusqz_refdec`:
+
+| variant | 1GB `speed` / `balance` / `ratio` | 283MB | enwik8 | compress kbusy |
+|---|---|---|---|---|
+| Also probe the last match offset (ties go to it) | −0.31 / −0.33 / −0.30% | −0.23 / −0.24 / −0.25% | −0.11 / −0.11 / −0.09% | 0–4% slower |
+| … and the second-last offset | −0.40 / −0.42 / −0.39% | −0.29 / −0.32 / −0.33% | −0.14 / −0.13 / −0.12% | 2–7% slower |
+| Hash the last 32 positions of matches longer than a window | −0.11 / −0.13 / −0.14% | −0.10 / −0.11 / −0.12% | −0.02 / −0.02 / −0.03% | 1–13% slower |
+
+**Where the rest of the output goes.** The rANS tables take 0.16–0.20% of
+the 1GB corpus's output (0.34% of enwik8's), and zstd shrinks them
+4–27x, mostly by exploiting how alike the groups' tables are. The chunk directory, 16 bytes per chunk, takes 0.10% at
+`speed`.
 
 ## Sizing the match-finder table
 
@@ -339,6 +438,8 @@ Tried, measured, and not kept. Check here before re-running one.
 | Three buffer sets instead of two | 7012791 | within noise at `speed`, slower at `ratio` |
 | 14- and 15-bit rANS probabilities (instead of 12) | 8c9ddcc | under 0.05% smaller: the 8-bit quantised counts are the limit |
 | 64 frequency-ranked literal contexts | 8c9ddcc | about the same as 256, but needs a stored class map |
+| Encoder tables from exact counts instead of 8-bit quantised ones | 92901a5 | 0.06–0.23% smaller before paying for bigger stored tables; 0.07–0.33% with 14-bit probabilities as well. The 8-bit counts did cap the 14-bit test above, but lifting them isn't worth much either |
+| Hashing the positions a long match skipped | 92901a5 | 0.02–0.14% smaller for up to 13% of compress kernel throughput |
 | Token-only coding (`--mode lz`) | c9f4ebe | 0.370 vs 0.272 at the same compress speed, decompress kernel 5498 vs 3759 MB/s; rANS won on ratio, so the mode was removed |
 
 ## Adding an entry

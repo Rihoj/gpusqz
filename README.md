@@ -22,15 +22,15 @@ ratio is output/input, so **lower is better**.
 
 | codec | compress MB/s | decompress MB/s | ratio |
 |---|---|---|---|
-| **gpusqz** (default, `speed`, 64KB chunks) | **1297** | 1130 | 0.2526 |
-| gpusqz `--profile balance` (256KB) | 989 | 1267 | 0.2387 |
-| gpusqz `--profile ratio` (1MB) | 873 | 1176 | 0.2255 |
-| gzip -1 | 145 | 250 | 0.2836 |
-| zstd -1 (1 thread) | 516 | **1434** | 0.2518 |
-| zstd -3 (1 thread) | 401 | 1335 | **0.2245** |
+| **gpusqz** (default, `speed`, 64KB chunks) | **1217** | 1234 | 0.2512 |
+| gpusqz `--profile balance` (256KB) | 946 | 1120 | 0.2373 |
+| gpusqz `--profile ratio` (1MB) | 837 | 1058 | **0.2243** |
+| gzip -1 | 147 | 251 | 0.2836 |
+| zstd -1 (1 thread) | 509 | **1384** | 0.2518 |
+| zstd -3 (1 thread) | 400 | 1293 | 0.2245 |
 
 These are whole-process wall-clock figures, including ~0.2s of CUDA
-startup. The GPU kernels alone run 1.6–4x faster. More corpora, an Apple
+startup. The GPU kernels alone run 1.8–3.6x faster. More corpora, an Apple
 M1 Max, and how to reproduce the numbers are in
 [docs/benchmarks.md](docs/benchmarks.md). How the numbers got here is in
 [docs/performance-history.md](docs/performance-history.md).

@@ -14,6 +14,7 @@
 #include "file_io.h"
 #include "format.h"
 #include "rans_codes.h"
+#include "table_codec.h"
 
 using namespace gpusqz;
 
@@ -295,28 +296,44 @@ int main(int argc, char** argv) {
   if (h.version != kVersion) fail("unsupported version");
   if (h.chunk_size == 0 || h.chunk_size > kMaxChunkSize) fail("bad chunk_size");
 
+  if (!file_seek(in, 0, SEEK_END)) fail("seek failed");
+  uint64_t file_bytes = file_tell(in);
+  if (!file_seek(in, sizeof(h))) fail("seek failed");
+
+  // Chunk sizes only: offsets and original sizes follow from them.
+  if ((uint64_t)h.chunk_count * 4 > file_bytes) fail("truncated chunk table");
+  std::vector<uint32_t> sizes(h.chunk_count);
+  if (h.chunk_count && std::fread(sizes.data(), 4, h.chunk_count, in) != h.chunk_count) fail("truncated chunk table");
   std::vector<ChunkEntry> entries(h.chunk_count);
-  if (h.chunk_count && std::fread(entries.data(), sizeof(ChunkEntry), h.chunk_count, in) != h.chunk_count) {
-    fail("truncated chunk table");
+  if (!chunk_entries(sizes.data(), h.chunk_count, h.chunk_size, h.original_size, entries.data())) {
+    fail("chunk table doesn't match the header");
   }
 
+  if ((uint64_t)h.table_group_count * sizeof(TableGroup) > file_bytes) fail("truncated table group directory");
   std::vector<TableGroup> groups(h.table_group_count);
   if (h.table_group_count &&
       std::fread(groups.data(), sizeof(TableGroup), h.table_group_count, in) != h.table_group_count) {
     fail("truncated table group directory");
   }
   uint64_t payload_start = file_tell(in);
-  // The table section: each group's quantised counts, in group order, at
-  // tables_offset (after the payload). Each group has its own
-  // literal-context rule and so its own size.
+  // The table section: each group's coded quantised counts (table_codec.h),
+  // in group order, at tables_offset (after the payload) to the end of the
+  // file. Each group has its own literal-context rule and so its own size.
   std::vector<Tables> tables;
   tables.reserve(h.table_group_count);
   if (!file_seek(in, h.tables_offset)) fail("bad tables_offset");
+  uint64_t coded_total = 0;
   for (const TableGroup& g : groups) {
     if (!lit_shift_valid(g.lit_ctx_shift)) fail("bad lit_ctx_shift");
-    std::vector<uint8_t> q(group_quant_bytes(g));
-    if (std::fread(q.data(), 1, q.size(), in) != q.size()) fail("truncated table section");
+    std::vector<uint8_t> coded(g.table_bytes), q(group_quant_bytes(g));
+    if (std::fread(coded.data(), 1, coded.size(), in) != coded.size()) fail("truncated table section");
+    if (!decode_table_counts(coded.data(), coded.size(), q.data(), q.size())) fail("corrupt table section");
     tables.emplace_back(q.data(), lit_ctx_count(g.lit_ctx_shift));
+    coded_total += g.table_bytes;
+  }
+  uint64_t payload_bytes = entries.empty() ? 0 : entries.back().offset + entries.back().compressed_size;
+  if (h.tables_offset != payload_start + payload_bytes || h.tables_offset + coded_total != file_bytes) {
+    fail("payload and table section don't match the file");
   }
   // Every chunk's group, found independently of any GPU-side batching:
   // this is exactly the directory-coverage logic the file format promises,

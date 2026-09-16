@@ -24,6 +24,13 @@ constexpr int kHashBucketWays = 4;
 __host__ __device__ inline int hash_table_bits(uint32_t chunk_size) {
   return chunk_size <= kDefaultChunkSize ? 11 : chunk_size <= 4 * kDefaultChunkSize ? 12 : 15;
 }
+// How many recent match offsets the parse also tries at every position
+// (see lz_parse_warp; at most kMaxRepProbes). Against none, on the three
+// corpora: one gave 0.03-0.33% smaller output for 2-4% of compress kernel
+// throughput; a second, another 0.03-0.15% for another ~3%, which `speed`
+// doesn't take.
+constexpr int kMaxRepProbes = 2;
+__host__ __device__ inline int rep_probes(uint32_t chunk_size) { return chunk_size <= kDefaultChunkSize ? 1 : 2; }
 __host__ __device__ inline size_t hash_table_bytes(uint32_t chunk_size) {
   return ((size_t)1 << hash_table_bits(chunk_size)) * kHashBucketWays * sizeof(uint32_t);
 }

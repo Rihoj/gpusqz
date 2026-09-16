@@ -31,11 +31,11 @@
   ~0.2s on this WSL2 machine, over half of the wall time on the 283MB
   corpus. It amortises on larger inputs and is mostly outside gpusqz's
   control. A native Metal device (M1 Max) starts in well under 0.1s.
-- **Decompression is `fwrite`-bound under WSL2.** Writing 1GB measured
-  0.5–1.2s depending on page-cache state, while the decompress kernel
-  needs ~0.25s, so the writer thread is almost always the bottleneck.
-  gpusqz would need a faster filesystem path to go further, not a faster
-  kernel.
+- **Decompression is bound by writing the file under WSL2.** Decompressing
+  1GB to `/dev/null` takes ~0.35s, and to a file 0.6–0.8s, even with two
+  writer threads (more measured no faster), while the decompress kernel
+  needs ~0.25s. Going further needs a faster filesystem path, not a
+  faster kernel.
 - **`compute_repeat_codes`' encode-side pass is serial**, one lane per
   chunk. Disabling it costs only a few percent of compress-kernel
   throughput on text. Struct-like binary data with recurring strides
@@ -46,18 +46,20 @@
 
 ## Ratio
 
-- **Ratio vs zstd.** zstd's parser is more sophisticated than gpusqz's hash
-  match finder with a two-step lazy lookahead: `zstd -3`'s output is ~0.5%
-  smaller than gpusqz's `ratio` profile on the varied corpus. An optimal
-  parser, or a match finder with longer chains, would be the next ratio
-  lever. A third lazy step and a 64-byte probe cap were measured and did
-  nothing useful (see [Measured and
+- **Ratio vs zstd.** The `ratio` profile now edges `zstd -3` on both
+  benchmark corpora (0.1% and 0.6% smaller), but zstd's parser is still
+  the more sophisticated one, and `zstd -19` is far out of reach. An
+  optimal parser, a second longer-key hash table (zstd's dfast, which is
+  what levels 3–4 use), or a match finder with longer chains would be the
+  next ratio levers. A third lazy step and a 64-byte probe cap were
+  measured and did nothing useful (see [Measured and
   rejected](performance-history.md#measured-and-rejected)).
 - **Literal-context choice is per batch, estimated from the histogram.**
   It is exact about which chunks can't use rANS, but not about which
   chunks will lose to plain tokens later, so a batch can occasionally
   carry 16 or 256 tables that few of its chunks use. The cost is bounded
-  by the table bytes (4KB or 66KB per batch).
+  by the coded table bytes, which are about a tenth of the 4KB or 66KB
+  the raw counts would take (see [Design](design.md#container-format)).
 
 ## Format and robustness
 

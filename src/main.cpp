@@ -7,7 +7,7 @@
 // Host side, batches of chunks live only in device memory, in a ring of
 // kSets buffer sets with a stream each. File data moves through a small,
 // fixed pool of staging buffers: the main thread freads into an input stage
-// and uploads it asynchronously, and a writer thread drains the output
+// and uploads it asynchronously, and writer threads drain the output
 // stages the main thread fills with asynchronous downloads. So batch i+1's
 // read and upload overlap batch i's kernels, and batch i-1's download and
 // file write overlap both. The GPU work itself is behind backend.h.
@@ -30,6 +30,7 @@
 #include "backend.h"
 #include "file_io.h"
 #include "format.h"
+#include "table_codec.h"
 
 using namespace gpusqz;
 
@@ -155,7 +156,7 @@ struct Stats {
                  "  kernel %.3fs  (%.1f MB/s of input; sum of per-batch spans)\n"
                  "  kbusy  %.3fs  (%.1f MB/s of input; wall-clock time any kernel ran)\n"
                  "  d2h    %.3fs  (%.1f MB/s, %llu bytes)\n"
-                 "  fwrite %.3fs  (%.1f MB/s of output; writer thread)\n"
+                 "  fwrite %.3fs  (%.1f MB/s of output; summed over the writer threads)\n"
                  "  stall  %.3fs waiting for a free input stage, %.3fs for a free output stage\n",
                  mode, g_backend->name().c_str(), (unsigned long long)bytes_in, (unsigned long long)bytes_out,
                  wall_s, mbps(bytes_in, wall_s), batches, batch_chunks, sets, setup_s, wall_s - setup_s,
@@ -229,34 +230,34 @@ struct InRing {
   }
 };
 
-// Output stages plus the thread that drains them. The main thread queues an
-// async download into a free stage and hands (stage, length) over; the
-// writer waits for that copy, fwrites it, and frees the stage. Jobs are
-// written strictly in the order they were pushed. fwrite (~1.3GB/s on this
-// WSL2 setup) is the slowest stage of decompression, so moving it off the
-// main thread lets the next batch's read, upload and kernels overlap it.
+// Output stages plus the threads that drain them. The main thread queues an
+// async download into a free stage and hands (stage, length, file offset)
+// over; a writer waits for that copy, writes it, and frees the stage.
+// Writing the file is the slowest stage of decompression, so it runs off
+// the main thread, overlapping the next batch's read, upload and kernels.
+// Into a regular file, kWriterThreads threads write at the jobs' offsets
+// (file_write_at) in any order: copying out of cache-cold staging memory
+// is too slow for one thread (a standalone test wrote ~1.8GB/s with one,
+// ~2.9 with two, no more with four, under WSL2; 1GB decompressed at
+// `speed` ~18% faster end to end). Anything else (a pipe, /dev/null) gets
+// one thread writing in push order.
+constexpr int kWriterThreads = 2;
+
 class Writer {
  public:
-  ~Writer() {
-    if (th_.joinable()) {
-      {
-        std::lock_guard<std::mutex> lk(mu_);
-        done_ = true;
-        cv_.notify_all();
-      }
-      th_.join();
-    }
-  }
+  ~Writer() { stop(); }
 
   bool init(FILE* out, int count) {
     out_ = out;
     n_ = count;
+    positional_ = file_is_regular(out);
+    if (positional_) std::fflush(out); // file_write_at bypasses stdio's buffer
     st_.reset(new Stage[count]);
     busy_.assign(count, 0);
     for (int i = 0; i < n_; ++i) {
       if (!st_[i].init()) return false;
     }
-    th_ = std::thread([this] { run(); });
+    for (int t = 0; t < (positional_ ? kWriterThreads : 1); ++t) th_.emplace_back([this] { run(); });
     return true;
   }
 
@@ -273,24 +274,23 @@ class Writer {
     return st_[idx];
   }
 
-  // The caller has recorded st[idx].ev after its download. `err`, if not
-  // null, is a host flag downloaded before that copy on the same stream:
-  // nonzero means the batch was corrupt and must not be written.
-  void push(int idx, size_t len, const uint32_t* err) {
+  // The caller has recorded st[idx].ev after its download; the bytes belong
+  // at `offset` in the file. `err`, if not null, is a host flag downloaded
+  // before that copy on the same stream: nonzero means the batch was
+  // corrupt and must not be written. Jobs must be pushed in file order
+  // (the sequential mode relies on it).
+  void push(int idx, size_t len, uint64_t offset, const uint32_t* err) {
     std::lock_guard<std::mutex> lk(mu_);
-    q_.push_back(Job{idx, len, err});
+    q_.push_back(Job{idx, len, offset, err});
     cv_.notify_all();
   }
 
-  // Writes everything queued, stops the thread, and dies if any write failed.
+  // Writes everything queued, stops the threads, and dies if any write
+  // failed. Afterwards the FILE's position is unspecified: seek before
+  // writing to it again.
   void finish() {
-    if (!th_.joinable()) return;
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      done_ = true;
-      cv_.notify_all();
-    }
-    th_.join();
+    if (th_.empty()) return;
+    stop();
     g_stats.fwrite_s += fwrite_s_;
     if (!error_.empty()) die(error_);
   }
@@ -299,8 +299,19 @@ class Writer {
   struct Job {
     int idx;
     size_t len;
+    uint64_t offset;
     const uint32_t* err;
   };
+
+  void stop() {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      done_ = true;
+      cv_.notify_all();
+    }
+    for (std::thread& t : th_) t.join();
+    th_.clear();
+  }
 
   void run() {
     for (;;) {
@@ -313,17 +324,20 @@ class Writer {
         q_.pop_front();
       }
       std::string why, err;
+      double busy = 0;
       if (!g_backend->wait(*st_[j.idx].ev, &why)) {
         err = "wait for output stage: " + why;
       } else if (j.err && *(const volatile uint32_t*)j.err) {
         err = "corrupt input: malformed chunk data";
       } else {
         double t = now_s();
-        bool ok = std::fwrite(st_[j.idx].buf->p, 1, j.len, out_) == j.len;
-        fwrite_s_ += now_s() - t;
+        const void* p = st_[j.idx].buf->p;
+        bool ok = positional_ ? file_write_at(out_, p, j.len, j.offset) : std::fwrite(p, 1, j.len, out_) == j.len;
+        busy = now_s() - t;
         if (!ok) err = "write failed";
       }
       std::lock_guard<std::mutex> lk(mu_);
+      fwrite_s_ += busy;
       if (!err.empty() && error_.empty()) error_ = err;
       busy_[j.idx] = 0;
       cv_.notify_all();
@@ -337,6 +351,7 @@ class Writer {
   }
 
   FILE* out_ = nullptr;
+  bool positional_ = false;
   int n_ = 0, next_ = 0;
   std::unique_ptr<Stage[]> st_;
   std::vector<char> busy_;
@@ -345,20 +360,21 @@ class Writer {
   std::deque<Job> q_;
   bool done_ = false;
   std::string error_;
-  std::thread th_;
-  double fwrite_s_ = 0;
+  std::vector<std::thread> th_;
+  double fwrite_s_ = 0; // summed over the writer threads
 };
 
-// Downloads the set's output [0, bytes) through the writer's stages.
+// Downloads the set's output [0, bytes) through the writer's stages, to be
+// written at file offset `file_off` onwards.
 template <typename Set>
-void download(Writer& w, Set& set, uint64_t bytes, const uint32_t* err) {
+void download(Writer& w, Set& set, uint64_t bytes, uint64_t file_off, const uint32_t* err) {
   for (uint64_t off = 0; off < bytes; off += kStageBytes) {
     size_t len = (size_t)std::min<uint64_t>(kStageBytes, bytes - off);
     int idx;
     Stage& s = w.acquire(idx);
     set.download_output(off, *s.buf, len);
     g_backend->record(*s.ev, set.stream());
-    w.push(idx, len, err);
+    w.push(idx, len, file_off + off, err);
   }
   g_stats.d2h_bytes += bytes;
 }
@@ -467,7 +483,8 @@ struct Compressor {
   Plan plan;
   InRing in_ring;
   Writer writer;
-  uint64_t payload_offset = 0;
+  uint64_t payload_start = 0;  // file offset of the payload
+  uint64_t payload_offset = 0; // payload bytes queued so far
   uint32_t next_chunk = 0;
 
   void allocate() {
@@ -476,7 +493,7 @@ struct Compressor {
         plan, chunk_count, [&](uint32_t batch) { return g_backend->create_compress_set(batch, chunk_size); });
     sets.resize(made.size());
     for (size_t i = 0; i < made.size(); ++i) sets[i].set = std::move(made[i]);
-    if (!in_ring.init(kInStages) || !writer.init(out, kOutStages)) die("out of pinned host memory");
+    if (!in_ring.init(kInStages)) die("out of pinned host memory");
   }
 
   // Reads batch b's input into s and starts its upload.
@@ -513,6 +530,7 @@ struct Compressor {
   void enqueue_d2h(CompressSlot& s) {
     CompressSet& set = *s.set;
     set.wait_meta();
+    uint64_t batch_off = payload_start + payload_offset;
     const uint32_t* sizes = set.sizes();
     for (uint32_t c = 0; c < s.n; ++c) {
       uint64_t start = (uint64_t)(s.first + c) * chunk_size;
@@ -520,13 +538,13 @@ struct Compressor {
       entries[s.first + c] = ChunkEntry{payload_offset, sizes[c], len};
       payload_offset += sizes[c];
     }
-    TableGroup g{s.first, s.n, set.lit_shift()};
+    TableGroup g{s.first, s.n, set.lit_shift(), 0};
     if (!lit_shift_valid(g.lit_ctx_shift)) die("internal error: bad literal-context rule from the GPU");
     groups.push_back(g);
     tables.insert(tables.end(), set.quant(), set.quant() + group_quant_bytes(g));
 
     g_stats.mark(s.batch, kD2h0, set.stream());
-    download(writer, set, set.packed_bytes(), nullptr);
+    download(writer, set, set.packed_bytes(), batch_off, nullptr);
     g_stats.mark(s.batch, kD2h1, set.stream());
     s.d2h_pending = false;
   }
@@ -581,16 +599,18 @@ void compress(const std::string& in_path, const std::string& out_path, uint32_t 
 
   // table_group_count is unknown until Compressor::allocate() picks a
   // batch size, so the header is written with a placeholder and patched
-  // at the end, same as the ChunkEntry and TableGroup arrays below.
+  // at the end, same as the chunk sizes and the TableGroup array below.
   FileHeader header{kMagic, kVersion, chunk_size, total_size, chunk_count, 0, 0};
   std::fwrite(&header, sizeof(header), 1, out);
-  uint64_t entries_pos = file_tell(out);
+  uint64_t sizes_pos = file_tell(out);
+  std::vector<uint32_t> sizes(chunk_count);
+  std::fwrite(sizes.data(), sizeof(uint32_t), sizes.size(), out);
   std::vector<ChunkEntry> entries(chunk_count);
-  std::fwrite(entries.data(), sizeof(ChunkEntry), (size_t)chunk_count, out);
 
   std::vector<TableGroup> groups;
   std::vector<uint8_t> tables;
   uint64_t groups_pos = file_tell(out);
+  uint64_t payload_start = 0, payload_bytes = 0;
 
   if (chunk_count > 0) {
     Compressor cz;
@@ -605,35 +625,52 @@ void compress(const std::string& in_path, const std::string& out_path, uint32_t 
     double t = now_s();
     open_backend();
     cz.allocate();
-    g_stats.setup_s += now_s() - t;
-    g_stats.start_clock(cz.sets[0].set->stream());
 
     // Now that allocate() has fixed the batch size, reserve space for the
-    // group directory: one TableGroup per batch. The writer thread appends
-    // the payload after it.
+    // group directory: one TableGroup per batch. The payload follows it.
     header.table_group_count = (uint32_t)cz.plan.batches;
     groups.resize(header.table_group_count);
     std::fwrite(groups.data(), sizeof(TableGroup), groups.size(), out);
+    cz.payload_start = file_tell(out);
+    if (!cz.writer.init(out, kOutStages)) die("out of pinned host memory");
+    g_stats.setup_s += now_s() - t;
+    g_stats.start_clock(cz.sets[0].set->stream());
 
     cz.run();
 
+    payload_start = cz.payload_start;
+    payload_bytes = cz.payload_offset;
     entries.swap(cz.entries);
     groups.swap(cz.groups);
     tables.swap(cz.tables);
-    g_stats.bytes_in = total_size;
-    g_stats.bytes_out = cz.payload_offset + sizeof(FileHeader) + entries.size() * sizeof(ChunkEntry) +
-                        groups.size() * sizeof(TableGroup) + tables.size();
   }
 
-  // The table section follows the payload (the writer thread is done, so
-  // the stream position is the payload's end) and ends the file.
-  header.tables_offset = file_tell(out);
-  if (!tables.empty() && std::fwrite(tables.data(), 1, tables.size(), out) != tables.size()) die("write failed");
+  // Each group's quantised counts, coded compactly (table_codec.h).
+  std::vector<uint8_t> coded;
+  size_t q_off = 0;
+  for (TableGroup& g : groups) {
+    size_t n = group_quant_bytes(g);
+    std::vector<uint8_t> c = encode_table_counts(tables.data() + q_off, n);
+    q_off += n;
+    g.table_bytes = (uint32_t)c.size();
+    coded.insert(coded.end(), c.begin(), c.end());
+  }
+  for (uint32_t c = 0; c < chunk_count; ++c) sizes[c] = entries[c].compressed_size;
+
+  // The table section follows the payload and ends the file. (The writer
+  // threads left the stream position unspecified, hence the seek.)
+  header.tables_offset = chunk_count > 0 ? payload_start + payload_bytes : file_tell(out);
+  if (file_tell(out) != header.tables_offset && !file_seek(out, header.tables_offset)) {
+    die("output must be a seekable file");
+  }
+  if (!coded.empty() && std::fwrite(coded.data(), 1, coded.size(), out) != coded.size()) die("write failed");
+  g_stats.bytes_in = total_size;
+  g_stats.bytes_out = header.tables_offset + coded.size();
 
   file_seek(out, 0);
   std::fwrite(&header, sizeof(header), 1, out);
-  file_seek(out, entries_pos);
-  std::fwrite(entries.data(), sizeof(ChunkEntry), entries.size(), out);
+  file_seek(out, sizes_pos);
+  std::fwrite(sizes.data(), sizeof(uint32_t), sizes.size(), out);
   file_seek(out, groups_pos);
   std::fwrite(groups.data(), sizeof(TableGroup), groups.size(), out);
   std::fclose(in);
@@ -701,15 +738,13 @@ struct Decompressor {
     s.batch = b;
     DecompressSet::Inputs h = s.set->begin(n);
 
-    // The writer lays chunks out back to back in file order, so a batch's
+    // Chunks lie back to back in file order (chunk_entries), so a batch's
     // payload is one contiguous range we can read in one pass.
     uint64_t base = entries[s.first].offset;
     uint64_t expect = base;
     for (uint32_t c = 0; c < n; ++c) {
       const ChunkEntry& e = entries[s.first + c];
       if (e.compressed_size > slot_stride) die("corrupt chunk table: compressed_size too large");
-      if (e.original_size > header.chunk_size) die("corrupt chunk table: original_size too large");
-      if (e.offset != expect) die("corrupt chunk table: payload not contiguous");
       expect += e.compressed_size;
       h.in_offsets[c] = (uint32_t)(e.offset - base);
       h.in_lens[c] = e.compressed_size;
@@ -739,7 +774,8 @@ struct Decompressor {
   void enqueue_d2h(DecompressSlot& s) {
     uint64_t out_bytes = (uint64_t)(s.n - 1) * header.chunk_size + s.last_len;
     g_stats.mark(s.batch, kD2h0, s.set->stream());
-    download(writer, *s.set, out_bytes, reinterpret_cast<const uint32_t*>(h_err->p) + s.batch);
+    download(writer, *s.set, out_bytes, (uint64_t)s.first * header.chunk_size,
+             reinterpret_cast<const uint32_t*>(h_err->p) + s.batch);
     g_stats.mark(s.batch, kD2h1, s.set->stream());
     s.d2h_pending = false;
   }
@@ -776,12 +812,19 @@ void decompress(const std::string& in_path, const std::string& out_path) {
   if (header.version != kVersion) die("unsupported version");
   if (header.chunk_size == 0 || header.chunk_size > kMaxChunkSize) die("corrupt header: bad chunk_size");
 
-  std::vector<ChunkEntry> entries(header.chunk_count);
-  if (header.chunk_count > 0 &&
-      std::fread(entries.data(), sizeof(ChunkEntry), header.chunk_count, in) != header.chunk_count) {
+  // Each chunk has a 4-byte size in the file, so a count the file can't
+  // hold is corrupt (and must not size an allocation).
+  if ((uint64_t)header.chunk_count * sizeof(uint32_t) > file_size(in)) die("truncated chunk table");
+  std::vector<uint32_t> sizes(header.chunk_count);
+  if (header.chunk_count > 0 && std::fread(sizes.data(), sizeof(uint32_t), sizes.size(), in) != sizes.size()) {
     die("truncated chunk table");
   }
+  std::vector<ChunkEntry> entries(header.chunk_count);
+  if (!chunk_entries(sizes.data(), header.chunk_count, header.chunk_size, header.original_size, entries.data())) {
+    die("corrupt chunk table: sizes don't match the header");
+  }
 
+  if ((uint64_t)header.table_group_count * sizeof(TableGroup) > file_size(in)) die("truncated table group directory");
   std::vector<TableGroup> groups(header.table_group_count);
   if (header.table_group_count > 0 &&
       std::fread(groups.data(), sizeof(TableGroup), header.table_group_count, in) != header.table_group_count) {
@@ -808,16 +851,28 @@ void decompress(const std::string& in_path, const std::string& out_path) {
   // Checking that the chunk table covers exactly that range keeps any batch
   // read inside the payload.
   uint64_t payload_bytes = entries.empty() ? 0 : entries.back().offset + entries.back().compressed_size;
-  uint64_t tables_bytes = 0;
-  for (const TableGroup& g : groups) tables_bytes += group_quant_bytes(g);
+  uint64_t coded_bytes = 0, tables_bytes = 0;
+  for (const TableGroup& g : groups) {
+    coded_bytes += g.table_bytes;
+    tables_bytes += group_quant_bytes(g);
+  }
   if (header.tables_offset != payload_start + payload_bytes ||
-      header.tables_offset + tables_bytes != file_size(in)) {
+      header.tables_offset + coded_bytes != file_size(in)) {
     die("corrupt header: payload and table section don't match the file");
   }
-  std::vector<uint8_t> tables(tables_bytes);
+  std::vector<uint8_t> coded(coded_bytes), tables(tables_bytes);
   if (!file_seek(in, header.tables_offset) ||
-      (tables_bytes && std::fread(tables.data(), 1, tables_bytes, in) != tables_bytes)) {
+      (coded_bytes && std::fread(coded.data(), 1, coded_bytes, in) != coded_bytes)) {
     die("truncated table section");
+  }
+  // Decoded into each group's quantised counts, back to back.
+  uint64_t c_off = 0, q_off = 0;
+  for (const TableGroup& g : groups) {
+    if (!decode_table_counts(coded.data() + c_off, g.table_bytes, tables.data() + q_off, group_quant_bytes(g))) {
+      die("corrupt table section");
+    }
+    c_off += g.table_bytes;
+    q_off += group_quant_bytes(g);
   }
 
   FILE* out = std::fopen(out_path.c_str(), "wb");

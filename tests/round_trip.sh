@@ -67,6 +67,22 @@ make_case() {
       done
       head -c "$size" "$f.all" > "$f"
       rm -f "$f.all" ;;
+    # Random runs, each followed by a copy of its own tail: the parse is
+    # sampling positions by the time a copy starts, so this checks finding
+    # a match mid-stride and extending it back to where it really begins.
+    patchy)
+      local i=0 r c
+      : > "$f"
+      while [ "$(file_size "$f")" -lt "$size" ]; do
+        r=$((3000 + i * 977 % 4000))
+        c=$((200 + i * 331 % 1500))
+        head -c "$r" /dev/urandom > "$f.run"
+        cat "$f.run" >> "$f"
+        tail -c "$c" "$f.run" >> "$f"
+        i=$((i + 1))
+      done
+      rm -f "$f.run"
+      head -c "$size" "$f" > "$f.cut" && mv "$f.cut" "$f" ;;
     empty) : > "$f" ;;
   esac
   echo "$f"
@@ -214,6 +230,7 @@ run_suite() {
   run_case "$chunk" "off_by_one_over" "$(make_case off_by_one_over $((chunk + 1)) text)"
   run_case "$chunk" "all_zeros_5mb" "$(make_case all_zeros_5mb $((5 * 1024 * 1024)) zero)"
   run_case "$chunk" "random_5mb" "$(make_case random_5mb $((5 * 1024 * 1024)) random)"
+  run_case "$chunk" "patchy_2mb" "$(make_case patchy_2mb $((2 * 1024 * 1024)) patchy)"
   run_case "$chunk" "mixed_text_5mb" "$(make_case mixed_text_5mb $((5 * 1024 * 1024)) text)"
   if [ -n "${EXTRA_FILE:-}" ] && [ -f "$EXTRA_FILE" ]; then
     cp "$EXTRA_FILE" "$TMP/real_file.in"
