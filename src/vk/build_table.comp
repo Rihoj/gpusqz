@@ -75,11 +75,15 @@ bool normalize_row(uint k) {
   return true;
 }
 
-// Bits to code the row in g_row with the table the encoder would build.
+// Bits to code the row in g_row with the table the encoder would build,
+// plus its table in the file (see kernels.cu's row_coded_bits).
+const float kTableBitsPerEntry = 6.0;
 float row_coded_bits() {
   quantize_row(kLitSyms);
   if (!normalize_row(kLitSyms)) return 0.0;
-  float b = 0.0;
+  uint nz = 0;
+  for (uint s = 0; s < kLitSyms; ++s) nz += g_q[s] != 0 ? 1u : 0u;
+  float b = kTableBitsPerEntry * float(nz);
   for (uint s = 0; s < kLitSyms; ++s) {
     if (g_row[s] != 0) b += float(g_row[s]) * (float(kProbBits) - log2(float(g_f[s])));
   }
@@ -134,7 +138,7 @@ void main() {
       uint best = 0;
       float best_cost = 0.0;
       for (uint k = 0; k < 3; ++k) {
-        float c = 8.0 * float(kLitSyms * lit_ctx_count(shifts[k]));
+        float c = 0.0;
         for (uint i = 0; i < kThreads; ++i) c += part[k][i];
         if (k == 0 || c < best_cost) {
           best = k;

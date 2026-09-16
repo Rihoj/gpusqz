@@ -1,10 +1,15 @@
 // gpusqz container format: self-describing, chunk-based, raw fallback per chunk.
 //
 //   FileHeader
-//   ChunkEntry[chunk_count]
+//   u32 compressed_size[chunk_count]  each chunk's payload bytes, flag included
 //   TableGroup[table_group_count]
 //   payload: each chunk's [ChunkFlag][data], back to back in chunk order
-//   tables:  each group's quantised counts, in group order, ending the file
+//   tables:  each group's quantised counts, coded by table_codec.h,
+//            TableGroup::table_bytes each, in group order, ending the file
+//
+// A chunk's payload offset is the sum of the sizes before it, and every
+// chunk holds chunk_size bytes of the original except the last, which
+// holds the rest of original_size.
 #pragma once
 #include <cstddef>
 #include <cstdint>
@@ -14,7 +19,7 @@
 namespace gpusqz {
 
 constexpr uint32_t kMagic = 0x5A515347; // "GSQZ" in file byte order
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;
 
 // One warp compresses one chunk. Larger chunks give the match finder more
 // history, so they compress better but are coarser units of parallelism.
@@ -54,11 +59,6 @@ struct FileHeader {
   uint64_t tables_offset; // absolute offset of the table section, which ends the file
 };
 
-struct ChunkEntry {
-  uint64_t offset;          // of this chunk's data within the payload
-  uint32_t compressed_size; // including the flag byte
-  uint32_t original_size;   // only the file's last chunk may be short of chunk_size
-};
 
 // LzRans chunks share rANS tables with the rest of their compression batch,
 // a "table group". Groups cover [0, chunk_count) contiguously, in order.
@@ -68,9 +68,35 @@ struct TableGroup {
   uint32_t start_chunk;
   uint32_t chunk_count;
   uint32_t lit_ctx_shift; // 8, 4 or 0: 1, 16 or 256 literal contexts
+  uint32_t table_bytes;   // of this group's coded counts in the table section
 };
 #pragma pack(pop)
 
+// Bytes of a group's quantised counts once decoded (table_codec.h).
 inline size_t group_quant_bytes(const TableGroup& g) { return (size_t)quant_bytes(lit_ctx_count(g.lit_ctx_shift)); }
+
+// Where a chunk is, derived from the stored sizes (not itself stored).
+struct ChunkEntry {
+  uint64_t offset;          // of this chunk's data within the payload
+  uint32_t compressed_size; // including the flag byte
+  uint32_t original_size;   // only the file's last chunk may be short of chunk_size
+};
+
+// Rebuilds every chunk's entry from its stored compressed size. Returns
+// false if chunk_count doesn't match original_size and chunk_size, or a
+// size is 0 (every chunk has at least its flag byte).
+inline bool chunk_entries(const uint32_t* sizes, uint32_t chunk_count, uint32_t chunk_size, uint64_t original_size,
+                          ChunkEntry* out) {
+  if (chunk_size == 0 || chunk_count != (original_size + chunk_size - 1) / chunk_size) return false;
+  uint64_t off = 0;
+  for (uint32_t c = 0; c < chunk_count; ++c) {
+    if (sizes[c] == 0) return false;
+    uint64_t start = (uint64_t)c * chunk_size;
+    uint64_t left = original_size - start;
+    out[c] = ChunkEntry{off, sizes[c], (uint32_t)(left < chunk_size ? left : chunk_size)};
+    off += sizes[c];
+  }
+  return true;
+}
 
 } // namespace gpusqz

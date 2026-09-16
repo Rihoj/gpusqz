@@ -98,13 +98,18 @@ parse_hist_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, 
 // Bits to code a 256-symbol histogram row with the table the encoder would
 // actually build from it (8-bit quantised, normalised to kProbScale, every
 // present symbol at least 1/kProbScale), rather than the exact-probability
-// entropy, which ignores what quantisation costs thinly populated contexts.
+// entropy, which ignores what quantisation costs thinly populated contexts;
+// plus the row's table in the file, kTableBitsPerEntry per nonzero count
+// (table_codec.h codes zeros almost free and the rest at ~4-9 bits each).
+constexpr float kTableBitsPerEntry = 6.f;
 __device__ float row_coded_bits(const uint32_t* row) {
   uint8_t q[kLitSyms];
   uint16_t f[kLitSyms], c[kLitSyms];
   quantize_counts(row, kLitSyms, q);
   if (!normalize_table(q, kLitSyms, f, c)) return 0.f;
-  float b = 0.f;
+  int nz = 0;
+  for (int s = 0; s < kLitSyms; ++s) nz += q[s] != 0;
+  float b = kTableBitsPerEntry * (float)nz;
   for (int s = 0; s < kLitSyms; ++s) {
     if (row[s]) b += (float)row[s] * ((float)kProbBits - __log2f((float)f[s]));
   }
@@ -114,8 +119,8 @@ __device__ float row_coded_bits(const uint32_t* row) {
 // One block per batch. Picks the batch's literal-context rule from its full
 // order-1 histogram, folds the histogram to that rule, and builds the
 // tables (freq/cum for the encoder, q for the file). The rule minimises
-// estimated literal bits (row_coded_bits) plus 8 * 256 table bytes per
-// context, so literal-poor or incompressible batches keep a single table.
+// estimated literal bits plus coded table bits (row_coded_bits), so
+// literal-poor or incompressible batches keep a single table.
 // forced_shift >= 0 skips the choice (GPUSQZ_FORCE_LIT_SHIFT, tests). The
 // costs are summed in a fixed order, so the output is deterministic.
 constexpr int kTableThreads = 256;
@@ -149,7 +154,7 @@ build_table_kernel(uint32_t* cnt, int forced_shift, uint32_t* shift_out, uint8_t
       int best = 0;
       float best_cost = 0.f;
       for (int k = 0; k < 3; ++k) {
-        float c = 8.f * kLitSyms * lit_ctx_count(shifts[k]);
+        float c = 0.f;
         for (int i = 0; i < kTableThreads; ++i) c += part[k][i];
         if (k == 0 || c < best_cost) {
           best = k;

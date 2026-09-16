@@ -73,12 +73,13 @@ The first parses every chunk into scratch while atomically accumulating
 one full order-1 histogram for the batch. The second, one 256-thread
 block, folds that histogram to 16 and 1 contexts and keeps whichever rule
 minimises the estimated literal bits under the tables the encoder would
-actually build, plus 256 table bytes per context. On large text batches
-that is nearly always all 256 contexts (~66KB of tables per batch), while
-incompressible or literal-poor batches keep one table and pay nothing
-extra. The third encodes every chunk against that table. A chunk whose
-plain token stream is shorter than a rANS header can never end up
-rANS-coded, so it stays out of the histogram and skips the rANS attempt.
+actually build, plus what those tables cost in the file (6 bits per
+nonzero count, which is what the table coder averages). On large text
+batches that is nearly always all 256 contexts, while incompressible or
+literal-poor batches keep one table and pay nothing extra. The third
+encodes every chunk against that table. A chunk whose plain token stream
+is shorter than a rANS header can never end up rANS-coded, so it stays
+out of the histogram and skips the rANS attempt.
 
 The GPU-specific part is the interleaving: 32 rANS states, one per lane,
 share **one** stream of 16-bit words. All lanes step in lockstep; the
@@ -147,24 +148,35 @@ batch no longer needs), so the download moves only compressed bytes.
 `src/format.h`:
 
 ```
-FileHeader    { magic="GSQZ", version=1, chunk_size, original_size, chunk_count,
-                table_group_count, tables_offset }
-ChunkEntry[]  { offset, compressed_size, original_size }     -- one per chunk
-TableGroup[]  { start_chunk, chunk_count, lit_ctx_shift }    -- one per compression batch
-payload       -- each chunk: [flag: Raw | Lz | LzRans] [data]
-tables        -- at tables_offset: each group's quantised counts, in group order
+FileHeader   { magic="GSQZ", version=2, chunk_size, original_size,
+               chunk_count, table_group_count, tables_offset }
+u32[]        -- one compressed size per chunk, flag byte included
+TableGroup[] { start_chunk, chunk_count, lit_ctx_shift, table_bytes }
+             -- one per compression batch
+payload      -- each chunk: [flag: Raw | Lz | LzRans] [data]
+tables       -- at tables_offset: each group's coded counts, in group order
 ```
+
+The directory stores only each chunk's compressed size: chunks lie back
+to back, so a chunk's offset is the sum of the sizes before it, and every
+chunk holds `chunk_size` original bytes except the last, which holds the
+rest of `original_size` (`chunk_entries()` rebuilds all of that, and
+rejects a count that doesn't match the header). At 64KB chunks that is
+4 bytes per chunk instead of 16, about 0.07% of a compressed 1GB file.
 
 `TableGroup` entries cover `[0, chunk_count)` contiguously and in order;
 chunk *c*'s rANS tables are those of the group whose range contains *c* —
 always exactly one host compression batch's worth of chunks, decided at
 compress time and independent of whatever batch size decompression later
 chooses. Each group's counts are 96 bytes for the three small alphabets
-plus 256 per literal context, so their size depends on the group's
-`lit_ctx_shift` (8, 4 or 0 for 1, 16 or 256 contexts). That is why they
-come after the payload rather than in the directory. The decoder checks
-that the payload runs exactly from the end of the directory to
-`tables_offset` and that the table section ends the file.
+plus 256 per literal context, depending on the group's `lit_ctx_shift`
+(8, 4 or 0 for 1, 16 or 256 contexts). That is why they come after the
+payload rather than in the directory. They are not stored raw: each
+group's counts are coded by an adaptive binary range coder on the host
+(`src/table_codec.h`, shared with the reference decoder), which shrinks
+them about 10x on text, and `table_bytes` says how many bytes that took.
+The decoder checks that the payload runs exactly from the end of the
+directory to `tables_offset` and that the coded tables end the file.
 
 The format has no backward compatibility while gpusqz is at 0.x: a change
 bumps `version` and older files stop decoding (see

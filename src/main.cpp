@@ -30,6 +30,7 @@
 #include "backend.h"
 #include "file_io.h"
 #include "format.h"
+#include "table_codec.h"
 
 using namespace gpusqz;
 
@@ -537,7 +538,7 @@ struct Compressor {
       entries[s.first + c] = ChunkEntry{payload_offset, sizes[c], len};
       payload_offset += sizes[c];
     }
-    TableGroup g{s.first, s.n, set.lit_shift()};
+    TableGroup g{s.first, s.n, set.lit_shift(), 0};
     if (!lit_shift_valid(g.lit_ctx_shift)) die("internal error: bad literal-context rule from the GPU");
     groups.push_back(g);
     tables.insert(tables.end(), set.quant(), set.quant() + group_quant_bytes(g));
@@ -598,12 +599,13 @@ void compress(const std::string& in_path, const std::string& out_path, uint32_t 
 
   // table_group_count is unknown until Compressor::allocate() picks a
   // batch size, so the header is written with a placeholder and patched
-  // at the end, same as the ChunkEntry and TableGroup arrays below.
+  // at the end, same as the chunk sizes and the TableGroup array below.
   FileHeader header{kMagic, kVersion, chunk_size, total_size, chunk_count, 0, 0};
   std::fwrite(&header, sizeof(header), 1, out);
-  uint64_t entries_pos = file_tell(out);
+  uint64_t sizes_pos = file_tell(out);
+  std::vector<uint32_t> sizes(chunk_count);
+  std::fwrite(sizes.data(), sizeof(uint32_t), sizes.size(), out);
   std::vector<ChunkEntry> entries(chunk_count);
-  std::fwrite(entries.data(), sizeof(ChunkEntry), (size_t)chunk_count, out);
 
   std::vector<TableGroup> groups;
   std::vector<uint8_t> tables;
@@ -641,10 +643,19 @@ void compress(const std::string& in_path, const std::string& out_path, uint32_t 
     entries.swap(cz.entries);
     groups.swap(cz.groups);
     tables.swap(cz.tables);
-    g_stats.bytes_in = total_size;
-    g_stats.bytes_out = cz.payload_offset + sizeof(FileHeader) + entries.size() * sizeof(ChunkEntry) +
-                        groups.size() * sizeof(TableGroup) + tables.size();
   }
+
+  // Each group's quantised counts, coded compactly (table_codec.h).
+  std::vector<uint8_t> coded;
+  size_t q_off = 0;
+  for (TableGroup& g : groups) {
+    size_t n = group_quant_bytes(g);
+    std::vector<uint8_t> c = encode_table_counts(tables.data() + q_off, n);
+    q_off += n;
+    g.table_bytes = (uint32_t)c.size();
+    coded.insert(coded.end(), c.begin(), c.end());
+  }
+  for (uint32_t c = 0; c < chunk_count; ++c) sizes[c] = entries[c].compressed_size;
 
   // The table section follows the payload and ends the file. (The writer
   // threads left the stream position unspecified, hence the seek.)
@@ -652,12 +663,14 @@ void compress(const std::string& in_path, const std::string& out_path, uint32_t 
   if (file_tell(out) != header.tables_offset && !file_seek(out, header.tables_offset)) {
     die("output must be a seekable file");
   }
-  if (!tables.empty() && std::fwrite(tables.data(), 1, tables.size(), out) != tables.size()) die("write failed");
+  if (!coded.empty() && std::fwrite(coded.data(), 1, coded.size(), out) != coded.size()) die("write failed");
+  g_stats.bytes_in = total_size;
+  g_stats.bytes_out = header.tables_offset + coded.size();
 
   file_seek(out, 0);
   std::fwrite(&header, sizeof(header), 1, out);
-  file_seek(out, entries_pos);
-  std::fwrite(entries.data(), sizeof(ChunkEntry), entries.size(), out);
+  file_seek(out, sizes_pos);
+  std::fwrite(sizes.data(), sizeof(uint32_t), sizes.size(), out);
   file_seek(out, groups_pos);
   std::fwrite(groups.data(), sizeof(TableGroup), groups.size(), out);
   std::fclose(in);
@@ -725,15 +738,13 @@ struct Decompressor {
     s.batch = b;
     DecompressSet::Inputs h = s.set->begin(n);
 
-    // The writer lays chunks out back to back in file order, so a batch's
+    // Chunks lie back to back in file order (chunk_entries), so a batch's
     // payload is one contiguous range we can read in one pass.
     uint64_t base = entries[s.first].offset;
     uint64_t expect = base;
     for (uint32_t c = 0; c < n; ++c) {
       const ChunkEntry& e = entries[s.first + c];
       if (e.compressed_size > slot_stride) die("corrupt chunk table: compressed_size too large");
-      if (e.original_size > header.chunk_size) die("corrupt chunk table: original_size too large");
-      if (e.offset != expect) die("corrupt chunk table: payload not contiguous");
       expect += e.compressed_size;
       h.in_offsets[c] = (uint32_t)(e.offset - base);
       h.in_lens[c] = e.compressed_size;
@@ -801,12 +812,19 @@ void decompress(const std::string& in_path, const std::string& out_path) {
   if (header.version != kVersion) die("unsupported version");
   if (header.chunk_size == 0 || header.chunk_size > kMaxChunkSize) die("corrupt header: bad chunk_size");
 
-  std::vector<ChunkEntry> entries(header.chunk_count);
-  if (header.chunk_count > 0 &&
-      std::fread(entries.data(), sizeof(ChunkEntry), header.chunk_count, in) != header.chunk_count) {
+  // Each chunk has a 4-byte size in the file, so a count the file can't
+  // hold is corrupt (and must not size an allocation).
+  if ((uint64_t)header.chunk_count * sizeof(uint32_t) > file_size(in)) die("truncated chunk table");
+  std::vector<uint32_t> sizes(header.chunk_count);
+  if (header.chunk_count > 0 && std::fread(sizes.data(), sizeof(uint32_t), sizes.size(), in) != sizes.size()) {
     die("truncated chunk table");
   }
+  std::vector<ChunkEntry> entries(header.chunk_count);
+  if (!chunk_entries(sizes.data(), header.chunk_count, header.chunk_size, header.original_size, entries.data())) {
+    die("corrupt chunk table: sizes don't match the header");
+  }
 
+  if ((uint64_t)header.table_group_count * sizeof(TableGroup) > file_size(in)) die("truncated table group directory");
   std::vector<TableGroup> groups(header.table_group_count);
   if (header.table_group_count > 0 &&
       std::fread(groups.data(), sizeof(TableGroup), header.table_group_count, in) != header.table_group_count) {
@@ -833,16 +851,28 @@ void decompress(const std::string& in_path, const std::string& out_path) {
   // Checking that the chunk table covers exactly that range keeps any batch
   // read inside the payload.
   uint64_t payload_bytes = entries.empty() ? 0 : entries.back().offset + entries.back().compressed_size;
-  uint64_t tables_bytes = 0;
-  for (const TableGroup& g : groups) tables_bytes += group_quant_bytes(g);
+  uint64_t coded_bytes = 0, tables_bytes = 0;
+  for (const TableGroup& g : groups) {
+    coded_bytes += g.table_bytes;
+    tables_bytes += group_quant_bytes(g);
+  }
   if (header.tables_offset != payload_start + payload_bytes ||
-      header.tables_offset + tables_bytes != file_size(in)) {
+      header.tables_offset + coded_bytes != file_size(in)) {
     die("corrupt header: payload and table section don't match the file");
   }
-  std::vector<uint8_t> tables(tables_bytes);
+  std::vector<uint8_t> coded(coded_bytes), tables(tables_bytes);
   if (!file_seek(in, header.tables_offset) ||
-      (tables_bytes && std::fread(tables.data(), 1, tables_bytes, in) != tables_bytes)) {
+      (coded_bytes && std::fread(coded.data(), 1, coded_bytes, in) != coded_bytes)) {
     die("truncated table section");
+  }
+  // Decoded into each group's quantised counts, back to back.
+  uint64_t c_off = 0, q_off = 0;
+  for (const TableGroup& g : groups) {
+    if (!decode_table_counts(coded.data() + c_off, g.table_bytes, tables.data() + q_off, group_quant_bytes(g))) {
+      die("corrupt table section");
+    }
+    c_off += g.table_bytes;
+    q_off += group_quant_bytes(g);
   }
 
   FILE* out = std::fopen(out_path.c_str(), "wb");

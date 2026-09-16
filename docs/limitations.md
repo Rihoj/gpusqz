@@ -57,7 +57,8 @@
   It is exact about which chunks can't use rANS, but not about which
   chunks will lose to plain tokens later, so a batch can occasionally
   carry 16 or 256 tables that few of its chunks use. The cost is bounded
-  by the table bytes (4KB or 66KB per batch).
+  by the coded table bytes, which are about a tenth of the 4KB or 66KB
+  the raw counts would take (see [Design](design.md#container-format)).
 
 ## Format and robustness
 
