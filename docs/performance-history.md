@@ -91,6 +91,7 @@ are the corpora the change was measured on (see the sections below).
 | 2026-09-14 | ba9705f | | Positions sampled after 8 windows without a match | random data: compress kernel 3.0–6.7x faster; text unchanged |
 | 2026-09-15 | a7eeb42 | | Format 2: coded tables, 4-byte chunk directory, density-aware context choice | 0.004–1.6% smaller; no kernel change |
 | 2026-09-15 | a7eeb42 | | Re-measurement of everything on format 2 | the [current results](benchmarks.md) |
+| 2026-09-17 | f5d1404 | | Decode tables expanded per batch, for just the groups it touches, instead of all up front | Table memory bounded by one batch's groups. Decode wall unchanged (best of 7 to `/dev/null`: 1GB binaries 0.397 → 0.398s, enwik8 0.217 → 0.217s, 283MB `ratio` 0.270 → 0.263s); the expansion moves from setup into the kernel span. A 1GB file with 1024 groups peaks 146MB lower (RTX 5060 Ti, CUDA, idle, no ollama) |
 
 ## The occupancy round (2026-09-13)
 
