@@ -67,7 +67,8 @@ All optional:
 | `GPUSQZ_BACKEND=auto\|cuda\|vulkan` | Same as `--backend`. |
 | `GPUSQZ_VERBOSE=1` | Per-stage timing on stderr: setup, fread, copies, kernel time (summed and wall-clock union), fwrite, staging stalls. |
 | `GPUSQZ_FORCE_BATCH=<n>` | Force chunks per batch (testing; see [Testing](testing.md)). |
-| `GPUSQZ_FORCE_LIT_SHIFT=<0\|4\|8>` | Force every batch's literal-context rule (testing and tuning). |
+| `GPUSQZ_FORCE_GROUP_CHUNKS=<n>` | Force chunks per table group (testing; see [Testing](testing.md)). |
+| `GPUSQZ_FORCE_LIT_SHIFT=<0\|4\|8>` | Force every group's literal-context rule (testing and tuning). |
 | `GPUSQZ_VK_DEVICE=<n>` | Use Vulkan device *n* from `gpusqz devices` (default: the first discrete GPU, then integrated, then others). |
 | `GPUSQZ_VK_LANES=shared` | Force shared-memory lanes (testing). |
 | `GPUSQZ_VULKAN_LIB=<path>` | Load this Vulkan library instead of the system loader (or bundled MoltenVK). |

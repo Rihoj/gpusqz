@@ -370,6 +370,7 @@ struct Pipeline {
 struct CompressPc {
   uint32_t chunk_size, chunk_count, slot_stride, hash_bits, max_seq;
   int32_t forced_shift;
+  uint32_t group_chunks;
 };
 struct DecompressPc {
   uint32_t chunk_size, chunk_count, max_seq;
@@ -429,9 +430,12 @@ class VkBackend : public Backend {
 
   size_t compress_bytes_per_chunk(uint32_t chunk_size) override {
     // in (+1 for the packed output), slot, sequences, repeat codes,
-    // literals, hash table, six u32 per-chunk values.
+    // literals, hash table, six u32 per-chunk values, plus each group's
+    // histogram and tables amortised over its chunks (kMaxQuantBytes of
+    // u32 counts, u32 freq/cum and u8 counts).
+    size_t per_group = (size_t)kMaxQuantBytes * (4 + 4 + 1);
     return 2 * (size_t)chunk_size + worst_case_size(chunk_size) + 9 * (size_t)max_sequences(chunk_size) +
-           hash_bytes_for(chunk_size) + 8 * sizeof(uint32_t);
+           hash_bytes_for(chunk_size) + 8 * sizeof(uint32_t) + per_group / group_chunks(chunk_size);
   }
   size_t decompress_bytes_per_chunk(uint32_t chunk_size) override {
     return 2 * (size_t)chunk_size + worst_case_size(chunk_size) + 8 * (size_t)max_sequences(chunk_size) +
@@ -992,6 +996,9 @@ class VkCompressSet : public CompressSet {
     chunk_size_ = chunk_size;
     slot_stride_ = worst_case_size(chunk_size);
     max_seq_ = max_sequences(chunk_size);
+    group_chunks_ = group_chunks(chunk_size);
+    max_groups_ = (batch + group_chunks_ - 1) / group_chunks_;
+    tab_ = (size_t)max_groups_ * kMaxQuantBytes;
     size_t b = batch;
     // `in` also receives the packed output (compact.comp), at most one flag
     // byte per chunk more than the input.
@@ -1002,16 +1009,16 @@ class VkCompressSet : public CompressSet {
               be_->alloc_buf(lits_, b * chunk_size, false) &&
               be_->alloc_buf(htab_, b * hash_bytes_for(chunk_size), false) &&
               be_->alloc_buf(n_seq_, b * 4, false) && be_->alloc_buf(n_lit_, b * 4, false) &&
-              be_->alloc_buf(cnt_, kMaxQuantBytes * 4, false) && be_->alloc_buf(fc_, kMaxQuantBytes * 4, false) &&
-              be_->alloc_buf(q_, kMaxQuantBytes, false) && be_->alloc_buf(shift_, 4, false);
+              be_->alloc_buf(cnt_, tab_ * 4, false) && be_->alloc_buf(fc_, tab_ * 4, false) &&
+              be_->alloc_buf(q_, tab_, false) && be_->alloc_buf(shift_, (size_t)max_groups_ * 4, false);
     if (!ok) return false;
     h_lens_ = be_->alloc_host(b * 4);
     // Results: sizes, offsets, shift, q.
     meta_sizes_ = 0;
     meta_offsets_ = b * 4;
     meta_shift_ = meta_offsets_ + (b + 1) * 4;
-    meta_q_ = meta_shift_ + 4;
-    h_meta_ = be_->alloc_host(meta_q_ + kMaxQuantBytes);
+    meta_q_ = meta_shift_ + (size_t)max_groups_ * 4;
+    h_meta_ = be_->alloc_host(meta_q_ + tab_);
     if (!h_lens_ || !h_meta_) return false;
     pool_ = be_->make_pool(kCompressBindings);
     set_ = be_->make_set(pool_, be_->compress_dsl);
@@ -1042,18 +1049,20 @@ class VkCompressSet : public CompressSet {
     VkStreamImpl& st = stream_;
     st.copy(static_cast<VkHostBuf&>(*h_lens_).buf, 0, in_lens_, 0, (VkDeviceSize)n_ * 4);
     st.zero(cnt_);
-    CompressPc pc{chunk_size_, n_, slot_stride_, (uint32_t)hash_bits_for(chunk_size_), max_seq_, forced_lit_shift};
+    groups_ = (n_ + group_chunks_ - 1) / group_chunks_;
+    CompressPc pc{chunk_size_,        n_,      slot_stride_, (uint32_t)hash_bits_for(chunk_size_), max_seq_,
+                  forced_lit_shift, group_chunks_};
     VkPipelineLayout pl = be_->compress_pl;
     st.dispatch(be_->parse_hist, pl, set_, &pc, sizeof(pc), n_);
-    st.dispatch(be_->build_table, pl, set_, &pc, sizeof(pc), 1);
+    st.dispatch(be_->build_table, pl, set_, &pc, sizeof(pc), groups_);
     st.dispatch(be_->rans_encode, pl, set_, &pc, sizeof(pc), n_);
     st.dispatch(be_->scan, pl, set_, &pc, sizeof(pc), 1);
     st.dispatch(be_->compact, pl, set_, &pc, sizeof(pc), n_);
     const Buf& h = static_cast<VkHostBuf&>(*h_meta_).buf;
     st.copy(sizes_, 0, h, meta_sizes_, (VkDeviceSize)n_ * 4);
     st.copy(offsets_, 0, h, meta_offsets_, (VkDeviceSize)(n_ + 1) * 4);
-    st.copy(shift_, 0, h, meta_shift_, 4);
-    st.copy(q_, 0, h, meta_q_, kMaxQuantBytes);
+    st.copy(shift_, 0, h, meta_shift_, (VkDeviceSize)groups_ * 4);
+    st.copy(q_, 0, h, meta_q_, (VkDeviceSize)groups_ * kMaxQuantBytes);
     be_->record(meta_, st);
   }
 
@@ -1063,8 +1072,11 @@ class VkCompressSet : public CompressSet {
   }
   const uint32_t* sizes() override { return reinterpret_cast<const uint32_t*>(h_meta_->p + meta_sizes_); }
   uint32_t packed_bytes() override { return reinterpret_cast<const uint32_t*>(h_meta_->p + meta_offsets_)[n_]; }
-  uint32_t lit_shift() override { return *reinterpret_cast<const uint32_t*>(h_meta_->p + meta_shift_); }
-  const uint8_t* quant() override { return h_meta_->p + meta_q_; }
+  uint32_t group_count() override { return groups_; }
+  uint32_t lit_shift(uint32_t g) override {
+    return reinterpret_cast<const uint32_t*>(h_meta_->p + meta_shift_)[g];
+  }
+  const uint8_t* quant(uint32_t g) override { return h_meta_->p + meta_q_ + (size_t)g * kMaxQuantBytes; }
 
   void download_output(uint64_t off, HostBuf& dst, size_t len) override {
     stream_.copy(in_, off, static_cast<VkHostBuf&>(dst).buf, 0, len);
@@ -1075,6 +1087,8 @@ class VkCompressSet : public CompressSet {
   VkStreamImpl stream_;
   VkEventImpl meta_;
   uint32_t chunk_size_ = 0, slot_stride_ = 0, max_seq_ = 0, n_ = 0;
+  uint32_t group_chunks_ = 0, max_groups_ = 0, groups_ = 0;
+  size_t tab_ = 0; // kMaxQuantBytes entries per group, in cnt_, fc_ and q_
   size_t meta_sizes_ = 0, meta_offsets_ = 0, meta_shift_ = 0, meta_q_ = 0;
   Buf in_, in_lens_, slots_, start_, sizes_, offsets_, seqs_, rep_, lits_, htab_, n_seq_, n_lit_, cnt_, fc_, q_,
       shift_;

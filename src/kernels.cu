@@ -56,7 +56,7 @@ __global__ void GPUSQZ_LAUNCH_BOUNDS
 parse_hist_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, const uint32_t* in_lens,
                   uint8_t* out, uint32_t out_slot_stride, uint32_t* out_start, uint32_t* out_sizes,
                   uint8_t* scratch, uint32_t* htab, uint32_t hash_bits, uint32_t* n_seq_arr, uint32_t* n_lit_arr,
-                  uint32_t* batch_cnt) {
+                  uint32_t* batch_cnt, uint32_t group_chunks) {
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   uint32_t c = blockIdx.x * kWarpsPerBlock + warp;
   if (c >= chunk_count) return;
@@ -92,7 +92,9 @@ parse_hist_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, 
   uint32_t token_bytes;
   if (!rans_eligible(seqs, em.n_seq, token_bytes)) return;
   compute_repeat_codes(seqs, em.n_seq, rep_code);
-  accumulate_hist(seqs, em.n_seq, rep_code, lits, em.n_lit, batch_cnt);
+  // Each TableGroup in the batch keeps its own histogram (see kGroupBytes).
+  accumulate_hist(seqs, em.n_seq, rep_code, lits, em.n_lit,
+                  batch_cnt + (size_t)(c / group_chunks) * kMaxQuantBytes);
 }
 
 // Bits to code a 256-symbol histogram row with the table the encoder would
@@ -116,17 +118,24 @@ __device__ float row_coded_bits(const uint32_t* row) {
   return b;
 }
 
-// One block per batch. Picks the batch's literal-context rule from its full
-// order-1 histogram, folds the histogram to that rule, and builds the
-// tables (freq/cum for the encoder, q for the file). The rule minimises
-// estimated literal bits plus coded table bits (row_coded_bits), so
-// literal-poor or incompressible batches keep a single table.
+// One block per TableGroup in the batch. Picks the group's
+// literal-context rule from its full order-1 histogram, folds the histogram
+// to that rule, and builds the tables (freq/cum for the encoder, q for the
+// file). The rule minimises estimated literal bits plus coded table bits
+// (row_coded_bits), so literal-poor or incompressible groups keep a single
+// table.
 // forced_shift >= 0 skips the choice (GPUSQZ_FORCE_LIT_SHIFT, tests). The
 // costs are summed in a fixed order, so the output is deterministic.
 constexpr int kTableThreads = 256;
 __global__ void __launch_bounds__(kTableThreads)
-build_table_kernel(uint32_t* cnt, int forced_shift, uint32_t* shift_out, uint8_t* q_out, uint16_t* freq,
-                   uint16_t* cum) {
+build_table_kernel(uint32_t* cnt_all, int forced_shift, uint32_t* shift_out_all, uint8_t* q_out_all,
+                   uint16_t* freq_all, uint16_t* cum_all) {
+  uint32_t g = blockIdx.x;
+  uint32_t* cnt = cnt_all + (size_t)g * kMaxQuantBytes;
+  uint32_t* shift_out = shift_out_all + g;
+  uint8_t* q_out = q_out_all + (size_t)g * kMaxQuantBytes;
+  uint16_t* freq = freq_all + (size_t)g * kMaxQuantBytes;
+  uint16_t* cum = cum_all + (size_t)g * kMaxQuantBytes;
   __shared__ uint32_t nib[16][kLitSyms]; // counts folded to 16 contexts (shift 4)
   __shared__ uint32_t col[kLitSyms];     // folded to 1 context (shift 8)
   __shared__ float part[3][kTableThreads];
@@ -187,7 +196,8 @@ __global__ void GPUSQZ_LAUNCH_BOUNDS
 rans_encode_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, const uint32_t* in_lens,
                    uint8_t* out, uint32_t out_slot_stride, uint32_t* out_start, uint32_t* out_sizes,
                    uint8_t* scratch, const uint32_t* n_seq_arr, const uint32_t* n_lit_arr,
-                   const uint32_t* lit_shift_p, const uint16_t* freq, const uint16_t* cum) {
+                   const uint32_t* lit_shift_all, const uint16_t* freq_all, const uint16_t* cum_all,
+                   uint32_t group_chunks) {
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   uint32_t c = blockIdx.x * kWarpsPerBlock + warp;
   if (c >= chunk_count) return;
@@ -202,14 +212,17 @@ rans_encode_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count,
   uint8_t* lits;
   chunk_scratch(scratch, c, chunk_size, seqs, rep_code, lits);
   uint32_t n_seq = n_seq_arr[c], n_lit = n_lit_arr[c];
-  uint32_t lit_shift = *lit_shift_p; // chosen by build_table_kernel for this batch
+  uint32_t g = c / group_chunks;         // its TableGroup within the batch
+  uint32_t lit_shift = lit_shift_all[g]; // chosen by build_table_kernel for that group
+  const uint16_t* freq = freq_all + (size_t)g * kMaxQuantBytes;
+  const uint16_t* cum = cum_all + (size_t)g * kMaxQuantBytes;
 
   uint32_t tok_total;
   bool eligible = rans_eligible(seqs, n_seq, tok_total);
 
   bool ok = false;
   uint32_t start = 0, size = 0;
-  // An ineligible chunk contributed nothing to the batch tables, so it
+  // An ineligible chunk contributed nothing to its group's tables, so it
   // must not use them either.
   if (eligible && in_len > (uint32_t)kRansHeaderBytes + 1) {
     ok = rans_encode_warp(seqs, n_seq, rep_code, lits, n_lit, lit_shift, freq, cum, slot, out_slot_stride, in_len,
@@ -309,22 +322,25 @@ __global__ void expand_group_tables_kernel(const uint8_t* q_all, const uint64_t*
 void launch_compress(const uint8_t* d_in, uint32_t chunk_size, uint32_t chunk_count,
                       const uint32_t* d_in_lens, uint8_t* d_out, uint32_t out_slot_stride,
                       uint32_t* d_out_start, uint32_t* d_out_sizes, uint8_t* d_scratch, uint32_t* d_htab,
-                      int forced_lit_shift, const RansBatchBufs& d_rans, cudaStream_t stream) {
+                      int forced_lit_shift, uint32_t group_chunks, const RansBatchBufs& d_rans,
+                      cudaStream_t stream) {
   uint32_t blocks = (chunk_count + kWarpsPerBlock - 1) / kWarpsPerBlock;
   uint32_t hash_bits = (uint32_t)hash_table_bits(chunk_size);
-  // Parse+histogram everything in the batch, build one shared set of
+  uint32_t groups = (chunk_count + group_chunks - 1) / group_chunks;
+  // Parse+histogram everything in the batch, build each TableGroup's
   // tables, then encode. Sequential on `stream`, so each stage sees the
   // previous one's complete output.
-  cudaMemsetAsync(d_rans.cnt, 0, (size_t)kMaxQuantBytes * sizeof(uint32_t), stream);
+  cudaMemsetAsync(d_rans.cnt, 0, (size_t)groups * kMaxQuantBytes * sizeof(uint32_t), stream);
   parse_hist_kernel<<<blocks, kBlockThreads, 0, stream>>>(d_in, chunk_size, chunk_count, d_in_lens, d_out,
                                                           out_slot_stride, d_out_start, d_out_sizes, d_scratch,
-                                                          d_htab, hash_bits, d_rans.n_seq, d_rans.n_lit, d_rans.cnt);
-  build_table_kernel<<<1, kTableThreads, 0, stream>>>(d_rans.cnt, forced_lit_shift, d_rans.lit_shift, d_rans.q,
-                                                      d_rans.freq, d_rans.cum);
+                                                          d_htab, hash_bits, d_rans.n_seq, d_rans.n_lit, d_rans.cnt,
+                                                          group_chunks);
+  build_table_kernel<<<groups, kTableThreads, 0, stream>>>(d_rans.cnt, forced_lit_shift, d_rans.lit_shift, d_rans.q,
+                                                           d_rans.freq, d_rans.cum);
   rans_encode_kernel<<<blocks, kBlockThreads, 0, stream>>>(d_in, chunk_size, chunk_count, d_in_lens, d_out,
                                                            out_slot_stride, d_out_start, d_out_sizes, d_scratch,
                                                            d_rans.n_seq, d_rans.n_lit, d_rans.lit_shift, d_rans.freq,
-                                                           d_rans.cum);
+                                                           d_rans.cum, group_chunks);
 }
 
 void launch_decompress(const uint8_t* d_in, const uint32_t* d_in_offsets, uint32_t chunk_count,

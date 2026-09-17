@@ -13,6 +13,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 
 #include "rans_codes.h"
 
@@ -36,6 +37,24 @@ constexpr uint32_t kProfileRatioChunkSize = kMaxChunkSize;
 // Shortest match the LZ stage emits; token and rANS match-length codes are
 // relative to it. (3 measured ~3% worse and slower on text.)
 constexpr int kMinMatch = 4;
+
+// A TableGroup covers this much input, so which chunks share tables — and
+// so the bytes gpusqz writes — depend only on the file, not on how much GPU
+// memory a batch happened to get. A group is small enough to fit any usable
+// GPU, and a compression batch holds whole groups (see plan_batches).
+constexpr uint64_t kGroupBytes = 64ull << 20;
+inline uint32_t group_chunks(uint32_t chunk_size) {
+  // Tests only: GPUSQZ_FORCE_GROUP_CHUNKS puts several groups in a batch
+  // without needing a kGroupBytes-sized input.
+  static const uint32_t forced = [] {
+    const char* e = std::getenv("GPUSQZ_FORCE_GROUP_CHUNKS");
+    unsigned long v = e ? std::strtoul(e, nullptr, 10) : 0;
+    return (uint32_t)v;
+  }();
+  if (forced) return forced;
+  uint64_t n = kGroupBytes / chunk_size;
+  return (uint32_t)(n < 1 ? 1 : n);
+}
 
 // Bytes reserved per chunk in the fixed-slot output layout: encoders give
 // up (and store the chunk raw) before writing past the input size, so a
