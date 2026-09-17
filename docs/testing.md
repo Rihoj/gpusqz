@@ -71,6 +71,12 @@ GitHub's runners have no GPU, so the `gpu` label (CUDA) is skipped there.
   2^20 is one past what the rANS length alphabet can code; such a chunk
   now falls back to plain tokens.
 
+Lavapipe reports a subgroup size but not a usable subgroup-lane path: at
+every `LP_NATIVE_VECTOR_WIDTH` it takes the shared-memory lane build. So
+the subgroup-lane build — what NVIDIA and Apple actually run — is not
+covered locally, and needs a real GPU (or the Windows cross-build in the
+`/vulkan-check` skill).
+
 ## CI
 
 The `build` workflow (`.github/workflows/build.yml`) builds and tests the
