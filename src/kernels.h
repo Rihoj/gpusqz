@@ -54,14 +54,15 @@ __host__ __device__ inline size_t scratch_bytes(uint32_t chunk_size) {
 }
 
 // Per-batch buffers for the LzRans pipeline. cnt, freq, cum and q hold
-// kMaxQuantBytes entries each (rans_codes.h): the batch histogram, the
-// encode tables, and the quantised counts stored in the file.
+// kMaxQuantBytes entries (rans_codes.h) per TableGroup in the batch: each
+// group's histogram, encode tables, and the quantised counts stored in the
+// file.
 struct RansBatchBufs {
   uint32_t* cnt;       // zeroed by launch_compress before parsing
   uint16_t* freq;
   uint16_t* cum;
   uint8_t* q;
-  uint32_t* lit_shift; // 1 entry: the literal-context rule this batch chose
+  uint32_t* lit_shift; // per group: the literal-context rule it chose
   uint32_t* n_seq;     // per chunk: sequences in its scratch
   uint32_t* n_lit;     // per chunk: literals in its scratch
 };
@@ -71,14 +72,16 @@ struct RansBatchBufs {
 // d_out + c*out_slot_stride, starting d_out_start[c] bytes in, d_out_sizes[c]
 // bytes long. d_scratch holds chunk_count * scratch_bytes() and d_htab
 // chunk_count * hash_table_bytes(). Runs three kernels on `stream`: parse +
-// histogram, build the batch's tables, encode. The batch picks its
-// literal-context rule and reports it in *d_rans.lit_shift, unless
-// forced_lit_shift >= 0. Each chunk keeps the smallest of rANS, plain LZ
-// tokens (ChunkFlag::Lz) and raw storage.
+// histogram, build each TableGroup's tables, encode. Chunks [g*group_chunks,
+// (g+1)*group_chunks) form group g, which picks its literal-context rule and
+// reports it in d_rans.lit_shift[g], unless forced_lit_shift >= 0. Each
+// chunk keeps the smallest of rANS, plain LZ tokens (ChunkFlag::Lz) and raw
+// storage.
 void launch_compress(const uint8_t* d_in, uint32_t chunk_size, uint32_t chunk_count,
                       const uint32_t* d_in_lens, uint8_t* d_out, uint32_t out_slot_stride,
                       uint32_t* d_out_start, uint32_t* d_out_sizes, uint8_t* d_scratch, uint32_t* d_htab,
-                      int forced_lit_shift, const RansBatchBufs& d_rans, cudaStream_t stream);
+                      int forced_lit_shift, uint32_t group_chunks, const RansBatchBufs& d_rans,
+                      cudaStream_t stream);
 
 // Decompresses a batch: chunk c's data is at d_in + d_in_offsets[c]
 // (d_in_lens[c] bytes); its output at d_out + c*chunk_size (d_out_lens[c]

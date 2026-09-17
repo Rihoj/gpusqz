@@ -67,17 +67,20 @@ chunk's literal stream rather than every 32nd literal, and the first
 literal of each run uses context 0. Runs are 4-byte aligned, so the
 decoder stores 4 literals at a time.
 
-**Tables are shared per batch** (a "table group", see [Container
-format](#container-format)): compression runs three kernels per batch.
-The first parses every chunk into scratch while atomically accumulating
-one full order-1 histogram for the batch. The second, one 256-thread
-block, folds that histogram to 16 and 1 contexts and keeps whichever rule
+**Tables are shared by the chunks covering 64MB of input** (a "table
+group", `kGroupBytes`, see [Container format](#container-format)):
+compression runs three kernels per batch, and a batch holds whole groups.
+The first parses every chunk into scratch while atomically accumulating a
+full order-1 histogram per group. The second, one 256-thread block per
+group, folds that histogram to 16 and 1 contexts and keeps whichever rule
 minimises the estimated literal bits under the tables the encoder would
 actually build, plus what those tables cost in the file (6 bits per
 nonzero count, which is what the table coder averages). On large text
-batches that is nearly always all 256 contexts, while incompressible or
-literal-poor batches keep one table and pay nothing extra. The third
-encodes every chunk against that table. A chunk whose plain token stream
+groups that is nearly always all 256 contexts, while incompressible or
+literal-poor groups keep one table and pay nothing extra. The third
+encodes every chunk against its group's tables. Groups are a function of
+the file alone, so two runs with different memory budgets — or the two
+backends — write the same bytes. A chunk whose plain token stream
 is shorter than a rANS header can never end up rANS-coded, so it stays
 out of the histogram and skips the rANS attempt.
 
@@ -155,7 +158,7 @@ FileHeader   { magic="GSQZ", version=2, chunk_size, original_size,
                chunk_count, table_group_count, tables_offset }
 u32[]        -- one compressed size per chunk, flag byte included
 TableGroup[] { start_chunk, chunk_count, lit_ctx_shift, table_bytes }
-             -- one per compression batch
+             -- one per kGroupBytes of input
 payload      -- each chunk: [flag: Raw | Lz | LzRans] [data]
 tables       -- at tables_offset: each group's coded counts, in group order
 ```
@@ -169,7 +172,7 @@ rejects a count that doesn't match the header). At 64KB chunks that is
 
 `TableGroup` entries cover `[0, chunk_count)` contiguously and in order;
 chunk *c*'s rANS tables are those of the group whose range contains *c* —
-always exactly one host compression batch's worth of chunks, decided at
+the chunks covering one `kGroupBytes` span of input, decided at
 compress time and independent of whatever batch size decompression later
 chooses. Each group's counts are 96 bytes for the three small alphabets
 plus 256 per literal context, depending on the group's `lit_ctx_shift`

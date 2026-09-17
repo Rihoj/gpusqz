@@ -70,10 +70,13 @@ class CompressSet {
   virtual void launch(int forced_lit_shift) = 0;
   // Waits for launch()'s results.
   virtual void wait_meta() = 0;
-  virtual const uint32_t* sizes() = 0;    // n compressed chunk sizes
-  virtual uint32_t packed_bytes() = 0;    // their sum: the packed output's size
-  virtual uint32_t lit_shift() = 0;       // the batch's literal-context rule
-  virtual const uint8_t* quant() = 0;     // its quantised counts (group_quant_bytes)
+  virtual const uint32_t* sizes() = 0;           // n compressed chunk sizes
+  virtual uint32_t packed_bytes() = 0;           // their sum: the packed output's size
+  // The batch's TableGroups, g of group_count(): chunks [g*group_chunks,
+  // (g+1)*group_chunks) of the batch (format.h's group_chunks()).
+  virtual uint32_t group_count() = 0;
+  virtual uint32_t lit_shift(uint32_t g) = 0;    // group g's literal-context rule
+  virtual const uint8_t* quant(uint32_t g) = 0;  // its quantised counts (group_quant_bytes)
   // Queues a copy of len bytes of the packed output, from byte off, to dst.
   virtual void download_output(uint64_t off, HostBuf& dst, size_t len) = 0;
 };

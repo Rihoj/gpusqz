@@ -55,10 +55,10 @@
   next ratio levers. A third lazy step and a 64-byte probe cap were
   measured and did nothing useful (see [Measured and
   rejected](performance-history.md#measured-and-rejected)).
-- **Literal-context choice is per batch, estimated from the histogram.**
-  It is exact about which chunks can't use rANS, but not about which
-  chunks will lose to plain tokens later, so a batch can occasionally
-  carry 16 or 256 tables that few of its chunks use. The cost is bounded
+- **Literal-context choice is per table group, estimated from the
+  histogram.** It is exact about which chunks can't use rANS, but not
+  about which chunks will lose to plain tokens later, so a group can
+  occasionally carry 16 or 256 tables that few of its chunks use. The cost is bounded
   by the coded table bytes, which are about a tenth of the 4KB or 66KB
   the raw counts would take (see [Design](design.md#container-format)).
 - **No format-aware transforms.** gpusqz codes every file as a plain byte

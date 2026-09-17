@@ -202,6 +202,29 @@ run_profile_cases() {
     printf "PASS %-28s bad --gpu-mem unit rejected\n" "gpu_mem"
   fi
   rm -f "$comp" "$dec"
+
+  # The same file whatever memory a run gets: TableGroups cover a fixed
+  # amount of input (format.h), so the batch size a budget allows must not
+  # change the bytes. Small groups here stand in for a kGroupBytes input.
+  local mem ref out ok=1
+  export GPUSQZ_FORCE_GROUP_CHUNKS=16
+  ref="$TMP/det_ref.gsz"
+  run_gpusqz c "$f" "$ref" 4096 2>>"$TMP/log" || ok=0
+  for mem in 16M 8M 4M; do
+    out="$TMP/det_$mem.gsz"
+    if ! run_gpusqz c "$f" "$out" 4096 --gpu-mem "$mem" 2>>"$TMP/log" || ! cmp -s "$ref" "$out"; then
+      ok=0
+    fi
+    rm -f "$out"
+  done
+  unset GPUSQZ_FORCE_GROUP_CHUNKS
+  if [ "$ok" -eq 1 ]; then
+    printf "PASS %-28s same output at any --gpu-mem\n" "gpu_mem_determinism"
+  else
+    printf "FAIL %-28s output changed with the memory budget\n" "gpu_mem_determinism"
+    fail=1
+  fi
+  rm -f "$ref"
 }
 
 # Exercises all three literal-context rules (GPUSQZ_FORCE_LIT_SHIFT, see

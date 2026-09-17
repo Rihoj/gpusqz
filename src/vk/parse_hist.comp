@@ -233,24 +233,24 @@ void compute_repeat_codes(uint n_seq) {
   lg_sync();
 }
 
-void accumulate_hist(uint n_seq, uint n_lit) {
+void accumulate_hist(uint n_seq, uint n_lit, uint gbase) {
   uint lane = lg_lane();
   uint run_len = lit_run_len(n_lit);
   uint run0 = lane * run_len, run_end = min(n_lit, run0 + run_len);
   uint prev = 0;
   for (uint i = run0; i < run_end; ++i) {
     uint sym = uint(lits[g_lit + i]);
-    atomicAdd(batch_cnt[lit_entry(lit_ctx(prev, kLitShiftByte), sym)], 1u);
+    atomicAdd(batch_cnt[gbase + lit_entry(lit_ctx(prev, kLitShiftByte), sym)], 1u);
     prev = sym;
   }
   for (uint i = lane; i < n_seq; i += 32) {
     uvec2 r = seqs[g_seq + i];
     uint c, nb, b;
     len_code(seq_ll(r), c, nb, b);
-    atomicAdd(batch_cnt[kLlBase + c], 1u);
+    atomicAdd(batch_cnt[gbase + kLlBase + c], 1u);
     uint ml = seq_ml(r);
     len_code(ml != 0 ? ml - (kMinMatch - 1) : 0, c, nb, b);
-    atomicAdd(batch_cnt[kMlBase + c], 1u);
+    atomicAdd(batch_cnt[gbase + kMlBase + c], 1u);
     if (ml != 0) {
       uint rc = uint(rep_code[g_seq + i]);
       if (rc != 0) {
@@ -258,7 +258,7 @@ void accumulate_hist(uint n_seq, uint n_lit) {
       } else {
         off_code(seq_off(r), c, nb, b);
       }
-      atomicAdd(batch_cnt[kOffBase + c], 1u);
+      atomicAdd(batch_cnt[gbase + kOffBase + c], 1u);
     }
   }
 }
@@ -297,5 +297,6 @@ void main() {
   uint token_bytes;
   if (!rans_eligible(g_n_seq, token_bytes)) return;
   compute_repeat_codes(g_n_seq);
-  accumulate_hist(g_n_seq, g_n_lit);
+  // Each TableGroup in the batch keeps its own histogram.
+  accumulate_hist(g_n_seq, g_n_lit, (c / pc.group_chunks) * kMaxQuantBytes);
 }

@@ -101,15 +101,18 @@ class CudaCompressSet : public CompressSet {
     chunk_size_ = chunk_size;
     slot_stride_ = worst_case_size(chunk_size);
     temp_bytes_ = compaction_temp_bytes(batch);
-    return h_in_lens_.alloc(batch) && h_sizes_.alloc(batch) && h_offsets_.alloc(batch + 1) && h_shift_.alloc(1) &&
-           h_q_.alloc(kMaxQuantBytes) && d_in_.alloc((size_t)batch * chunk_size) &&
+    group_chunks_ = group_chunks(chunk_size);
+    max_groups_ = (batch + group_chunks_ - 1) / group_chunks_;
+    size_t tab = (size_t)max_groups_ * kMaxQuantBytes;
+    return h_in_lens_.alloc(batch) && h_sizes_.alloc(batch) && h_offsets_.alloc(batch + 1) &&
+           h_shift_.alloc(max_groups_) && h_q_.alloc(tab) && d_in_.alloc((size_t)batch * chunk_size) &&
            d_slots_.alloc((size_t)batch * slot_stride_) && d_temp_.alloc(temp_bytes_) &&
            d_scratch_.alloc((size_t)batch * compress_scratch_bytes(chunk_size)) &&
            d_htab_.alloc((size_t)batch * (hash_table_bytes(chunk_size) / sizeof(uint32_t))) &&
            d_in_lens_.alloc(batch) && d_start_.alloc(batch) && d_sizes_.alloc(batch) &&
-           d_offsets_.alloc(batch + 1) && d_rans_cnt_.alloc(kMaxQuantBytes) && d_rans_shift_.alloc(1) &&
-           d_rans_n_seq_.alloc(batch) && d_rans_n_lit_.alloc(batch) && d_rans_freq_.alloc(kMaxQuantBytes) &&
-           d_rans_cum_.alloc(kMaxQuantBytes) && d_rans_q_.alloc(kMaxQuantBytes);
+           d_offsets_.alloc(batch + 1) && d_rans_cnt_.alloc(tab) && d_rans_shift_.alloc(max_groups_) &&
+           d_rans_n_seq_.alloc(batch) && d_rans_n_lit_.alloc(batch) && d_rans_freq_.alloc(tab) &&
+           d_rans_cum_.alloc(tab) && d_rans_q_.alloc(tab);
   }
 
   Stream& stream() override { return stream_; }
@@ -134,8 +137,9 @@ class CudaCompressSet : public CompressSet {
     check(cudaEventRecord(h2d_done_.e, st), "cudaEventRecord");
     RansBatchBufs rb{d_rans_cnt_.p, d_rans_freq_.p, d_rans_cum_.p,   d_rans_q_.p,
                      d_rans_shift_.p, d_rans_n_seq_.p, d_rans_n_lit_.p};
+    groups_ = (n_ + group_chunks_ - 1) / group_chunks_;
     launch_compress(d_in_.p, chunk_size_, n_, d_in_lens_.p, d_slots_.p, slot_stride_, d_start_.p, d_sizes_.p,
-                    d_scratch_.p, d_htab_.p, forced_lit_shift, rb, st);
+                    d_scratch_.p, d_htab_.p, forced_lit_shift, group_chunks_, rb, st);
     check(cudaGetLastError(), "compress_kernel launch");
     // The encode kernel is done with scratch (same stream), so the packed
     // output reuses it; see compress_scratch_bytes.
@@ -145,16 +149,19 @@ class CudaCompressSet : public CompressSet {
     check(cudaMemcpyAsync(h_sizes_.p, d_sizes_.p, n_ * sizeof(uint32_t), cudaMemcpyDeviceToHost, st), "D2H sizes");
     check(cudaMemcpyAsync(h_offsets_.p, d_offsets_.p, (n_ + 1) * sizeof(uint32_t), cudaMemcpyDeviceToHost, st),
           "D2H offsets");
-    check(cudaMemcpyAsync(h_shift_.p, d_rans_shift_.p, sizeof(uint32_t), cudaMemcpyDeviceToHost, st), "D2H shift");
-    check(cudaMemcpyAsync(h_q_.p, d_rans_q_.p, kMaxQuantBytes, cudaMemcpyDeviceToHost, st), "D2H q");
+    check(cudaMemcpyAsync(h_shift_.p, d_rans_shift_.p, groups_ * sizeof(uint32_t), cudaMemcpyDeviceToHost, st),
+          "D2H shift");
+    check(cudaMemcpyAsync(h_q_.p, d_rans_q_.p, (size_t)groups_ * kMaxQuantBytes, cudaMemcpyDeviceToHost, st),
+          "D2H q");
     check(cudaEventRecord(meta_.e, st), "cudaEventRecord");
   }
 
   void wait_meta() override { check(cudaEventSynchronize(meta_.e), "wait for chunk sizes"); }
   const uint32_t* sizes() override { return h_sizes_.p; }
   uint32_t packed_bytes() override { return h_offsets_.p[n_]; }
-  uint32_t lit_shift() override { return *h_shift_.p; }
-  const uint8_t* quant() override { return h_q_.p; }
+  uint32_t group_count() override { return groups_; }
+  uint32_t lit_shift(uint32_t g) override { return h_shift_.p[g]; }
+  const uint8_t* quant(uint32_t g) override { return h_q_.p + (size_t)g * kMaxQuantBytes; }
 
   void download_output(uint64_t off, HostBuf& dst, size_t len) override {
     check(cudaMemcpyAsync(dst.p, d_scratch_.p + off, len, cudaMemcpyDeviceToHost, stream_.s), "D2H output");
@@ -164,10 +171,11 @@ class CudaCompressSet : public CompressSet {
   CudaStream stream_;
   CudaEvent h2d_done_{false}, meta_{false};
   uint32_t chunk_size_ = 0, slot_stride_ = 0, n_ = 0;
+  uint32_t group_chunks_ = 0, max_groups_ = 0, groups_ = 0;
   size_t temp_bytes_ = 0;
   bool used_ = false;
   PinBuf<uint32_t> h_in_lens_, h_sizes_, h_offsets_, h_shift_;
-  PinBuf<uint8_t> h_q_; // the batch's quantised tables (up to kMaxQuantBytes)
+  PinBuf<uint8_t> h_q_; // each group's quantised tables, kMaxQuantBytes apart
   DevBuf<uint8_t> d_in_, d_slots_, d_temp_, d_scratch_; // d_scratch_ doubles as the packed output
   DevBuf<uint32_t> d_htab_; // LZ parse's match-finding table, one region per chunk; see hash_table_bytes()
   DevBuf<uint32_t> d_in_lens_, d_start_, d_sizes_, d_offsets_;
@@ -330,8 +338,11 @@ class CudaBackend : public Backend {
   }
 
   size_t compress_bytes_per_chunk(uint32_t chunk_size) override {
+    // Plus each group's histogram and tables, amortised over its chunks
+    // (kMaxQuantBytes of u32 counts, u16 freq and cum, and u8 counts).
+    size_t per_group = (size_t)kMaxQuantBytes * (4 + 2 + 2 + 1);
     return (size_t)chunk_size + worst_case_size(chunk_size) + compress_scratch_bytes(chunk_size) +
-           hash_table_bytes(chunk_size) + 6 * sizeof(uint32_t);
+           hash_table_bytes(chunk_size) + 6 * sizeof(uint32_t) + per_group / group_chunks(chunk_size);
   }
 
   size_t decompress_bytes_per_chunk(uint32_t chunk_size) override {

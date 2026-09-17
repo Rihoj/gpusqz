@@ -394,6 +394,10 @@ struct Plan {
 // that fits in one batch gets the whole budget as a single set: batches on
 // different streams barely overlap on the GPU, so a bigger batch beats a
 // second set.
+//
+// A compress batch holds whole TableGroups (format.h's group_chunks), so
+// the output doesn't depend on the memory a run happened to get. Only a GPU
+// too small for one group (warned about in compress()) breaks that.
 Plan plan_batches(uint32_t chunk_count, uint32_t chunk_size, size_t dev_bytes_per_chunk) {
   size_t free_bytes = g_backend->free_memory();
   size_t budget = free_bytes / 100 * kDefaultBudgetPercent;
@@ -418,12 +422,24 @@ Plan plan_batches(uint32_t chunk_count, uint32_t chunk_size, size_t dev_bytes_pe
   want = std::min(want, std::max<uint32_t>(1, g_backend->max_batch(chunk_size)));
 
   Plan p;
+  uint32_t gchunks = group_chunks(chunk_size);
   for (int s = 1; s <= kSets; ++s) {
     uint32_t mem_max = (uint32_t)std::max<size_t>(1, budget / ((size_t)s * dev_bytes_per_chunk));
-    p.batch = std::min({want, mem_max, chunk_count});
-    p.batches = (int)((chunk_count + p.batch - 1) / p.batch);
-    p.sets = std::min(s, p.batches);
-    if (p.batches <= s) break;
+    Plan c;
+    c.batch = std::min({want, mem_max, chunk_count});
+    // Whole groups per batch, so every batch starts on a group boundary.
+    // A single batch holding the whole file already does; rounding it down
+    // would only cost chunks in flight. Below one group the groups follow
+    // the batches instead.
+    if (c.batch > gchunks && c.batch < chunk_count) c.batch -= c.batch % gchunks;
+    c.batches = (int)((chunk_count + c.batch - 1) / c.batch);
+    c.sets = std::min(s, c.batches);
+    // A second set halves each one's memory. If that no longer fits a
+    // whole group, keep the single set: overlapping a little less is
+    // better than writing a different file than a bigger GPU would.
+    if (s > 1 && c.batch < gchunks && p.batch >= gchunks) break;
+    p = c;
+    if (c.batches <= s) break;
   }
   return p;
 }
@@ -538,10 +554,17 @@ struct Compressor {
       entries[s.first + c] = ChunkEntry{payload_offset, sizes[c], len};
       payload_offset += sizes[c];
     }
-    TableGroup g{s.first, s.n, set.lit_shift(), 0};
-    if (!lit_shift_valid(g.lit_ctx_shift)) die("internal error: bad literal-context rule from the GPU");
-    groups.push_back(g);
-    tables.insert(tables.end(), set.quant(), set.quant() + group_quant_bytes(g));
+    // One TableGroup per group of the batch: chunks group_chunks apart,
+    // aligned to the file's own group boundaries (see kGroupBytes), so the
+    // groups don't depend on how big a batch the GPU's memory allowed.
+    uint32_t gchunks = set.group_count() > 1 ? group_chunks(chunk_size) : s.n;
+    for (uint32_t gi = 0; gi < set.group_count(); ++gi) {
+      uint32_t start = gi * gchunks;
+      TableGroup g{s.first + start, std::min(gchunks, s.n - start), set.lit_shift(gi), 0};
+      if (!lit_shift_valid(g.lit_ctx_shift)) die("internal error: bad literal-context rule from the GPU");
+      groups.push_back(g);
+      tables.insert(tables.end(), set.quant(gi), set.quant(gi) + group_quant_bytes(g));
+    }
 
     g_stats.mark(s.batch, kD2h0, set.stream());
     download(writer, set, set.packed_bytes(), batch_off, nullptr);
@@ -571,7 +594,10 @@ struct Compressor {
       if (s.d2h_pending && s.batch == b) enqueue_d2h(s);
     }
     writer.finish();
-    if (groups.size() != (size_t)plan.batches) die("internal error: table group count mismatch");
+    uint32_t gchunks = std::min(group_chunks(chunk_size), plan.batch);
+    if (groups.size() != (chunk_count + gchunks - 1) / gchunks) {
+      die("internal error: table group count mismatch");
+    }
   }
 };
 
@@ -627,8 +653,17 @@ void compress(const std::string& in_path, const std::string& out_path, uint32_t 
     cz.allocate();
 
     // Now that allocate() has fixed the batch size, reserve space for the
-    // group directory: one TableGroup per batch. The payload follows it.
-    header.table_group_count = (uint32_t)cz.plan.batches;
+    // group directory. The payload follows it. Groups cover kGroupBytes of
+    // input each, so their count depends only on the file, unless the
+    // memory a batch got was too small even for one group.
+    uint32_t gchunks = std::min(group_chunks(chunk_size), cz.plan.batch);
+    if (gchunks < group_chunks(chunk_size)) {
+      std::fprintf(stderr,
+                   "gpusqz: only %u chunks fit in GPU memory at once, fewer than the %u a table group covers; "
+                   "this file's bytes will differ from a run with more memory (see --gpu-mem)\n",
+                   cz.plan.batch, group_chunks(chunk_size));
+    }
+    header.table_group_count = (uint32_t)((chunk_count + gchunks - 1) / gchunks);
     groups.resize(header.table_group_count);
     std::fwrite(groups.data(), sizeof(TableGroup), groups.size(), out);
     cz.payload_start = file_tell(out);

@@ -16,6 +16,7 @@ shared float part[3][kThreads];
 shared uint chosen;
 
 // Per-invocation scratch for row_coded_bits.
+uint g_base; // this workgroup's TableGroup base in batch_cnt / fc / q_out
 uint g_row[kLitSyms];
 uint g_q[kLitSyms];
 uint g_f[kLitSyms];
@@ -90,8 +91,10 @@ float row_coded_bits() {
   return b;
 }
 
-// Quantises batch_cnt[base, base + k) into q_out and expands it into fc.
+// Quantises batch_cnt[g_base + base, ... + k) into q_out and expands it
+// into fc, all within this workgroup's TableGroup.
 void build_row(uint base, uint k) {
+  base += g_base;
   for (uint s = 0; s < k; ++s) g_row[s] = batch_cnt[base + s];
   quantize_row(k);
   normalize_row(k);
@@ -104,11 +107,12 @@ void build_row(uint base, uint k) {
 }
 
 void main() {
+  g_base = gl_WorkGroupID.x * kMaxQuantBytes; // this workgroup's TableGroup
   uint t = gl_LocalInvocationIndex; // one literal symbol per thread while folding
   uint colsum = 0;
   for (uint c = 0; c < 16; ++c) {
     uint v = 0;
-    for (uint r = 0; r < 16; ++r) v += batch_cnt[lit_entry(c * 16 + r, t)];
+    for (uint r = 0; r < 16; ++r) v += batch_cnt[g_base + lit_entry(c * 16 + r, t)];
     nib[c][t] = v;
     colsum += v;
   }
@@ -130,7 +134,7 @@ void main() {
     } else {
       part[1][t] = 0.0;
     }
-    for (uint s = 0; s < kLitSyms; ++s) g_row[s] = batch_cnt[lit_entry(t, s)];
+    for (uint s = 0; s < kLitSyms; ++s) g_row[s] = batch_cnt[g_base + lit_entry(t, s)];
     part[2][t] = row_coded_bits();
     barrier();
     if (t == 0) {
@@ -154,12 +158,12 @@ void main() {
 
   uint shift = chosen;
   uint n_ctx = lit_ctx_count(shift);
-  if (t == 0) lit_shift_buf[0] = shift;
+  if (t == 0) lit_shift_buf[gl_WorkGroupID.x] = shift;
   // Every read of the full histogram is done; fold into its first rows.
   if (shift == kLitShiftNibble) {
-    for (uint c = 0; c < 16; ++c) batch_cnt[lit_entry(c, t)] = nib[c][t];
+    for (uint c = 0; c < 16; ++c) batch_cnt[g_base + lit_entry(c, t)] = nib[c][t];
   } else if (shift == kLitShiftOrder0) {
-    batch_cnt[lit_entry(0, t)] = col[t];
+    batch_cnt[g_base + lit_entry(0, t)] = col[t];
   }
   memoryBarrierBuffer();
   barrier();

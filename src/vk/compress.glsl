@@ -32,4 +32,6 @@ layout(push_constant) uniform PC {
   uint hash_bits;
   uint max_seq;
   int forced_shift;
+  uint group_chunks; // chunks per TableGroup (format.h); batch_cnt, fc and
+                     // q_out hold kMaxQuantBytes entries per group
 } pc;

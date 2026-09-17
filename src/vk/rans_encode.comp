@@ -71,7 +71,8 @@ bool enc_bits(inout uint x, bool live, uint nb, uint bits, inout uint wp, uint w
 }
 
 // See rans_encode_warp. slot is the chunk's slot base.
-bool rans_encode(uint n_seq, uint n_lit, uint lit_shift, uint slot, uint in_len, out uint start, out uint size) {
+bool rans_encode(uint n_seq, uint n_lit, uint lit_shift, uint gbase, uint slot, uint in_len, out uint start,
+                 out uint size) {
   uint lane = lg_lane();
   start = 0;
   size = 0;
@@ -90,7 +91,7 @@ bool rans_encode(uint n_seq, uint n_lit, uint lit_shift, uint slot, uint in_len,
       uint prev = t != 0 ? uint(lits[g_lit + idx - 1]) : 0;
       e = lit_entry(lit_ctx(prev, lit_shift), uint(lits[g_lit + idx]));
     }
-    if (!enc_put(x, act, fc[e], wp, wlimit)) return false;
+    if (!enc_put(x, act, fc[gbase + e], wp, wlimit)) return false;
   }
   for (int g = int((n_seq + 31) / 32) - 1; g >= 0; --g) {
     uint idx = uint(g) * 32 + lane;
@@ -111,11 +112,11 @@ bool rans_encode(uint n_seq, uint n_lit, uint lit_shift, uint slot, uint in_len,
       }
     }
     if (!enc_bits(x, has_off, onb, ob, wp, wlimit)) return false;
-    if (!enc_put(x, has_off, fc[kOffBase + oc], wp, wlimit)) return false;
+    if (!enc_put(x, has_off, fc[gbase + kOffBase + oc], wp, wlimit)) return false;
     if (!enc_bits(x, act, mlnb, mlb, wp, wlimit)) return false;
-    if (!enc_put(x, act, fc[kMlBase + mlc], wp, wlimit)) return false;
+    if (!enc_put(x, act, fc[gbase + kMlBase + mlc], wp, wlimit)) return false;
     if (!enc_bits(x, act, llnb, llb, wp, wlimit)) return false;
-    if (!enc_put(x, act, fc[kLlBase + llc], wp, wlimit)) return false;
+    if (!enc_put(x, act, fc[gbase + kLlBase + llc], wp, wlimit)) return false;
   }
 
   uint hdr = wp - kRansHeaderBytes;
@@ -189,17 +190,19 @@ void main() {
   g_lit = c * pc.chunk_size;
   uint slot = c * pc.slot_stride;
   uint n_seq = n_seq_arr[c], n_lit = n_lit_arr[c];
-  uint lit_shift = lit_shift_buf[0];
+  uint g = c / pc.group_chunks; // its TableGroup within the batch
+  uint gbase = g * kMaxQuantBytes;
+  uint lit_shift = lit_shift_buf[g];
 
   uint tok_total;
   bool eligible = rans_eligible(n_seq, tok_total);
 
   bool ok = false;
   uint start = 0, size = 0;
-  // An ineligible chunk contributed nothing to the batch tables, so it
+  // An ineligible chunk contributed nothing to its group's tables, so it
   // must not use them either.
   if (eligible && in_len > kRansHeaderBytes + 1) {
-    ok = rans_encode(n_seq, n_lit, lit_shift, slot, in_len, start, size);
+    ok = rans_encode(n_seq, n_lit, lit_shift, gbase, slot, in_len, start, size);
     if (ok && 1 + tok_total < size) ok = false;
   }
   // Each attempt below overwrites bytes other lanes wrote in the one

@@ -59,6 +59,12 @@ GitHub's runners have no GPU, so the `gpu` label (CUDA) is skipped there.
   picks its own batch size independently. The extremes suite compresses
   and decompresses with deliberately different batch sizes, in both
   directions, including with 256-context tables.
+- **Same output at any memory budget.** A `TableGroup` covers a fixed
+  amount of input (`kGroupBytes`), so the batch size a memory budget
+  allows must not change the bytes written. The profile suite compresses
+  one file at several `--gpu-mem` values and compares them, with
+  `GPUSQZ_FORCE_GROUP_CHUNKS` shrinking groups so a small test file still
+  spans several.
 - **A match-free 1MB chunk.** The extremes suite includes a 2^20-byte De
   Bruijn sequence B(32,4), in which no 4-byte string repeats. It once
   produced undecodable output, because a single literal run of exactly
