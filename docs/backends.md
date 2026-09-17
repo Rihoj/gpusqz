@@ -71,7 +71,7 @@ best of 3–4) narrowed where the rest of the gap is, without finding a fix:
 
 | what decodes | Vulkan / CUDA |
 |---|---|
-| raw chunks only (256MB of random data: a pure copy) | **1.20** (Vulkan faster) |
+| raw chunks only (256MB of random data: a pure copy) | **1.20**, i.e. at least as fast — but 5ms against 6ms, near the timer's resolution |
 | rANS decode alone (reconstruction stubbed out) | 0.54–0.55 |
 | full decode | 0.51 (283MB `speed`), 0.70 (enwik8 `ratio`) |
 
