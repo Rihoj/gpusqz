@@ -37,9 +37,10 @@
   needs ~0.25s. Going further needs a faster filesystem path, not a
   faster kernel.
 - **`compute_repeat_codes`' encode-side pass is serial**, one lane per
-  chunk. Disabling it costs only a few percent of compress-kernel
-  throughput on text. Struct-like binary data with recurring strides
-  should gain more from repeat offsets than prose does.
+  chunk. Removing it entirely would save only 1–6% of compress-kernel
+  time, too little to parallelise, while its repeat codes make binaries
+  3.5–4.2% smaller (see [Measured and
+  rejected](performance-history.md#measured-and-rejected)).
 - **Small inputs can't fill the GPU at the `ratio` profile.** Each 1MB
   chunk is one warp; a 100MB file is only ~96 of them, while ~350 are
   needed to saturate an RTX 5060 Ti.
