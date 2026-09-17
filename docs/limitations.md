@@ -76,11 +76,6 @@
   truncation, invalid rANS streams) is detected, but the format has no
   checksum, so a corrupted literal or table byte that still decodes
   consistently produces wrong output silently.
-- **Expanded decode tables use ~1.3MB of device memory per table group**
-  at 256 contexts, all expanded up front. That is ~10MB for a 1GB file at
-  the default profile, but would grow to gigabytes for a file of many
-  terabytes; expanding each decode batch's groups on demand would fix
-  it.
 - **No streaming API** — it's a file-in, file-out CLI, and output must be
   seekable (the header is patched at the end).
 - Match offsets are 32-bit, but chunks are capped at 1MB by policy

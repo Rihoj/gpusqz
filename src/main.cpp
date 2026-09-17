@@ -684,6 +684,7 @@ void compress(const std::string& in_path, const std::string& out_path, uint32_t 
 struct DecompressSlot {
   std::unique_ptr<DecompressSet> set;
   uint32_t n = 0, first = 0, last_len = 0;
+  uint32_t group0 = 0, group_count = 0; // the TableGroups the batch touches
   int batch = -1;
   bool d2h_pending = false;
 };
@@ -698,7 +699,8 @@ struct Decompressor {
   std::vector<TableGroup> groups;
   std::vector<uint8_t> tables;       // the file's table section: each group's quantised counts in order
   std::vector<uint32_t> chunk_group; // header.chunk_count entries, from `groups`
-  std::unique_ptr<GroupTables> group_tables;
+  std::vector<uint64_t> group_q_off; // group g's quantised counts start at tables[group_q_off[g]]
+  std::vector<uint64_t> group_ctx;   // literal contexts of groups [0, g), groups.size() + 1 entries
   std::vector<DecompressSlot> sets;
   std::unique_ptr<HostBuf> h_err; // one flag per batch, checked by the writer before writing it
   Plan plan;
@@ -706,24 +708,42 @@ struct Decompressor {
   Writer writer;
   uint32_t next_chunk = 0;
 
-  // Builds chunk_group[] from groups[] and expands every group's table
-  // once, up front, so any decode batch (its own boundaries chosen
-  // independently of whatever batch size compression used) can look up
-  // any chunk's table by a simple index. Must run before the batch loop.
-  void prepare_group_tables() {
+  // Indexes groups[]: which group each chunk is in, and where each group's
+  // counts and contexts start. A decode batch's boundaries are chosen
+  // independently of whatever batch size compression used, so a batch can
+  // touch several groups; each batch expands just those (see launch).
+  // Must run before allocate().
+  void index_groups() {
     chunk_group.assign(header.chunk_count, 0);
+    group_q_off.assign(groups.size(), 0);
+    group_ctx.assign(groups.size() + 1, 0);
+    uint64_t q = 0;
     for (uint32_t g = 0; g < groups.size(); ++g) {
       const TableGroup& tg = groups[g];
       for (uint32_t c = tg.start_chunk; c < tg.start_chunk + tg.chunk_count; ++c) chunk_group[c] = g;
+      group_q_off[g] = q;
+      q += group_quant_bytes(tg);
+      group_ctx[g + 1] = group_ctx[g] + (uint64_t)lit_ctx_count(tg.lit_ctx_shift);
     }
-    group_tables = g_backend->load_group_tables(groups, tables);
+  }
+
+  // The most groups and contexts any decode batch of `batch` chunks touches.
+  TableCapacity table_capacity(uint32_t batch) const {
+    TableCapacity cap;
+    for (uint64_t first = 0; first < header.chunk_count; first += batch) {
+      uint32_t last = (uint32_t)std::min<uint64_t>(header.chunk_count, first + batch) - 1;
+      uint32_t g0 = chunk_group[first], g1 = chunk_group[last];
+      cap.groups = std::max(cap.groups, g1 - g0 + 1);
+      cap.contexts = std::max(cap.contexts, group_ctx[g1 + 1] - group_ctx[g0]);
+    }
+    return cap;
   }
 
   void allocate() {
     plan = plan_batches(header.chunk_count, header.chunk_size,
                         g_backend->decompress_bytes_per_chunk(header.chunk_size));
     auto made = create_sets<DecompressSet>(plan, header.chunk_count, [&](uint32_t batch) {
-      return g_backend->create_decompress_set(batch, header.chunk_size);
+      return g_backend->create_decompress_set(batch, header.chunk_size, table_capacity(batch));
     });
     sets.resize(made.size());
     for (size_t i = 0; i < made.size(); ++i) sets[i].set = std::move(made[i]);
@@ -737,6 +757,8 @@ struct Decompressor {
     s.first = next_chunk;
     s.batch = b;
     DecompressSet::Inputs h = s.set->begin(n);
+    s.group0 = chunk_group[s.first];
+    s.group_count = chunk_group[s.first + n - 1] - s.group0 + 1;
 
     // Chunks lie back to back in file order (chunk_entries), so a batch's
     // payload is one contiguous range we can read in one pass.
@@ -749,7 +771,7 @@ struct Decompressor {
       h.in_offsets[c] = (uint32_t)(e.offset - base);
       h.in_lens[c] = e.compressed_size;
       h.out_lens[c] = e.original_size;
-      h.group_id[c] = chunk_group.empty() ? 0 : chunk_group[s.first + c];
+      h.group_id[c] = chunk_group[s.first + c] - s.group0;
     }
     s.last_len = entries[s.first + n - 1].original_size;
     uint64_t total_in = expect - base;
@@ -765,7 +787,8 @@ struct Decompressor {
     g_stats.mark(s.batch, kK0, s.set->stream());
     // The error flag is downloaded ahead of the output on the same stream,
     // so the writer can check it before writing any of this batch.
-    s.set->launch(*group_tables, *h_err, (size_t)s.batch * sizeof(uint32_t));
+    TableWindow w{groups.data() + s.group0, s.group_count, tables.data() + group_q_off[s.group0]};
+    s.set->launch(w, *h_err, (size_t)s.batch * sizeof(uint32_t));
     g_stats.mark(s.batch, kK1, s.set->stream());
     s.d2h_pending = true;
   }
@@ -835,6 +858,7 @@ void decompress(const std::string& in_path, const std::string& out_path) {
   // group_id land outside chunk_group[] or reference an out-of-range slot.
   // An empty group list only ever occurs for an empty file (chunk_count
   // == 0), which is fine as-is: no chunk will ever look one up.
+  if (groups.empty() && header.chunk_count > 0) die("corrupt table group directory: no groups");
   if (!groups.empty()) {
     uint64_t covered = 0;
     for (const TableGroup& g : groups) {
@@ -892,8 +916,8 @@ void decompress(const std::string& in_path, const std::string& out_path) {
 
     double t = now_s();
     open_backend();
+    dz.index_groups();
     dz.allocate();
-    dz.prepare_group_tables();
     g_stats.setup_s += now_s() - t;
     g_stats.start_clock(dz.sets[0].set->stream());
 

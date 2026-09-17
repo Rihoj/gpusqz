@@ -99,8 +99,11 @@ into already-written history so no serial path is needed. rANS decoding
 runs the same 32-lane lockstep as the encoder into scratch — literals
 through a per-context slot-to-symbol table, lengths and offsets through a
 coarse 128-entry index plus a short scan — then the same reconstruction
-loop rebuilds the chunk. Every table group's tables are expanded once, up
-front, into a global buffer that each chunk finds through its group id.
+loop rebuilds the chunk. Each decode batch expands just the table groups
+it touches into its buffer set's own global buffer, ahead of the decode
+kernel on the same stream, and each chunk finds its tables through a group
+id local to the batch. Table memory is sized for the most groups and
+contexts any one batch touches, so it doesn't grow with the file.
 Malformed input sets an error flag that the host turns into an error
 rather than garbage output.
 

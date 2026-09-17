@@ -9,7 +9,8 @@
 // most one word per lane, which keeps both sides' word counts in step.
 //
 // Tables are not in the per-chunk payload: every chunk of a TableGroup
-// shares them, expanded once per group (expand_group_table).
+// shares them, expanded per decode batch for the groups it touches
+// (expand_group_table).
 //
 // Payload (ChunkFlag::LzRans, after the flag byte):
 //   u32 n_seq, u32 n_lit, u32 state[32], u16 words[]
