@@ -444,9 +444,13 @@ Plan plan_batches(uint32_t chunk_count, uint32_t chunk_size, size_t dev_bytes_pe
   return p;
 }
 
-// Creates plan.sets buffer sets, halving the batch until they fit.
+// Creates plan.sets buffer sets, halving the batch until they fit. `align`
+// keeps a shrunken batch a whole number of TableGroups (compression; 1 for
+// decompression, whose batches need no alignment), so the groups stay the
+// file's own however little memory the allocation ends up with. Below one
+// group the groups follow the batches, as plan_batches leaves them.
 template <typename Set, typename Create>
-std::vector<std::unique_ptr<Set>> create_sets(Plan& plan, uint32_t chunk_count, Create create) {
+std::vector<std::unique_ptr<Set>> create_sets(Plan& plan, uint32_t chunk_count, Create create, uint32_t align = 1) {
   std::vector<std::unique_ptr<Set>> sets;
   for (;;) {
     sets.clear();
@@ -459,6 +463,7 @@ std::vector<std::unique_ptr<Set>> create_sets(Plan& plan, uint32_t chunk_count, 
     sets.clear();
     if (plan.batch == 1) die("out of GPU or pinned host memory even at 1 chunk per batch");
     plan.batch = std::max<uint32_t>(1, plan.batch / 2);
+    if (align > 1 && plan.batch > align) plan.batch -= plan.batch % align;
   }
   plan.batches = (int)((chunk_count + plan.batch - 1) / plan.batch);
   g_stats.batches = plan.batches;
@@ -506,7 +511,8 @@ struct Compressor {
   void allocate() {
     plan = plan_batches(chunk_count, chunk_size, g_backend->compress_bytes_per_chunk(chunk_size));
     auto made = create_sets<CompressSet>(
-        plan, chunk_count, [&](uint32_t batch) { return g_backend->create_compress_set(batch, chunk_size); });
+        plan, chunk_count, [&](uint32_t batch) { return g_backend->create_compress_set(batch, chunk_size); },
+        group_chunks(chunk_size));
     sets.resize(made.size());
     for (size_t i = 0; i < made.size(); ++i) sets[i].set = std::move(made[i]);
     if (!in_ring.init(kInStages)) die("out of pinned host memory");
