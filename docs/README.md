@@ -29,6 +29,9 @@ summary of its results.
 - [Performance history](performance-history.md): every measured change
   since the first commit, the corpora and conditions behind each number,
   experiments that were dropped, and how to add an entry.
+- [Predictive modeling study](predictive-modeling-study.md): where a
+  file's bits go, and what context-mixing models (on literals, or instead
+  of LZ) would save under gpusqz's chunk and lane constraints.
 
 **Working on gpusqz**
 
