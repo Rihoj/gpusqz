@@ -64,8 +64,32 @@ On the RTX 5060 Ti (Windows NVIDIA Vulkan driver) the Vulkan compress
 kernels ran at 90–96% of CUDA's throughput and the decompress kernel at
 55–70% (283MB corpus; e.g. `speed` profile 2013 vs 2227 MB/s compress,
 1874 vs 3323 MB/s decompress). Removing `coherent` from the scratch
-buffers and dropping a redundant memory barrier helped; the remaining
-decode gap is not understood yet.
+buffers and dropping a redundant memory barrier helped.
+
+A profiling pass on 2026-09-17 (same GPU, Windows driver, kernel `kbusy`,
+best of 3–4) narrowed where the rest of the gap is, without finding a fix:
+
+| what decodes | Vulkan / CUDA |
+|---|---|
+| raw chunks only (256MB of random data: a pure copy) | **1.20** (Vulkan faster) |
+| rANS decode alone (reconstruction stubbed out) | 0.54–0.55 |
+| full decode | 0.51 (283MB `speed`), 0.70 (enwik8 `ratio`) |
+
+So it is not dispatch overhead, PCIe or plain copying: those are at least
+as fast as CUDA. The cost is spread evenly over the 32-lane cooperative
+code — rANS decoding and LZ reconstruction lose about the same share.
+Both backends use one 32-lane group per chunk and the same number of
+barriers per match.
+
+Ruled out so far (see [Measured and
+rejected](performance-history.md#measured-and-rejected)): a lane-group
+layer specialised for subgroup size 32, and `lg_sync()` narrowed to
+buffer-only memory semantics with `controlBarrier`. A timing probe that
+drops the *execution* barrier entirely (leaving only a buffer memory
+barrier, which is not safe to ship) does recover 17–18%, so lane
+synchronisation looks like part of the gap. What has not been measured
+yet: register use and occupancy, through
+`VK_KHR_pipeline_executable_properties`.
 
 On an Apple M1 Max the Vulkan backend runs through MoltenVK in
 subgroup-lane mode and passes the round-trip suite; its speed is in

@@ -58,6 +58,11 @@ Use it for changes to barriers, streams, events, or buffer reuse in
 - NVIDIA through Vulkan: `GPUSQZ_BACKEND=vulkan` on a machine whose Vulkan
   loader sees the GPU. Under WSL2 the Linux loader doesn't, but a Windows
   build of gpusqz.exe (llvm-mingw cross-compile, `-DGPUSQZ_BUILD_CUDA=OFF`)
-  run from WSL uses the Windows NVIDIA driver.
+  run from WSL uses the Windows NVIDIA driver. Link it with
+  `-DCMAKE_EXE_LINKER_FLAGS=-static`: without it the exe needs llvm-mingw's
+  libc++ DLLs and simply hangs, even on `--version`. Give the exe Windows
+  paths (`C:\...`), not `/mnt/c` ones, and pass env vars through
+  `WSLENV=GPUSQZ_VERBOSE`. Vulkan headers come from the Vulkan SDK
+  (`-DGPUSQZ_VULKAN_INCLUDE=<sdk>/include`); the loader is found at runtime.
 - AMD and Apple: ask the user to run `gpusqz devices` and
   `GPUSQZ_BACKEND=vulkan bash tests/round_trip.sh ./build/gpusqz` there.
