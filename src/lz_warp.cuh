@@ -103,6 +103,29 @@ __device__ __forceinline__ void probe_bucket(const uint8_t* in, uint32_t p, cons
   }
 }
 
+// What a match costs in the rANS stream, in bits, roughly: a symbol is
+// about 5 bits, an explicit offset also carries floor(log2 off) raw bits,
+// and a repeat offset carries none (rans_codes.h). Literals are counted at
+// 8 bits. Only differences matter here, so the constants are coarse.
+constexpr int kBitsSymbol = 5;
+constexpr int kBitsLiteral = 8;
+__device__ __forceinline__ int match_price(uint32_t ml, uint32_t off, const uint32_t* rep_off, int n_rep) {
+  int price = 2 * kBitsSymbol; // length and offset symbols
+  bool is_rep = false;
+  for (int r = 0; r < kMaxRepProbes; ++r) {
+    if (r < n_rep && rep_off[r] == off) is_rep = true;
+  }
+  if (!is_rep) price += (int)floor_log2(off); // the offset's raw bits
+  uint32_t code, nb, bits;
+  len_code(ml - kMinMatch, code, nb, bits);
+  price += (int)nb;
+  return price;
+}
+// Bits saved by coding `ml` bytes as this match instead of as literals.
+__device__ __forceinline__ int match_gain(uint32_t ml, uint32_t off, const uint32_t* rep_off, int n_rep) {
+  return (int)(kBitsLiteral * ml) - match_price(ml, off, rep_off, n_rep);
+}
+
 __device__ __forceinline__ uint32_t ext_bytes(uint32_t v) { return v >= 15 ? 1 + (v - 15) / 255 : 0; }
 
 __device__ __forceinline__ uint32_t seq_size(uint32_t lit_len, uint32_t ml) {
@@ -324,17 +347,25 @@ __device__ inline void lz_parse_warp(const uint8_t* in, uint32_t n, uint32_t* ht
       if (!m) break;
       uint32_t j = __ffs(m) - 1;
       uint32_t lj = __shfl_sync(kFullMask, best_len, j);
-      // Lazy matching: while the next position's match is longer by more
-      // than one byte, take it instead (up to kLazySteps positions on).
+      uint32_t oj = __shfl_sync(kFullMask, best_off, j);
+      // Lazy matching, priced: take the next position's match when it saves
+      // more bits than this one plus the literal that deferring adds (up to
+      // kLazySteps positions on). Length alone would ignore what a far
+      // offset costs and what a repeat offset saves.
+      int gj = match_gain(lj, oj, rep, n_rep);
 #pragma unroll
       for (int step = 0; step < kLazySteps; ++step) {
         if (j >= 31 || !((mask >> (j + 1)) & 1)) break;
         uint32_t lj1 = __shfl_sync(kFullMask, best_len, j + 1);
-        if (lj1 <= lj + 1) break;
+        uint32_t oj1 = __shfl_sync(kFullMask, best_off, j + 1);
+        int gj1 = match_gain(lj1, oj1, rep, n_rep);
+        if (gj1 <= gj + kBitsLiteral) break;
         ++j;
         lj = lj1;
+        oj = oj1;
+        gj = gj1;
       }
-      uint32_t off = __shfl_sync(kFullMask, best_off, j);
+      uint32_t off = oj;
       uint32_t len = lj;
       if (len == (uint32_t)kProbe) len = warp_extend(in, pos + j, off, n, len);
       emit(lit_start, pos + j - lit_start, off, len);

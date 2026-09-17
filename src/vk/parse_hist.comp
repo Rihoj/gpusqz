@@ -83,6 +83,24 @@ void emit(uint lit_start, uint lit_len, uint off, uint ml) {
   g_n_lit += lit_len;
 }
 
+// lz_warp.cuh's match_price / match_gain: what a match costs in the rANS
+// stream, in bits, roughly (a symbol ~5 bits, an explicit offset also its
+// floor(log2 off) raw bits, a repeat offset none), against 8 bits a literal.
+const int kBitsSymbol = 5;
+const int kBitsLiteral = 8;
+int match_gain(uint ml, uint off, uint rep[kMaxRepProbes], int n_rep) {
+  int price = 2 * kBitsSymbol;
+  bool is_rep = false;
+  for (int r = 0; r < kMaxRepProbes; ++r) {
+    if (r < n_rep && rep[r] == off) is_rep = true;
+  }
+  if (!is_rep) price += findMSB(off);
+  uint code, nb, bits;
+  len_code(ml - kMinMatch, code, nb, bits);
+  price += int(nb);
+  return int(kBitsLiteral * ml) - price;
+}
+
 // lz_parse_warp's use_offset: moves off to the front of rep.
 void use_offset(inout uint rep[kMaxRepProbes], uint off) {
   uint carry = off;
@@ -179,16 +197,23 @@ void lz_parse(uint n, uint hash_bits) {
       if (m == 0) break;
       uint j = uint(findLSB(m));
       uint lj = lg_shfl(best_len, j);
-      // Lazy matching: while the next position's match is longer by more
-      // than one byte, take it instead (up to kLazySteps positions on).
+      uint oj = lg_shfl(best_off, j);
+      // Lazy matching, priced: take the next position's match when it saves
+      // more bits than this one plus the literal that deferring adds (up to
+      // kLazySteps positions on).
+      int gj = match_gain(lj, oj, rep, n_rep);
       for (int step = 0; step < kLazySteps; ++step) {
         if (j >= 31 || ((mask >> (j + 1)) & 1u) == 0) break;
         uint lj1 = lg_shfl(best_len, j + 1);
-        if (lj1 <= lj + 1) break;
+        uint oj1 = lg_shfl(best_off, j + 1);
+        int gj1 = match_gain(lj1, oj1, rep, n_rep);
+        if (gj1 <= gj + kBitsLiteral) break;
         ++j;
         lj = lj1;
+        oj = oj1;
+        gj = gj1;
       }
-      uint off = lg_shfl(best_off, j);
+      uint off = oj;
       uint len = lj;
       if (len == kProbe) len = lg_extend(pos + j, off, n, len);
       emit(lit_start, pos + j - lit_start, off, len);
