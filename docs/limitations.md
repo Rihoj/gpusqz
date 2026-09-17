@@ -60,6 +60,14 @@
   carry 16 or 256 tables that few of its chunks use. The cost is bounded
   by the coded table bytes, which are about a tenth of the 4KB or 66KB
   the raw counts would take (see [Design](design.md#container-format)).
+- **No format-aware transforms.** gpusqz codes every file as a plain byte
+  stream. On binary STL meshes, a bit-exact per-chunk transform (storing
+  each normal as its difference from one recomputed from the vertices,
+  plus a per-chunk table of distinct vertices) made `ratio` output 1.5–3.3x
+  smaller than on the untransformed file, and fits inside chunk
+  independence. It
+  would be format 3. See the [Format-aware transforms
+  study](format-aware-transforms-study.md).
 
 ## Format and robustness
 

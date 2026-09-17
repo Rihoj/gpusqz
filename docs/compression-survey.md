@@ -1996,6 +1996,10 @@ Findings from this survey that bear most directly on its trade-offs:
   - an incompressible-data probe before the GPU pass (10.8)
   - a seek index for chunks (7.3, 9.13), which its fixed chunking already
     almost provides
+- **Type-specific transforms (3.6, 8.3, 11.5).** These are the largest
+  pre-codec gains that keep chunks independent. The [Format-aware transforms
+  study](format-aware-transforms-study.md) measures them on binary STL
+  meshes.
 
 ---
 

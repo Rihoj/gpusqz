@@ -32,6 +32,9 @@ summary of its results.
 - [Predictive modeling study](predictive-modeling-study.md): where a
   file's bits go, and what context-mixing models (on literals, or instead
   of LZ) would save under gpusqz's chunk and lane constraints.
+- [Format-aware transforms study](format-aware-transforms-study.md):
+  reversible per-chunk transforms for binary STL meshes (normal residuals,
+  a vertex table), and what chunk independence costs on that data.
 
 **Working on gpusqz**
 

@@ -443,6 +443,8 @@ Tried, measured, and not kept. Check here before re-running one.
 | Token-only coding (`--mode lz`) | c9f4ebe | 0.370 vs 0.272 at the same compress speed, decompress kernel 5498 vs 3759 MB/s; rANS won on ratio, so the mode was removed |
 | Order-2 literal contexts (previous literal + top bits of the one before, in the lane's run) | c777280 | at most 0.61% smaller (enwik8 `speed`), 0.02–0.04% at enwik8 `ratio`, up to 0.37% *larger* on headers at `ratio` once the extra tables are paid for. See [Predictive modeling study](predictive-modeling-study.md) |
 | Adaptive (context-mixing) literal models over the lane's literals, reset per lane run or per chunk | c777280 | 0.04–5.2% larger than today's static order-1 tables: a lane's run is too short to learn from. See [Predictive modeling study](predictive-modeling-study.md) |
+| Byte planes over a binary STL's raw vertex stream (x, y, z split, then 4 byte planes), normals dropped | 593ae95 | 2.34x *larger* at `ratio` on a grid-ordered mesh than dropping the normals alone (3,700,955 vs 1,581,575 bytes): it breaks the 50-byte record stride the match finder uses. 5% smaller on the same mesh with its triangles shuffled. See [Format-aware transforms study](format-aware-transforms-study.md) |
+| Whole-file vertex table for binary STL | 593ae95 | 4.20x at `ratio` on a shuffled mesh against 1.94x for a per-chunk table, but every chunk would reference one shared table, which breaks chunk independence. See [Format-aware transforms study](format-aware-transforms-study.md) |
 
 ## Adding an entry
 
