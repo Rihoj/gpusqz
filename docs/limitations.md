@@ -37,9 +37,10 @@
   needs ~0.25s. Going further needs a faster filesystem path, not a
   faster kernel.
 - **`compute_repeat_codes`' encode-side pass is serial**, one lane per
-  chunk. Disabling it costs only a few percent of compress-kernel
-  throughput on text. Struct-like binary data with recurring strides
-  should gain more from repeat offsets than prose does.
+  chunk. Removing it entirely would save only 1–6% of compress-kernel
+  time, too little to parallelise, while its repeat codes make binaries
+  3.5–4.2% smaller (see [Measured and
+  rejected](performance-history.md#measured-and-rejected)).
 - **Small inputs can't fill the GPU at the `ratio` profile.** Each 1MB
   chunk is one warp; a 100MB file is only ~96 of them, while ~350 are
   needed to saturate an RTX 5060 Ti.
@@ -75,11 +76,6 @@
   truncation, invalid rANS streams) is detected, but the format has no
   checksum, so a corrupted literal or table byte that still decodes
   consistently produces wrong output silently.
-- **Expanded decode tables use ~1.3MB of device memory per table group**
-  at 256 contexts, all expanded up front. That is ~10MB for a 1GB file at
-  the default profile, but would grow to gigabytes for a file of many
-  terabytes; expanding each decode batch's groups on demand would fix
-  it.
 - **No streaming API** — it's a file-in, file-out CLI, and output must be
   seekable (the header is patched at the end).
 - Match offsets are 32-bit, but chunks are capped at 1MB by policy

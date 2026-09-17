@@ -438,9 +438,8 @@ class VkBackend : public Backend {
            4 * sizeof(uint32_t);
   }
   std::unique_ptr<CompressSet> create_compress_set(uint32_t batch, uint32_t chunk_size) override;
-  std::unique_ptr<DecompressSet> create_decompress_set(uint32_t batch, uint32_t chunk_size) override;
-  std::unique_ptr<GroupTables> load_group_tables(const std::vector<TableGroup>& groups,
-                                                 const std::vector<uint8_t>& tables) override;
+  std::unique_ptr<DecompressSet> create_decompress_set(uint32_t batch, uint32_t chunk_size,
+                                                       const TableCapacity& tables) override;
 
   // Helpers for the sets.
   bool alloc_buf(Buf& b, VkDeviceSize size, bool host);
@@ -1084,10 +1083,6 @@ class VkCompressSet : public CompressSet {
   VkDescriptorSet set_ = VK_NULL_HANDLE;
 };
 
-struct VkGroupTables : GroupTables {
-  Buf info, sym, fc, q;
-};
-
 class VkDecompressSet : public DecompressSet {
  public:
   explicit VkDecompressSet(VkBackend* be) : be_(be), stream_(be) {}
@@ -1095,23 +1090,37 @@ class VkDecompressSet : public DecompressSet {
     if (pool_) vkDestroyDescriptorPool(be_->dev, pool_, nullptr);
   }
 
-  bool alloc(uint32_t batch, uint32_t chunk_size) {
+  bool alloc(uint32_t batch, uint32_t chunk_size, const TableCapacity& tables) {
     chunk_size_ = chunk_size;
     max_seq_ = max_sequences(chunk_size);
     batch_ = batch;
     size_t b = batch;
-    bool ok = be_->alloc_buf(in_, b * worst_case_size(chunk_size), false) &&
+    // Quantised counts and both expanded buffers are linear in groups and
+    // contexts (quant_bytes, group_sym_bytes), so the capacity's two maxima
+    // bound any batch's total.
+    max_groups_ = std::max<uint32_t>(1, tables.groups);
+    max_q_ = max_groups_ * (size_t)quant_bytes(0) + tables.contexts * (size_t)kLitSyms;
+    size_t sym_per_ctx = (group_sym_bytes(4) - group_sym_bytes(8)) / 15; // 16 contexts vs 1
+    max_sym_ = max_groups_ * (group_sym_bytes(8) - sym_per_ctx) + tables.contexts * sym_per_ctx;
+    // ginfo holds 32-bit offsets; too many tables for one batch makes the
+    // caller retry with a smaller one.
+    if (max_sym_ > UINT32_MAX || max_q_ * 4 > UINT32_MAX) return false;
+    bool ok =be_->alloc_buf(in_, b * worst_case_size(chunk_size), false) &&
               be_->alloc_buf(in_offsets_, b * 4, false) && be_->alloc_buf(in_lens_, b * 4, false) &&
               be_->alloc_buf(out_lens_, b * 4, false) && be_->alloc_buf(group_id_, b * 4, false) &&
               be_->alloc_buf(out_, b * chunk_size, false) && be_->alloc_buf(seqs_, b * max_seq_ * 8, false) &&
-              be_->alloc_buf(lits_, b * ((chunk_size + 3) & ~3u), false) && be_->alloc_buf(err_, 4, false);
+              be_->alloc_buf(lits_, b * ((chunk_size + 3) & ~3u), false) && be_->alloc_buf(err_, 4, false) &&
+              be_->alloc_buf(ginfo_, (size_t)max_groups_ * 16, false) && be_->alloc_buf(gsym_, max_sym_, false) &&
+              be_->alloc_buf(gfc_, max_q_ * 4, false) && be_->alloc_buf(gq_, max_q_, false);
     if (!ok) return false;
     h_in_ = be_->alloc_host(b * 16);
-    if (!h_in_) return false;
+    h_tab_ = be_->alloc_host((size_t)max_groups_ * 16 + max_q_);
+    if (!h_in_ || !h_tab_) return false;
     pool_ = be_->make_pool(kDecompressBindings);
     set_ = be_->make_set(pool_, be_->decompress_dsl);
-    const Buf* bufs[9] = {&in_, &in_offsets_, &in_lens_, &out_lens_, &group_id_, &out_, &seqs_, &lits_, &err_};
-    for (uint32_t i = 0; i < 9; ++i) be_->bind(set_, i, *bufs[i]);
+    const Buf* bufs[kDecompressBindings] = {&in_,  &in_offsets_, &in_lens_, &out_lens_, &group_id_, &out_, &seqs_,
+                                            &lits_, &err_,       &ginfo_,   &gsym_,     &gfc_,      &gq_};
+    for (uint32_t i = 0; i < kDecompressBindings; ++i) be_->bind(set_, i, *bufs[i]);
     return true;
   }
 
@@ -1131,16 +1140,7 @@ class VkDecompressSet : public DecompressSet {
     stream_.copy(static_cast<VkHostBuf&>(src).buf, 0, in_, off, len);
   }
 
-  void launch(const GroupTables& tables, HostBuf& err, size_t err_off) override {
-    const auto& gt = static_cast<const VkGroupTables&>(tables);
-    // Bound on first use, before this set has been submitted anywhere.
-    if (bound_ != &gt) {
-      be_->bind(set_, 9, gt.info);
-      be_->bind(set_, 10, gt.sym);
-      be_->bind(set_, 11, gt.fc);
-      be_->bind(set_, 12, gt.q);
-      bound_ = &gt;
-    }
+  void launch(const TableWindow& tables, HostBuf& err, size_t err_off) override {
     VkStreamImpl& st = stream_;
     const Buf& h = static_cast<VkHostBuf&>(*h_in_).buf;
     VkDeviceSize arr = (VkDeviceSize)batch_ * 4, bytes = (VkDeviceSize)n_ * 4;
@@ -1148,6 +1148,7 @@ class VkDecompressSet : public DecompressSet {
     st.copy(h, arr, in_lens_, 0, bytes);
     st.copy(h, 2 * arr, out_lens_, 0, bytes);
     st.copy(h, 3 * arr, group_id_, 0, bytes);
+    expand_tables(tables);
     st.zero(err_);
     DecompressPc pc{chunk_size_, n_, max_seq_};
     st.dispatch(be_->decompress, be_->decompress_pl, set_, &pc, sizeof(pc), n_);
@@ -1160,15 +1161,50 @@ class VkDecompressSet : public DecompressSet {
   }
 
  private:
+  // Stages the window's group info and quantised counts, and queues their
+  // upload and expansion into this set's table buffers.
+  void expand_tables(const TableWindow& w) {
+    auto* info = reinterpret_cast<uint32_t*>(h_tab_->p);
+    size_t q_off = 0, sym_bytes = 0, fc_words = 0;
+    for (uint32_t g = 0; g < w.count; ++g) {
+      uint32_t shift = w.groups[g].lit_ctx_shift;
+      info[g * 4 + 0] = (uint32_t)q_off;
+      info[g * 4 + 1] = (uint32_t)sym_bytes;
+      info[g * 4 + 2] = (uint32_t)fc_words;
+      info[g * 4 + 3] = shift;
+      q_off += group_quant_bytes(w.groups[g]);
+      sym_bytes += group_sym_bytes(shift);
+      fc_words += (size_t)quant_bytes(lit_ctx_count(shift));
+    }
+    if (w.count > max_groups_ || q_off > max_q_ || sym_bytes > max_sym_ || fc_words > max_q_) {
+      std::fprintf(stderr, "gpusqz: internal error: a decode batch's tables exceed its set's capacity\n");
+      std::exit(1);
+    }
+    size_t info_bytes = (size_t)max_groups_ * 16;
+    std::memcpy(h_tab_->p + info_bytes, w.quant, q_off);
+    VkStreamImpl& st = stream_;
+    const Buf& h = static_cast<VkHostBuf&>(*h_tab_).buf;
+    st.copy(h, 0, ginfo_, 0, (VkDeviceSize)w.count * 16);
+    st.copy(h, info_bytes, gq_, 0, q_off);
+    // Unused contexts and groups with no LzRans chunks have all-zero
+    // counts, which leave their tables zero: what flags a corrupt chunk
+    // decoding against one.
+    st.zero(gsym_);
+    st.zero(gfc_);
+    DecompressPc pc{0, w.count, 0};
+    st.dispatch(be_->expand_tables, be_->decompress_pl, set_, &pc, sizeof(pc), w.count);
+  }
+
   VkBackend* be_;
   VkStreamImpl stream_;
   VkEventImpl done_;
-  uint32_t chunk_size_ = 0, max_seq_ = 0, batch_ = 0, n_ = 0;
+  uint32_t chunk_size_ = 0, max_seq_ = 0, batch_ = 0, n_ = 0, max_groups_ = 0;
+  size_t max_q_ = 0, max_sym_ = 0;
   Buf in_, in_offsets_, in_lens_, out_lens_, group_id_, out_, seqs_, lits_, err_;
-  std::unique_ptr<HostBuf> h_in_;
+  Buf ginfo_, gsym_, gfc_, gq_; // the batch's group tables, see decompress.glsl
+  std::unique_ptr<HostBuf> h_in_, h_tab_;
   VkDescriptorPool pool_ = VK_NULL_HANDLE;
   VkDescriptorSet set_ = VK_NULL_HANDLE;
-  const GroupTables* bound_ = nullptr;
 };
 
 std::unique_ptr<CompressSet> VkBackend::create_compress_set(uint32_t batch, uint32_t chunk_size) {
@@ -1177,65 +1213,11 @@ std::unique_ptr<CompressSet> VkBackend::create_compress_set(uint32_t batch, uint
   return s;
 }
 
-std::unique_ptr<DecompressSet> VkBackend::create_decompress_set(uint32_t batch, uint32_t chunk_size) {
+std::unique_ptr<DecompressSet> VkBackend::create_decompress_set(uint32_t batch, uint32_t chunk_size,
+                                                               const TableCapacity& tables) {
   auto s = std::make_unique<VkDecompressSet>(this);
-  if (!s->alloc(batch, chunk_size)) return nullptr;
+  if (!s->alloc(batch, chunk_size, tables)) return nullptr;
   return s;
-}
-
-std::unique_ptr<GroupTables> VkBackend::load_group_tables(const std::vector<TableGroup>& groups,
-                                                          const std::vector<uint8_t>& tables) {
-  auto gt = std::make_unique<VkGroupTables>();
-  size_t ng = std::max<size_t>(1, groups.size());
-  std::vector<uint32_t> ginfo(ng * 4, 0);
-  size_t q_off = 0, sym_bytes = 0, fc_words = 0;
-  for (size_t g = 0; g < groups.size(); ++g) {
-    uint32_t shift = groups[g].lit_ctx_shift;
-    ginfo[g * 4 + 0] = (uint32_t)q_off;
-    ginfo[g * 4 + 1] = (uint32_t)sym_bytes;
-    ginfo[g * 4 + 2] = (uint32_t)fc_words;
-    ginfo[g * 4 + 3] = shift;
-    q_off += group_quant_bytes(groups[g]);
-    sym_bytes += group_sym_bytes(shift);
-    fc_words += (size_t)quant_bytes(lit_ctx_count(shift));
-  }
-  if (sym_bytes > UINT32_MAX || fc_words * 4 > UINT32_MAX ||
-      !alloc_buf(gt->info, ginfo.size() * 4, false) || !alloc_buf(gt->sym, sym_bytes, false) ||
-      !alloc_buf(gt->fc, fc_words * 4, false) || !alloc_buf(gt->q, tables.size(), false)) {
-    std::fprintf(stderr, "gpusqz: out of GPU memory expanding table groups\n");
-    std::exit(1);
-  }
-  if (groups.empty()) return gt;
-
-  auto host = alloc_host(ginfo.size() * 4 + tables.size());
-  if (!host) {
-    std::fprintf(stderr, "gpusqz: out of host memory expanding table groups\n");
-    std::exit(1);
-  }
-  std::memcpy(host->p, ginfo.data(), ginfo.size() * 4);
-  std::memcpy(host->p + ginfo.size() * 4, tables.data(), tables.size());
-  VkDescriptorPool pool = make_pool(kDecompressBindings);
-  VkDescriptorSet set = make_set(pool, decompress_dsl);
-  bind(set, 9, gt->info);
-  bind(set, 10, gt->sym);
-  bind(set, 11, gt->fc);
-  bind(set, 12, gt->q);
-  {
-    VkStreamImpl st(this);
-    const Buf& h = static_cast<VkHostBuf&>(*host).buf;
-    st.copy(h, 0, gt->info, 0, ginfo.size() * 4);
-    st.copy(h, ginfo.size() * 4, gt->q, 0, tables.size());
-    // Unused contexts and groups with no LzRans chunks have all-zero
-    // counts, which leave their tables zero: what flags a corrupt chunk
-    // decoding against one.
-    st.zero(gt->sym);
-    st.zero(gt->fc);
-    DecompressPc pc{0, (uint32_t)groups.size(), 0};
-    st.dispatch(expand_tables, decompress_pl, set, &pc, sizeof(pc), (uint32_t)groups.size());
-    if (!st.wait_value(st.submit(-1))) vk_die(VK_ERROR_DEVICE_LOST, "expand group tables");
-  }
-  vkDestroyDescriptorPool(dev, pool, nullptr);
-  return gt;
 }
 
 // Every usable device, best first: GPUSQZ_VK_DEVICE=<index into

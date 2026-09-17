@@ -1,6 +1,8 @@
 // The CUDA backend: NVIDIA GPUs, with the kernels in kernels.cu.
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <cuda_runtime.h>
 
@@ -174,22 +176,26 @@ class CudaCompressSet : public CompressSet {
   DevBuf<uint8_t> d_rans_q_;
 };
 
-struct CudaGroupTables : GroupTables {
-  DevBuf<uint8_t> tables;   // every group's expanded tables
-  DevBuf<uint64_t> offsets; // byte offset of group g's region in `tables`
-  DevBuf<uint32_t> shift;   // group g's literal-context rule
-};
-
 class CudaDecompressSet : public DecompressSet {
  public:
-  bool alloc(uint32_t batch, uint32_t chunk_size) {
+  bool alloc(uint32_t batch, uint32_t chunk_size, const TableCapacity& tables) {
     chunk_size_ = chunk_size;
     uint32_t slot_stride = worst_case_size(chunk_size);
+    // Quantised counts and expanded tables are both linear in groups and
+    // contexts (rans_codes.h's quant_bytes, rans.cuh's group_table_bytes),
+    // so the capacity's two maxima bound any batch's total.
+    max_groups_ = std::max<uint32_t>(1, tables.groups);
+    max_q_ = max_groups_ * (size_t)quant_bytes(0) + tables.contexts * (size_t)kLitSyms;
+    size_t per_ctx = (rans_group_table_bytes(4) - rans_group_table_bytes(8)) / 15; // 16 contexts vs 1
+    max_tables_ = max_groups_ * (rans_group_table_bytes(8) - per_ctx) + tables.contexts * per_ctx;
     return h_in_offsets_.alloc(batch) && h_in_lens_.alloc(batch) && h_out_lens_.alloc(batch) &&
            h_group_id_.alloc(batch) && d_in_.alloc((size_t)batch * slot_stride) &&
            d_out_.alloc((size_t)batch * chunk_size) && d_scratch_.alloc((size_t)batch * scratch_bytes(chunk_size)) &&
            d_in_offsets_.alloc(batch) && d_in_lens_.alloc(batch) && d_out_lens_.alloc(batch) &&
-           d_group_id_.alloc(batch) && d_err_.alloc(1);
+           d_group_id_.alloc(batch) && d_err_.alloc(1) && h_q_.alloc(max_q_) && h_q_off_.alloc(max_groups_) &&
+           h_table_off_.alloc(max_groups_) && h_shift_.alloc(max_groups_) && d_q_.alloc(max_q_) &&
+           d_q_off_.alloc(max_groups_) && d_table_off_.alloc(max_groups_) && d_shift_.alloc(max_groups_) &&
+           d_tables_.alloc(max_tables_);
   }
 
   Stream& stream() override { return stream_; }
@@ -205,18 +211,25 @@ class CudaDecompressSet : public DecompressSet {
     check(cudaMemcpyAsync(d_in_.p + off, src.p, len, cudaMemcpyHostToDevice, stream_.s), "H2D input");
   }
 
-  void launch(const GroupTables& tables, HostBuf& err, size_t err_off) override {
+  void launch(const TableWindow& tables, HostBuf& err, size_t err_off) override {
     cudaStream_t st = stream_.s;
     size_t bytes = n_ * sizeof(uint32_t);
     check(cudaMemcpyAsync(d_in_offsets_.p, h_in_offsets_.p, bytes, cudaMemcpyHostToDevice, st), "H2D offsets");
     check(cudaMemcpyAsync(d_in_lens_.p, h_in_lens_.p, bytes, cudaMemcpyHostToDevice, st), "H2D lens");
     check(cudaMemcpyAsync(d_out_lens_.p, h_out_lens_.p, bytes, cudaMemcpyHostToDevice, st), "H2D out_lens");
     check(cudaMemcpyAsync(d_group_id_.p, h_group_id_.p, bytes, cudaMemcpyHostToDevice, st), "H2D group_id");
+    size_t table_bytes = upload_tables(tables);
     check(cudaEventRecord(h2d_done_.e, st), "cudaEventRecord");
+    // Unused contexts and groups with no LzRans chunks have all-zero
+    // counts, which leave their tables untouched; zeroing first makes those
+    // zero frequencies (what flags a corrupt chunk using one) rather than
+    // whatever the previous batch left.
+    check(cudaMemsetAsync(d_tables_.p, 0, table_bytes, st), "zero group tables");
+    launch_expand_group_tables(d_q_.p, d_q_off_.p, d_table_off_.p, d_shift_.p, tables.count, d_tables_.p, st);
+    check(cudaGetLastError(), "expand_group_tables launch");
     check(cudaMemsetAsync(d_err_.p, 0, sizeof(uint32_t), st), "clear error flag");
-    const auto& gt = static_cast<const CudaGroupTables&>(tables);
     launch_decompress(d_in_.p, d_in_offsets_.p, n_, d_in_lens_.p, d_out_.p, chunk_size_, d_out_lens_.p,
-                      d_scratch_.p, gt.tables.p, gt.offsets.p, gt.shift.p, d_group_id_.p, d_err_.p, st);
+                      d_scratch_.p, d_tables_.p, d_table_off_.p, d_shift_.p, d_group_id_.p, d_err_.p, st);
     check(cudaGetLastError(), "decompress_kernel launch");
     check(cudaMemcpyAsync(err.p + err_off, d_err_.p, sizeof(uint32_t), cudaMemcpyDeviceToHost, st), "D2H err");
   }
@@ -226,13 +239,46 @@ class CudaDecompressSet : public DecompressSet {
   }
 
  private:
+  // Stages the window's counts and its groups' offsets and rules, and
+  // queues their upload. Each group's counts and expanded tables vary in
+  // size with its literal-context rule, so both are located by offset.
+  // Returns the window's expanded table bytes.
+  size_t upload_tables(const TableWindow& w) {
+    uint64_t q = 0, t = 0;
+    for (uint32_t g = 0; g < w.count; ++g) {
+      h_q_off_.p[g] = q;
+      h_table_off_.p[g] = t;
+      h_shift_.p[g] = w.groups[g].lit_ctx_shift;
+      q += group_quant_bytes(w.groups[g]);
+      t += rans_group_table_bytes(w.groups[g].lit_ctx_shift);
+    }
+    if (w.count > max_groups_ || q > max_q_ || t > max_tables_) {
+      std::fprintf(stderr, "gpusqz: internal error: a decode batch's tables exceed its set's capacity\n");
+      std::exit(1);
+    }
+    cudaStream_t st = stream_.s;
+    std::memcpy(h_q_.p, w.quant, q);
+    check(cudaMemcpyAsync(d_q_.p, h_q_.p, q, cudaMemcpyHostToDevice, st), "H2D tables");
+    check(cudaMemcpyAsync(d_q_off_.p, h_q_off_.p, w.count * sizeof(uint64_t), cudaMemcpyHostToDevice, st),
+          "H2D q offsets");
+    check(cudaMemcpyAsync(d_table_off_.p, h_table_off_.p, w.count * sizeof(uint64_t), cudaMemcpyHostToDevice, st),
+          "H2D table offsets");
+    check(cudaMemcpyAsync(d_shift_.p, h_shift_.p, w.count * sizeof(uint32_t), cudaMemcpyHostToDevice, st),
+          "H2D shifts");
+    return t;
+  }
+
   CudaStream stream_;
   CudaEvent h2d_done_{false};
-  uint32_t chunk_size_ = 0, n_ = 0;
+  uint32_t chunk_size_ = 0, n_ = 0, max_groups_ = 0;
+  size_t max_q_ = 0, max_tables_ = 0;
   bool used_ = false;
-  PinBuf<uint32_t> h_in_offsets_, h_in_lens_, h_out_lens_, h_group_id_;
-  DevBuf<uint8_t> d_in_, d_out_, d_scratch_;
-  DevBuf<uint32_t> d_in_offsets_, d_in_lens_, d_out_lens_, d_group_id_, d_err_;
+  PinBuf<uint32_t> h_in_offsets_, h_in_lens_, h_out_lens_, h_group_id_, h_shift_;
+  PinBuf<uint64_t> h_q_off_, h_table_off_;
+  PinBuf<uint8_t> h_q_;
+  DevBuf<uint8_t> d_in_, d_out_, d_scratch_, d_q_, d_tables_;
+  DevBuf<uint32_t> d_in_offsets_, d_in_lens_, d_out_lens_, d_group_id_, d_err_, d_shift_;
+  DevBuf<uint64_t> d_q_off_, d_table_off_;
 };
 
 class CudaBackend : public Backend {
@@ -298,54 +344,11 @@ class CudaBackend : public Backend {
     return s;
   }
 
-  std::unique_ptr<DecompressSet> create_decompress_set(uint32_t batch, uint32_t chunk_size) override {
+  std::unique_ptr<DecompressSet> create_decompress_set(uint32_t batch, uint32_t chunk_size,
+                                                       const TableCapacity& tables) override {
     auto s = std::make_unique<CudaDecompressSet>();
-    if (!s->alloc(batch, chunk_size)) return nullptr;
+    if (!s->alloc(batch, chunk_size, tables)) return nullptr;
     return s;
-  }
-
-  // Each group's quantised counts and expanded tables vary in size with its
-  // literal-context rule, so both are located by offset.
-  std::unique_ptr<GroupTables> load_group_tables(const std::vector<TableGroup>& groups,
-                                                 const std::vector<uint8_t>& tables) override {
-    auto gt = std::make_unique<CudaGroupTables>();
-    if (groups.empty()) return gt;
-    std::vector<uint64_t> q_off(groups.size()), table_off(groups.size());
-    std::vector<uint32_t> shift(groups.size());
-    uint64_t q_total = 0, table_bytes = 0;
-    for (size_t g = 0; g < groups.size(); ++g) {
-      q_off[g] = q_total;
-      table_off[g] = table_bytes;
-      shift[g] = groups[g].lit_ctx_shift;
-      q_total += group_quant_bytes(groups[g]);
-      table_bytes += rans_group_table_bytes(shift[g]);
-    }
-    DevBuf<uint8_t> d_q;
-    DevBuf<uint64_t> d_q_off;
-    if (!d_q.alloc(tables.size()) || !d_q_off.alloc(groups.size()) || !gt->offsets.alloc(groups.size()) ||
-        !gt->shift.alloc(groups.size()) || !gt->tables.alloc(table_bytes)) {
-      std::fprintf(stderr, "gpusqz: out of GPU memory expanding table groups\n");
-      std::exit(1);
-    }
-    CudaStream st;
-    check(cudaMemcpyAsync(d_q.p, tables.data(), tables.size(), cudaMemcpyHostToDevice, st.s), "H2D tables");
-    check(cudaMemcpyAsync(d_q_off.p, q_off.data(), q_off.size() * sizeof(uint64_t), cudaMemcpyHostToDevice, st.s),
-          "H2D q offsets");
-    check(cudaMemcpyAsync(gt->offsets.p, table_off.data(), table_off.size() * sizeof(uint64_t),
-                          cudaMemcpyHostToDevice, st.s),
-          "H2D table offsets");
-    check(cudaMemcpyAsync(gt->shift.p, shift.data(), shift.size() * sizeof(uint32_t), cudaMemcpyHostToDevice, st.s),
-          "H2D shifts");
-    // Unused contexts and groups with no LzRans chunks have all-zero
-    // counts, which leave their tables untouched; zeroing first makes those
-    // zero frequencies (what flags a corrupt chunk using one) rather than
-    // whatever cudaMalloc happened to hand back.
-    check(cudaMemsetAsync(gt->tables.p, 0, table_bytes, st.s), "zero group tables");
-    launch_expand_group_tables(d_q.p, d_q_off.p, gt->offsets.p, gt->shift.p, (uint32_t)groups.size(),
-                               gt->tables.p, st.s);
-    check(cudaGetLastError(), "expand_group_tables launch");
-    check(cudaStreamSynchronize(st.s), "expand_group_tables sync");
-    return gt;
   }
 
  private:

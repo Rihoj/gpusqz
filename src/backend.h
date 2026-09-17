@@ -35,9 +35,21 @@ struct Event {
   virtual ~Event() = default;
 };
 
-// A decompression's expanded rANS tables, one region per TableGroup.
-struct GroupTables {
-  virtual ~GroupTables() = default;
+// The most tables one decompress batch touches: its TableGroups and their
+// literal contexts summed (lit_ctx_count). Both backends' expanded tables
+// are linear in the two, so these bound a set's table memory.
+struct TableCapacity {
+  uint32_t groups = 0;
+  uint64_t contexts = 0;
+};
+
+// One decompress batch's tables: its TableGroups in order (count of them,
+// within the set's TableCapacity) and their quantised counts back to back.
+// The batch's group_id[] indexes these, 0-based.
+struct TableWindow {
+  const TableGroup* groups;
+  uint32_t count;
+  const uint8_t* quant;
 };
 
 // Device memory and kernels for one compress batch of up to `batch` chunks.
@@ -73,15 +85,16 @@ class DecompressSet {
     uint32_t* in_offsets; // chunk c's data within the batch input
     uint32_t* in_lens;    // its compressed size
     uint32_t* out_lens;   // its original size
-    uint32_t* group_id;   // its TableGroup
+    uint32_t* group_id;   // its TableGroup, as an index into launch()'s TableWindow
   };
   virtual ~DecompressSet() = default;
   virtual Stream& stream() = 0;
   virtual Inputs begin(uint32_t n) = 0;
   virtual void upload_input(uint64_t off, HostBuf& src, size_t len) = 0;
-  // Queues the kernel, then a download of its error flag (nonzero: some
-  // chunk was malformed) to err->p + err_off.
-  virtual void launch(const GroupTables& tables, HostBuf& err, size_t err_off) = 0;
+  // Queues the expansion of the batch's tables and the kernel, then a
+  // download of its error flag (nonzero: some chunk was malformed) to
+  // err->p + err_off.
+  virtual void launch(const TableWindow& tables, HostBuf& err, size_t err_off) = 0;
   // Chunk c's output is at byte c * chunk_size.
   virtual void download_output(uint64_t off, HostBuf& dst, size_t len) = 0;
 };
@@ -108,11 +121,10 @@ class Backend {
   virtual size_t decompress_bytes_per_chunk(uint32_t chunk_size) = 0;
   // Null if the memory isn't available.
   virtual std::unique_ptr<CompressSet> create_compress_set(uint32_t batch, uint32_t chunk_size) = 0;
-  virtual std::unique_ptr<DecompressSet> create_decompress_set(uint32_t batch, uint32_t chunk_size) = 0;
-  // Expands every group's quantised counts (the file's table section, in
-  // group order); blocks until done.
-  virtual std::unique_ptr<GroupTables> load_group_tables(const std::vector<TableGroup>& groups,
-                                                         const std::vector<uint8_t>& tables) = 0;
+  // A decompress set also holds the expanded tables of up to `tables` at
+  // once, rebuilt for each batch, so table memory doesn't grow with the file.
+  virtual std::unique_ptr<DecompressSet> create_decompress_set(uint32_t batch, uint32_t chunk_size,
+                                                               const TableCapacity& tables) = 0;
 };
 
 // Each returns null, with the reason in *why, if that API or a usable
