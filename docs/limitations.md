@@ -49,10 +49,12 @@
 
 - **Ratio vs zstd.** The `ratio` profile now edges `zstd -3` on both
   benchmark corpora (0.1% and 0.6% smaller), but zstd's parser is still
-  the more sophisticated one, and `zstd -19` is far out of reach. An
-  optimal parser, a second longer-key hash table (zstd's dfast, which is
-  what levels 3–4 use), or a match finder with longer chains would be the
-  next ratio levers. A third lazy step and a 64-byte probe cap were
+  the more sophisticated one, and `zstd -19` is far out of reach. Pricing
+  the lazy parse in bits took 0.2–1.5%; a second longer-key hash table
+  (zstd's dfast) works but doubles hash-table traffic, which match-poor
+  data pays dearly for, so it is parked for an opt-in slower profile. A
+  full optimal parser or longer match chains are the levers left. A third
+  lazy step and a 64-byte probe cap were
   measured and did nothing useful (see [Measured and
   rejected](performance-history.md#measured-and-rejected)).
 - **Literal-context choice is per table group, estimated from the

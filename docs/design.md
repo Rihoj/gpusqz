@@ -36,8 +36,14 @@ history](performance-history.md#sizing-the-match-finder-table).
 
 The window's matches are selected warp-uniformly from a ballot mask with
 a lazy lookahead of up to `kLazySteps` (2) positions — take position
-*i+1*'s match instead if it's clearly longer, then *i+2* — which zstd calls
-"lazy2". Matches that hit the 32-byte probe cap are extended
+*i+1*'s match instead if it is worth more, then *i+2* — which zstd calls
+"lazy2". "Worth more" is priced in bits (`match_gain`): what a match saves
+against coding the same bytes as literals, counting its length and offset
+symbols at about 5 bits each plus the offset's `floor(log2 off)` raw bits,
+which a repeat offset doesn't pay. Deferring costs one literal, so the
+next position must save more than that. Comparing lengths alone made the
+parse take far offsets over cheap repeats; pricing them is 0.2–1.5%
+smaller at no measurable kernel cost. Matches that hit the 32-byte probe cap are extended
 cooperatively, 32 bytes per step, so long runs never serialise on one
 lane.
 
