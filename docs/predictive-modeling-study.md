@@ -225,6 +225,51 @@ None of this is measured. It is the reasoning for what to test next.
   index per chunk, like today's match finder, but only for predictions,
   not a parse.
 
+## The GPU prototype (2026-09-19)
+
+Recommendation 2 below, carried out. `study/predictive/cm_gpu.cu` runs the
+32-lane lockstep model on the GPU: one warp per chunk, the chunk split
+into 32 segments coded in lockstep, all sharing one model in global
+memory, with an integer mixer and every cross-lane update applied in lane
+order after a sync. It is deliberately **optimistic**: it has the six
+context orders but no word model, no match model and no arithmetic coder,
+and it measures predict + update for every bit, which is what decode does.
+A real codec would be slower than these figures, not faster.
+
+RTX 5060 Ti, idle, enwik8:
+
+| chunk, slots | model per chunk | in flight | throughput | prototype ratio |
+|---|---|---|---|---|
+| 64KB, 2^16 | 1.58MB | 256–1525 | **26–33 MB/s** | 0.4176 |
+| 1MB, 2^18 | 6.3MB | 64–95 | 11–13 MB/s | 0.3935 |
+| 1MB, 2^22 | 101MB | 32 | **5.6 MB/s** | 0.3556 |
+
+(The prototype's own ratios are worse than this study's CPU model — 0.3251
+at 64KB/2^16 — because it drops the word and match models. The CPU figures
+are the ones to compare against other codecs; the GPU figures are the
+speed.)
+
+**The verdict is no-go, and the two ends of the table say why.** The
+configuration that is fast (64KB chunks, a model small enough to keep
+hundreds of warps busy) compresses to 0.3251, while `zstd -19` reaches
+0.2650 on the same file. The configuration that matches `zstd -19` on
+ratio (1MB chunks, 2^22 slots, 0.2594) needs 101MB of model per chunk, so
+only ~32 chunks fit in flight and the GPU runs at 5.6 MB/s — against
+`zstd -19`'s 1–3 MB/s on one core, before adding back the word model, the
+match model and the coder. Two to five times a single CPU core is not what
+a GPU is for, and it is not the "clearly beats" the go/no-go asked for.
+
+Decode settles it. This model is symmetric: decode runs at the same
+5–30 MB/s, where gpusqz decodes at 3–4 GB/s and `zstd -19`'s output
+decodes at hundreds of MB/s. A profile that compresses 15% smaller than
+today's `speed` and decodes 100x slower is not a trade this codec should
+offer.
+
+What would change the answer: a model whose state fits in tens of KB per
+chunk (so thousands of chunks stay in flight) and still codes near 0.26.
+Nothing in this study's table does that — ratio tracked model size across
+every configuration measured.
+
 ## Recommendation
 
 1. **Don't pursue better literal models on top of LZ.** What today's

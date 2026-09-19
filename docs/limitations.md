@@ -63,6 +63,14 @@
   occasionally carry 16 or 256 tables that few of its chunks use. The cost is bounded
   by the coded table bytes, which are about a tenth of the 4KB or 66KB
   the raw counts would take (see [Design](design.md#container-format)).
+- **Every chunk starts with no history.** A 64KB chunk cannot match
+  anything before it, which is what makes gpusqz's chunks independent and
+  its decode parallel. Measured on the same chunking, a trained dictionary
+  recovers 6.4–12.4% on varied text and 2.1–2.3% on binaries (see
+  [Trained external dictionaries](compression-survey.md#34-trained-external-dictionaries)).
+  Taking it would mean a format change (offsets reaching into the
+  dictionary), a way to ship or store the dictionary, and priming each
+  chunk's hash table.
 - **No format-aware transforms.** gpusqz codes every file as a plain byte
   stream. On real binary STL meshes, a per-chunk transform storing each
   normal as its difference from one recomputed from the vertices made
