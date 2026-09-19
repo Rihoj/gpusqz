@@ -64,13 +64,15 @@
   by the coded table bytes, which are about a tenth of the 4KB or 66KB
   the raw counts would take (see [Design](design.md#container-format)).
 - **No format-aware transforms.** gpusqz codes every file as a plain byte
-  stream. On binary STL meshes, a bit-exact per-chunk transform (storing
-  each normal as its difference from one recomputed from the vertices,
-  plus a per-chunk table of distinct vertices) made `ratio` output 1.5–3.3x
-  smaller than on the untransformed file, and fits inside chunk
-  independence. It
-  would be format 3. See the [Format-aware transforms
-  study](format-aware-transforms-study.md).
+  stream. On real binary STL meshes, a per-chunk transform storing each
+  normal as its difference from one recomputed from the vertices made
+  `ratio` output 1.68–2.20x smaller on three of five, but 2.1x *larger* on
+  a mesh whose normals don't reproduce. It is blocked for a second reason:
+  the decoder would have to recompute those normals bit-identically on
+  every backend, and Vulkan guarantees no such thing for floating point —
+  not even for `a + b`, and Apple has no doubles at all. Anything the
+  decoder recomputes has to be integer. See the [Format-aware transforms
+  study](format-aware-transforms-study.md#the-blocker-floats-cant-be-recomputed-portably-2026-09-19).
 
 ## Format and robustness
 
