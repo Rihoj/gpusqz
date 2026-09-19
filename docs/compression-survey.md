@@ -310,6 +310,27 @@ They affect ratio more than speed.
   - Dictionaries have to be distributed and versioned, and they go stale as
     the data drifts.
   - There is "no universal dictionary".
+- **Measured for gpusqz (2026-09-19):** the shape that matters here is
+  gpusqz's: independent 64KB chunks, each starting with no history. Each
+  corpus was split into 64KB chunks, a dictionary trained on every tenth
+  chunk (`zstd --train`), and the *other* chunks compressed with and
+  without it, so no chunk trains on itself:
+
+  | corpus | dictionary | `zstd -3` | `zstd -19` |
+  |---|---|---|---|
+  | 43MB of `/usr/include` headers | 110KB | **6.35%** smaller | **11.35%** |
+  | enwik8 | 110KB | **7.54%** | **12.37%** |
+  | 50MB of `/usr/lib` binaries | 15KB (the trainer's choice) | 2.11% | 2.25% |
+
+  Those are large gains by this codec's standards, and they are what a
+  first chunk would otherwise throw away. Two caveats before believing the
+  exact figures for gpusqz: a zstd dictionary carries entropy tables as
+  well as content, and gpusqz already builds its own tables per table
+  group, so part of the measured gain is not available to it; and the
+  dictionary has to be stored or shipped (110KB is 0.26% of a 43MB file,
+  but it dwarfs a small one). The cost side is a format change (match
+  offsets reaching before the chunk start), and priming every chunk's hash
+  table, which costs compress-kernel occupancy.
 - **Sources:** <https://raw.githubusercontent.com/facebook/zstd/dev/lib/zdict.h>,
   <https://engineering.fb.com/2018/12/19/core-infra/zstandard/>,
   <https://github.com/lz4/lz4/releases/tag/v1.10.0>
