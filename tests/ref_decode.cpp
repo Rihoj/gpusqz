@@ -309,6 +309,14 @@ int main(int argc, char** argv) {
     fail("chunk table doesn't match the header");
   }
 
+  // Each chunk's payload checksum (format.h), checked before the payload is
+  // decoded: that is what catches a corrupted byte which would still decode.
+  if ((uint64_t)h.chunk_count * 4 > file_bytes) fail("truncated chunk checksums");
+  std::vector<uint32_t> hashes(h.chunk_count);
+  if (h.chunk_count && std::fread(hashes.data(), 4, h.chunk_count, in) != h.chunk_count) {
+    fail("truncated chunk checksums");
+  }
+
   if ((uint64_t)h.table_group_count * sizeof(TableGroup) > file_bytes) fail("truncated table group directory");
   std::vector<TableGroup> groups(h.table_group_count);
   if (h.table_group_count &&
@@ -327,6 +335,7 @@ int main(int argc, char** argv) {
     if (!lit_shift_valid(g.lit_ctx_shift)) fail("bad lit_ctx_shift");
     std::vector<uint8_t> coded(g.table_bytes), q(group_quant_bytes(g));
     if (std::fread(coded.data(), 1, coded.size(), in) != coded.size()) fail("truncated table section");
+    if (chunk_hash(coded.data(), coded.size()) != g.checksum) fail("corrupt table section: bad checksum");
     if (!decode_table_counts(coded.data(), coded.size(), q.data(), q.size())) fail("corrupt table section");
     tables.emplace_back(q.data(), lit_ctx_count(g.lit_ctx_shift));
     coded_total += g.table_bytes;
@@ -358,6 +367,7 @@ int main(int argc, char** argv) {
     cbuf.resize(e.compressed_size);
     if (!file_seek(in, payload_start + e.offset)) fail("seek failed");
     if (std::fread(cbuf.data(), 1, e.compressed_size, in) != e.compressed_size) fail("short payload read");
+    if (chunk_hash(cbuf.data(), cbuf.size()) != hashes[c]) fail("corrupt chunk: bad checksum");
 
     bool ok = false;
     switch ((ChunkFlag)cbuf[0]) {

@@ -74,10 +74,6 @@
 
 ## Format and robustness
 
-- **No integrity check.** Structural corruption (bad offsets, sizes,
-  truncation, invalid rANS streams) is detected, but the format has no
-  checksum, so a corrupted literal or table byte that still decodes
-  consistently produces wrong output silently.
 - **No streaming API** — it's a file-in, file-out CLI, and output must be
   seekable (the header is patched at the end).
 - Match offsets are 32-bit, but chunks are capped at 1MB by policy

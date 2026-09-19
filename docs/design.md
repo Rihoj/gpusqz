@@ -160,14 +160,26 @@ batch no longer needs), so the download moves only compressed bytes.
 `src/format.h`:
 
 ```
-FileHeader   { magic="GSQZ", version=2, chunk_size, original_size,
+FileHeader   { magic="GSQZ", version=3, chunk_size, original_size,
                chunk_count, table_group_count, tables_offset }
 u32[]        -- one compressed size per chunk, flag byte included
-TableGroup[] { start_chunk, chunk_count, lit_ctx_shift, table_bytes }
+u32[]        -- one checksum per chunk, over those same bytes
+TableGroup[] { start_chunk, chunk_count, lit_ctx_shift, table_bytes, checksum }
              -- one per kGroupBytes of input
 payload      -- each chunk: [flag: Raw | Lz | LzRans] [data]
 tables       -- at tables_offset: each group's coded counts, in group order
 ```
+
+Every stored byte is covered by a 32-bit checksum (`chunk_hash` in
+`format.h`): each chunk's payload by its entry in the checksum array, each
+group's coded counts by `TableGroup::checksum`. The decoders check a chunk
+before decoding it and a group's counts before expanding them, which is
+what catches a corrupted literal, table or length byte that would
+otherwise decode into plausible but wrong output. The hash splits the
+bytes over 32 lanes (lane *l* takes *l*, *l+32*, ...) and folds the lane
+results in order, so a warp, a workgroup and a plain loop all agree. It
+costs 4 bytes per chunk and no measurable time on either side: the bytes
+are already in cache where they are hashed.
 
 The directory stores only each chunk's compressed size: chunks lie back
 to back, so a chunk's offset is the sum of the sizes before it, and every

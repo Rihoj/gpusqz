@@ -376,8 +376,8 @@ struct DecompressPc {
   uint32_t chunk_size, chunk_count, max_seq;
 };
 constexpr uint32_t kPcBytes = 32;
-constexpr uint32_t kCompressBindings = 16;
-constexpr uint32_t kDecompressBindings = 13;
+constexpr uint32_t kCompressBindings = 17;
+constexpr uint32_t kDecompressBindings = 14;
 
 uint32_t max_sequences(uint32_t chunk_size) { return chunk_size / kMinMatch + 1; }
 int hash_bits_for(uint32_t chunk_size) { // as kernels.h's hash_table_bits
@@ -1010,20 +1010,22 @@ class VkCompressSet : public CompressSet {
               be_->alloc_buf(htab_, b * hash_bytes_for(chunk_size), false) &&
               be_->alloc_buf(n_seq_, b * 4, false) && be_->alloc_buf(n_lit_, b * 4, false) &&
               be_->alloc_buf(cnt_, tab_ * 4, false) && be_->alloc_buf(fc_, tab_ * 4, false) &&
-              be_->alloc_buf(q_, tab_, false) && be_->alloc_buf(shift_, (size_t)max_groups_ * 4, false);
+              be_->alloc_buf(q_, tab_, false) && be_->alloc_buf(shift_, (size_t)max_groups_ * 4, false) &&
+              be_->alloc_buf(hash_, b * 4, false);
     if (!ok) return false;
     h_lens_ = be_->alloc_host(b * 4);
     // Results: sizes, offsets, shift, q.
     meta_sizes_ = 0;
     meta_offsets_ = b * 4;
-    meta_shift_ = meta_offsets_ + (b + 1) * 4;
+    meta_hashes_ = meta_offsets_ + (b + 1) * 4;
+    meta_shift_ = meta_hashes_ + b * 4;
     meta_q_ = meta_shift_ + (size_t)max_groups_ * 4;
     h_meta_ = be_->alloc_host(meta_q_ + tab_);
     if (!h_lens_ || !h_meta_) return false;
     pool_ = be_->make_pool(kCompressBindings);
     set_ = be_->make_set(pool_, be_->compress_dsl);
     const Buf* bufs[kCompressBindings] = {&in_, &in_lens_, &slots_, &start_, &sizes_, &offsets_, &seqs_, &rep_,
-                                          &lits_, &htab_, &n_seq_, &n_lit_, &cnt_, &fc_, &q_, &shift_};
+                                          &lits_, &htab_, &n_seq_, &n_lit_, &cnt_, &fc_, &q_, &shift_, &hash_};
     for (uint32_t i = 0; i < kCompressBindings; ++i) be_->bind(set_, i, *bufs[i]);
     return true;
   }
@@ -1061,6 +1063,7 @@ class VkCompressSet : public CompressSet {
     const Buf& h = static_cast<VkHostBuf&>(*h_meta_).buf;
     st.copy(sizes_, 0, h, meta_sizes_, (VkDeviceSize)n_ * 4);
     st.copy(offsets_, 0, h, meta_offsets_, (VkDeviceSize)(n_ + 1) * 4);
+    st.copy(hash_, 0, h, meta_hashes_, (VkDeviceSize)n_ * 4);
     st.copy(shift_, 0, h, meta_shift_, (VkDeviceSize)groups_ * 4);
     st.copy(q_, 0, h, meta_q_, (VkDeviceSize)groups_ * kMaxQuantBytes);
     be_->record(meta_, st);
@@ -1071,6 +1074,7 @@ class VkCompressSet : public CompressSet {
     if (!be_->wait(meta_, &why)) vk_die(VK_ERROR_DEVICE_LOST, "wait for chunk sizes");
   }
   const uint32_t* sizes() override { return reinterpret_cast<const uint32_t*>(h_meta_->p + meta_sizes_); }
+  const uint32_t* hashes() override { return reinterpret_cast<const uint32_t*>(h_meta_->p + meta_hashes_); }
   uint32_t packed_bytes() override { return reinterpret_cast<const uint32_t*>(h_meta_->p + meta_offsets_)[n_]; }
   uint32_t group_count() override { return groups_; }
   uint32_t lit_shift(uint32_t g) override {
@@ -1089,9 +1093,9 @@ class VkCompressSet : public CompressSet {
   uint32_t chunk_size_ = 0, slot_stride_ = 0, max_seq_ = 0, n_ = 0;
   uint32_t group_chunks_ = 0, max_groups_ = 0, groups_ = 0;
   size_t tab_ = 0; // kMaxQuantBytes entries per group, in cnt_, fc_ and q_
-  size_t meta_sizes_ = 0, meta_offsets_ = 0, meta_shift_ = 0, meta_q_ = 0;
+  size_t meta_sizes_ = 0, meta_offsets_ = 0, meta_hashes_ = 0, meta_shift_ = 0, meta_q_ = 0;
   Buf in_, in_lens_, slots_, start_, sizes_, offsets_, seqs_, rep_, lits_, htab_, n_seq_, n_lit_, cnt_, fc_, q_,
-      shift_;
+      shift_, hash_;
   std::unique_ptr<HostBuf> h_lens_, h_meta_;
   VkDescriptorPool pool_ = VK_NULL_HANDLE;
   VkDescriptorSet set_ = VK_NULL_HANDLE;
@@ -1122,18 +1126,20 @@ class VkDecompressSet : public DecompressSet {
     bool ok =be_->alloc_buf(in_, b * worst_case_size(chunk_size), false) &&
               be_->alloc_buf(in_offsets_, b * 4, false) && be_->alloc_buf(in_lens_, b * 4, false) &&
               be_->alloc_buf(out_lens_, b * 4, false) && be_->alloc_buf(group_id_, b * 4, false) &&
+              be_->alloc_buf(hash_, b * 4, false) &&
               be_->alloc_buf(out_, b * chunk_size, false) && be_->alloc_buf(seqs_, b * max_seq_ * 8, false) &&
               be_->alloc_buf(lits_, b * ((chunk_size + 3) & ~3u), false) && be_->alloc_buf(err_, 4, false) &&
               be_->alloc_buf(ginfo_, (size_t)max_groups_ * 16, false) && be_->alloc_buf(gsym_, max_sym_, false) &&
               be_->alloc_buf(gfc_, max_q_ * 4, false) && be_->alloc_buf(gq_, max_q_, false);
     if (!ok) return false;
-    h_in_ = be_->alloc_host(b * 16);
+    h_in_ = be_->alloc_host(b * 20);
     h_tab_ = be_->alloc_host((size_t)max_groups_ * 16 + max_q_);
     if (!h_in_ || !h_tab_) return false;
     pool_ = be_->make_pool(kDecompressBindings);
     set_ = be_->make_set(pool_, be_->decompress_dsl);
-    const Buf* bufs[kDecompressBindings] = {&in_,  &in_offsets_, &in_lens_, &out_lens_, &group_id_, &out_, &seqs_,
-                                            &lits_, &err_,       &ginfo_,   &gsym_,     &gfc_,      &gq_};
+    const Buf* bufs[kDecompressBindings] = {&in_,   &in_offsets_, &in_lens_, &out_lens_, &group_id_,
+                                            &out_,  &seqs_,       &lits_,    &err_,      &ginfo_,
+                                            &gsym_, &gfc_,        &gq_,      &hash_};
     for (uint32_t i = 0; i < kDecompressBindings; ++i) be_->bind(set_, i, *bufs[i]);
     return true;
   }
@@ -1147,7 +1153,7 @@ class VkDecompressSet : public DecompressSet {
       if (!be_->wait(done_, &why)) vk_die(VK_ERROR_DEVICE_LOST, "wait for set");
     }
     auto* h = reinterpret_cast<uint32_t*>(h_in_->p);
-    return Inputs{h, h + batch_, h + 2 * (size_t)batch_, h + 3 * (size_t)batch_};
+    return Inputs{h, h + batch_, h + 2 * (size_t)batch_, h + 3 * (size_t)batch_, h + 4 * (size_t)batch_};
   }
 
   void upload_input(uint64_t off, HostBuf& src, size_t len) override {
@@ -1162,6 +1168,7 @@ class VkDecompressSet : public DecompressSet {
     st.copy(h, arr, in_lens_, 0, bytes);
     st.copy(h, 2 * arr, out_lens_, 0, bytes);
     st.copy(h, 3 * arr, group_id_, 0, bytes);
+    st.copy(h, 4 * arr, hash_, 0, bytes);
     expand_tables(tables);
     st.zero(err_);
     DecompressPc pc{chunk_size_, n_, max_seq_};
@@ -1214,7 +1221,7 @@ class VkDecompressSet : public DecompressSet {
   VkEventImpl done_;
   uint32_t chunk_size_ = 0, max_seq_ = 0, batch_ = 0, n_ = 0, max_groups_ = 0;
   size_t max_q_ = 0, max_sym_ = 0;
-  Buf in_, in_offsets_, in_lens_, out_lens_, group_id_, out_, seqs_, lits_, err_;
+  Buf in_, in_offsets_, in_lens_, out_lens_, group_id_, out_, seqs_, lits_, err_, hash_;
   Buf ginfo_, gsym_, gfc_, gq_; // the batch's group tables, see decompress.glsl
   std::unique_ptr<HostBuf> h_in_, h_tab_;
   VkDescriptorPool pool_ = VK_NULL_HANDLE;

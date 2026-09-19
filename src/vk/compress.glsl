@@ -24,6 +24,7 @@ layout(std430, binding = 12) buffer Cnt { uint batch_cnt[]; };
 layout(std430, binding = 13) buffer Fc { uint fc[]; };
 layout(std430, binding = 14) buffer Q { uint8_t q_out[]; };
 layout(std430, binding = 15) buffer Shift { uint lit_shift_buf[]; };
+layout(std430, binding = 16) buffer OutHash { uint out_hash[]; }; // format.h's chunk_hash per chunk
 
 layout(push_constant) uniform PC {
   uint chunk_size;

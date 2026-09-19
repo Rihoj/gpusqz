@@ -298,10 +298,15 @@ void main() {
 
   if (in_len <= 1) {
     for (uint k = lane; k < in_len; k += 32) slots[slot + 1 + k] = inb[g_in + k];
+    if (lane == 0) slots[slot] = uint8_t(kFlagRaw);
+    lg_sync(); // the bytes just written are what the hash covers
+    uint lh = kHashInit;
+    for (uint i = lane; i < 1 + in_len; i += 32) lh = hash_fold(lh, uint(slots[slot + i]));
+    uint hash = hash_combine(lh, 1 + in_len);
     if (lane == 0) {
-      slots[slot] = uint8_t(kFlagRaw);
       out_start[c] = 0;
       out_sizes[c] = 1 + in_len;
+      out_hash[c] = hash;
       n_seq_arr[c] = 0;
       n_lit_arr[c] = 0;
     }

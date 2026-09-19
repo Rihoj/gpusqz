@@ -58,6 +58,7 @@ __host__ __device__ inline size_t scratch_bytes(uint32_t chunk_size) {
 // group's histogram, encode tables, and the quantised counts stored in the
 // file.
 struct RansBatchBufs {
+  uint32_t* hash;      // per chunk: chunk_hash of its final payload bytes
   uint32_t* cnt;       // zeroed by launch_compress before parsing
   uint16_t* freq;
   uint16_t* cum;
@@ -92,7 +93,7 @@ void launch_decompress(const uint8_t* d_in, const uint32_t* d_in_offsets, uint32
                         const uint32_t* d_in_lens, uint8_t* d_out, uint32_t chunk_size,
                         const uint32_t* d_out_lens, uint8_t* d_scratch, uint8_t* d_group_tables,
                         const uint64_t* d_group_off, const uint32_t* d_group_shift, const uint32_t* d_group_id,
-                        uint32_t* d_err, cudaStream_t stream);
+                        const uint32_t* d_hash, uint32_t* d_err, cudaStream_t stream);
 
 // Bytes of one group's expanded decode tables.
 size_t rans_group_table_bytes(uint32_t lit_shift);

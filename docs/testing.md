@@ -65,6 +65,12 @@ GitHub's runners have no GPU, so the `gpu` label (CUDA) is skipped there.
   one file at several `--gpu-mem` values and compares them, with
   `GPUSQZ_FORCE_GROUP_CHUNKS` shrinking groups so a small test file still
   spans several.
+- **Checksums.** `text_badchunkhash.gszbad` flips one payload byte and
+  leaves the checksum alone: the chunk would still decode, so only the
+  checksum can reject it. `text_badtable.gszbad` does the same for a
+  group's coded counts. `text_badseq.gszbad` deliberately *recomputes* the
+  checksum after its edit, so it still exercises the rANS decoder's own
+  rejection rather than stopping at the checksum.
 - **A match-free 1MB chunk.** The extremes suite includes a 2^20-byte De
   Bruijn sequence B(32,4), in which no 4-byte string repeats. It once
   produced undecodable output, because a single literal run of exactly

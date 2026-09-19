@@ -2,6 +2,7 @@
 //
 //   FileHeader
 //   u32 compressed_size[chunk_count]  each chunk's payload bytes, flag included
+//   u32 checksum[chunk_count]         of those bytes (chunk_hash)
 //   TableGroup[table_group_count]
 //   payload: each chunk's [ChunkFlag][data], back to back in chunk order
 //   tables:  each group's quantised counts, coded by table_codec.h,
@@ -20,7 +21,7 @@
 namespace gpusqz {
 
 constexpr uint32_t kMagic = 0x5A515347; // "GSQZ" in file byte order
-constexpr uint32_t kVersion = 2;
+constexpr uint32_t kVersion = 3;
 
 // One warp compresses one chunk. Larger chunks give the match finder more
 // history, so they compress better but are coarser units of parallelism.
@@ -88,8 +89,43 @@ struct TableGroup {
   uint32_t chunk_count;
   uint32_t lit_ctx_shift; // 8, 4 or 0: 1, 16 or 256 literal contexts
   uint32_t table_bytes;   // of this group's coded counts in the table section
+  uint32_t checksum;      // chunk_hash of those coded bytes
 };
 #pragma pack(pop)
+
+// Every stored byte is covered by a 32-bit check: each chunk's payload by
+// checksum[c], each group's coded counts by TableGroup::checksum. That is
+// what catches a corrupted literal, table or length byte that would
+// otherwise decode "successfully" into wrong output. It is a plain hash,
+// not a cryptographic one, and the decoder rejects a chunk whose payload
+// doesn't match.
+//
+// The bytes are split over 32 lanes (lane l takes l, l + 32, ...), each
+// lane folds its own bytes, and the lanes combine in order, so one warp,
+// one workgroup or a plain loop all produce the same value.
+constexpr uint32_t kHashInit = 2166136261u; // FNV-1a's offset basis and prime
+constexpr uint32_t kHashMul = 16777619u;
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+    inline uint32_t
+    hash_fold(uint32_t h, uint32_t byte) {
+  return (h ^ byte) * kHashMul;
+}
+// The scalar definition (the GPUs compute the same value lane by lane).
+inline uint32_t chunk_hash(const uint8_t* p, size_t n) {
+  uint32_t lane_h[32];
+  for (int l = 0; l < 32; ++l) {
+    uint32_t h = kHashInit;
+    for (size_t i = (size_t)l; i < n; i += 32) h = hash_fold(h, p[i]);
+    lane_h[l] = h;
+  }
+  uint32_t h = kHashInit;
+  for (int l = 0; l < 32; ++l) {
+    for (int b = 0; b < 4; ++b) h = hash_fold(h, (lane_h[l] >> (8 * b)) & 0xFFu);
+  }
+  return h ^ (uint32_t)n;
+}
 
 // Bytes of a group's quantised counts once decoded (table_codec.h).
 inline size_t group_quant_bytes(const TableGroup& g) { return (size_t)quant_bytes(lit_ctx_count(g.lit_ctx_shift)); }
