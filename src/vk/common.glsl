@@ -104,6 +104,14 @@ void rep_use(inout uvec3 r, uint slot, uint off) {
   r.x = front ? r.x : off;
 }
 
+// format.h's chunk_hash: lane l folds bytes l, l + 32, ..., then every lane
+// folds all 32 lane hashes in lane order, so all lanes end with the same
+// value. The buffer the bytes come from differs per shader, so the caller
+// passes its fold of one lane's bytes and this combines them.
+const uint kHashInit = 2166136261u;
+const uint kHashMul = 16777619u;
+uint hash_fold(uint h, uint b) { return (h ^ b) * kHashMul; }
+
 // ---- Lane-group layer ----
 #if LG_SUBGROUP
 
@@ -152,5 +160,16 @@ void lg_sync() {
 }
 
 #endif
+
+// Combines the 32 lane folds (see hash_fold) into the chunk's checksum.
+uint hash_combine(uint lane_h, uint n) {
+  uint out_h = kHashInit;
+  for (uint l = 0; l < 32u; ++l) {
+    uint v = lg_shfl(lane_h, l);
+    for (int b = 0; b < 4; ++b) out_h = hash_fold(out_h, (v >> (8 * b)) & 0xFFu);
+  }
+  return out_h ^ n;
+}
+
 
 uint lanemask_lt() { return (1u << lg_lane()) - 1u; }

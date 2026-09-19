@@ -213,6 +213,105 @@ None of this is built.
   match finder's tables are the model). The decoder only gathers vertices
   by index.
 
+## Real meshes (2026-09-19)
+
+Recommendation 1 below, carried out: five real binary STLs, downloaded
+from Thingi10K (Thingiverse uploads) and NASA's 3D resources, transformed
+with `xform` and compressed at `ratio`. "Gain" is the raw `.gsz` divided
+by the transformed one, so higher is better and 1.00x means the transform
+paid for itself exactly.
+
+| mesh | bytes | producer | `t2x` f64 | zeros | `t2x` f32 | zeros |
+|---|---|---|---|---|---|---|
+| Rhino CAD vehicle body | 78.2MB | Rhinoceros | **2.20x** | 97.4% | 1.78x | 52.6% |
+| Wreath with print supports | 23.6MB | netfabb | **1.99x** | 59.4% | 1.93x | 53.6% |
+| Skull scan, smoothed | 135.7MB | MeshLab/VCG | 1.68x | 52.4% | **2.00x** | 100.0% |
+| Apollo 11 landing site | 7.1MB | Blender 2.70 | 1.06x | 40.6% | 1.05x | 40.6% |
+| Toyota 22RE engine block | 17.1MB | Cura | **0.48x** | 4.9% | 0.48x | 4.9% |
+
+Three findings:
+
+- **The gain is real where the recipe matches the producer.** Two meshes
+  are cut in half or better, and the zero-residual share predicts it: it
+  is what turns a normal into 12 zero bytes.
+- **Which precision matches depends on the tool that wrote the file.**
+  Rhino's normals reproduce in f64 (97.4% zero), MeshLab's in f32 (100%).
+  Neither recipe wins everywhere, so a real implementation would have to
+  try both per chunk, not per file.
+- **A mesh whose normals don't reproduce gets much worse.** The engine
+  block's normals match neither recipe (4.9%), and XORing against a
+  mismatched prediction turns 12 structured bytes into 12 noisy ones:
+  the file more than doubles. Any implementation must therefore keep the
+  untransformed chunk whenever the transform doesn't win, which the
+  per-chunk trial in [What it would take](#what-it-would-take-in-gpusqz)
+  already called for.
+
+An integer-only variant was measured as a way to avoid floating point
+altogether: XOR each triangle's normal against the previous triangle's,
+reset per chunk. It gives 1.00–1.04x on the same five meshes, so
+essentially all of the gain comes from recomputing the normal from the
+vertices, not from neighbouring normals being alike.
+
+## The blocker: floats can't be recomputed portably (2026-09-19)
+
+Every transform here works the same way: the encoder stores a normal as
+its difference from one *recomputed* from the vertices, and the decoder
+recomputes the same normal to undo it. That makes bit-exact reproduction a
+**correctness** requirement, not a ratio one — if the decoder's normal
+differs from the encoder's in one ULP, the inverse XOR hands back a
+different float than the file originally held, silently.
+
+gpusqz promises that CUDA and Vulkan write identical files and each
+decodes the other's, on NVIDIA, AMD, Intel and Apple. Vulkan does not
+give enough to keep that promise for floating point (all anchors below are
+in the Vulkan spec appendix *Vulkan Environment for SPIR-V*,
+`spirvenv-precision-operation`):
+
+- **Even `a + b` isn't pinned.** `OpFAdd`, `OpFSub` and `OpFMul` are
+  "correctly rounded", but correctly rounded *"with implementation-defined
+  rounding mode"* unless the entry point declares `RoundingModeRTE`
+  (`spirvenv-correctly-rounded-impl-defined`) — and
+  `shaderRoundingModeRTEFloat32` is `VK_FALSE` in the core required
+  limits, only `VK_TRUE` from Roadmap 2024.
+- **Division and square root are loose.** `OpFDiv` is 2.5 ULP (and
+  unbounded when the divisor leaves `[2^-126, 2^126]`); GLSL.std.450
+  `sqrt()` is defined as *"inherited from 1.0 / inversesqrt()"*, with
+  `inversesqrt()` at 2 ULP. Normalising a vector needs both.
+- **Denormals may vanish.** By default *"any denormalized floating-point
+  value ... may be flushed to zero"*; pinning it needs
+  `shaderDenormPreserveFloat32`, which MoltenVK reports as unsupported.
+- **`precise` isn't enough.** GLSL's `precise` maps to SPIR-V's
+  `NoContraction`, which prevents fusion and reassociation but says
+  nothing about rounding mode or denormals.
+- **Double precision doesn't rescue it.** Vulkan says only that *"the
+  precision of double-precision instructions is at least that of single
+  precision"*, `shaderFloat64` is optional, and Metal has no `double` at
+  all — so MoltenVK reports `shaderFloat64 = false` and Apple could never
+  decode such a file.
+
+So a `.gsz` whose decoding depends on recomputing a float is not portable,
+and the transform cannot ship as specified. What could still work, in
+increasing order of effort:
+
+1. **Integer-only prediction.** Measured: XORing each normal against the
+   previous triangle's gives 1.00–1.04x, i.e. nothing. The gain comes from
+   reproducing the producer's own arithmetic, which is exactly the part
+   that isn't portable.
+2. **Software floating point.** Implement the cross product and
+   normalisation in integer arithmetic (or in float with exact
+   error-free transformations), so every backend computes the same bits by
+   construction. This can reproduce an f32 recipe exactly — the skull scan
+   showed 100% zero residuals with f32 — but not an f64 one on Apple, and
+   it puts a software divide and square root in the decode path.
+3. **Restrict the transform to what needs no arithmetic**, e.g. coding the
+   attribute bytes and repeated vertex values only, which is where the
+   `t4x` gains come from rather than the normals.
+
+The same rule applies to any future format-aware transform, and to the
+context-mixing profile in the [Predictive modeling
+study](predictive-modeling-study.md): anything the decoder recomputes must
+be integer.
+
 ## Recommendation
 
 1. **Measure real meshes before building.** This corpus is synthetic.

@@ -71,6 +71,7 @@ class CompressSet {
   // Waits for launch()'s results.
   virtual void wait_meta() = 0;
   virtual const uint32_t* sizes() = 0;           // n compressed chunk sizes
+  virtual const uint32_t* hashes() = 0;          // their chunk_hash values (format.h)
   virtual uint32_t packed_bytes() = 0;           // their sum: the packed output's size
   // The batch's TableGroups, g of group_count(): chunks [g*group_chunks,
   // (g+1)*group_chunks) of the batch (format.h's group_chunks()).
@@ -89,6 +90,7 @@ class DecompressSet {
     uint32_t* in_lens;    // its compressed size
     uint32_t* out_lens;   // its original size
     uint32_t* group_id;   // its TableGroup, as an index into launch()'s TableWindow
+    uint32_t* hash;       // the chunk_hash its payload must have
   };
   virtual ~DecompressSet() = default;
   virtual Stream& stream() = 0;

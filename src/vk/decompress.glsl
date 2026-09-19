@@ -22,6 +22,7 @@ layout(std430, binding = 9) buffer GInfo { uvec4 ginfo[]; };
 layout(std430, binding = 10) buffer GSym { uint8_t gsym[]; };
 layout(std430, binding = 11) buffer GFc { uint gfc[]; };
 layout(std430, binding = 12) buffer GQ { uint8_t gq[]; };
+layout(std430, binding = 13) buffer InHash { uint in_hash[]; }; // each chunk's expected chunk_hash
 
 layout(push_constant) uniform PC {
   uint chunk_size;

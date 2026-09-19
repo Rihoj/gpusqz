@@ -497,6 +497,7 @@ struct Compressor {
   uint32_t chunk_size, chunk_count;
   uint64_t total_size;
   std::vector<ChunkEntry> entries;
+  std::vector<uint32_t> hashes;   // each chunk's payload checksum (format.h)
   std::vector<TableGroup> groups; // one per batch
   std::vector<uint8_t> tables;     // each group's quantised counts, in group order
   int forced_lit_shift = -1;       // GPUSQZ_FORCE_LIT_SHIFT, tests and tuning only
@@ -554,10 +555,12 @@ struct Compressor {
     set.wait_meta();
     uint64_t batch_off = payload_start + payload_offset;
     const uint32_t* sizes = set.sizes();
+    const uint32_t* chunk_hashes = set.hashes();
     for (uint32_t c = 0; c < s.n; ++c) {
       uint64_t start = (uint64_t)(s.first + c) * chunk_size;
       uint32_t len = (uint32_t)std::min<uint64_t>(chunk_size, total_size - start);
       entries[s.first + c] = ChunkEntry{payload_offset, sizes[c], len};
+      hashes[s.first + c] = chunk_hashes[c];
       payload_offset += sizes[c];
     }
     // One TableGroup per group of the batch: chunks group_chunks apart,
@@ -637,6 +640,9 @@ void compress(const std::string& in_path, const std::string& out_path, uint32_t 
   uint64_t sizes_pos = file_tell(out);
   std::vector<uint32_t> sizes(chunk_count);
   std::fwrite(sizes.data(), sizeof(uint32_t), sizes.size(), out);
+  uint64_t hashes_pos = file_tell(out);
+  std::vector<uint32_t> hashes(chunk_count);
+  std::fwrite(hashes.data(), sizeof(uint32_t), hashes.size(), out);
   std::vector<ChunkEntry> entries(chunk_count);
 
   std::vector<TableGroup> groups;
@@ -652,6 +658,7 @@ void compress(const std::string& in_path, const std::string& out_path, uint32_t 
     cz.chunk_count = chunk_count;
     cz.total_size = total_size;
     cz.entries.swap(entries);
+    cz.hashes.swap(hashes);
     cz.forced_lit_shift = forced_lit_shift();
 
     double t = now_s();
@@ -682,6 +689,7 @@ void compress(const std::string& in_path, const std::string& out_path, uint32_t 
     payload_start = cz.payload_start;
     payload_bytes = cz.payload_offset;
     entries.swap(cz.entries);
+    hashes.swap(cz.hashes);
     groups.swap(cz.groups);
     tables.swap(cz.tables);
   }
@@ -694,6 +702,7 @@ void compress(const std::string& in_path, const std::string& out_path, uint32_t 
     std::vector<uint8_t> c = encode_table_counts(tables.data() + q_off, n);
     q_off += n;
     g.table_bytes = (uint32_t)c.size();
+    g.checksum = chunk_hash(c.data(), c.size());
     coded.insert(coded.end(), c.begin(), c.end());
   }
   for (uint32_t c = 0; c < chunk_count; ++c) sizes[c] = entries[c].compressed_size;
@@ -712,6 +721,8 @@ void compress(const std::string& in_path, const std::string& out_path, uint32_t 
   std::fwrite(&header, sizeof(header), 1, out);
   file_seek(out, sizes_pos);
   std::fwrite(sizes.data(), sizeof(uint32_t), sizes.size(), out);
+  file_seek(out, hashes_pos);
+  std::fwrite(hashes.data(), sizeof(uint32_t), hashes.size(), out);
   file_seek(out, groups_pos);
   std::fwrite(groups.data(), sizeof(TableGroup), groups.size(), out);
   std::fclose(in);
@@ -737,6 +748,7 @@ struct Decompressor {
   uint32_t slot_stride;
   uint64_t payload_start;
   std::vector<ChunkEntry> entries;
+  std::vector<uint32_t> hashes; // each chunk's expected payload checksum
   std::vector<TableGroup> groups;
   std::vector<uint8_t> tables;       // the file's table section: each group's quantised counts in order
   std::vector<uint32_t> chunk_group; // header.chunk_count entries, from `groups`
@@ -813,6 +825,7 @@ struct Decompressor {
       h.in_lens[c] = e.compressed_size;
       h.out_lens[c] = e.original_size;
       h.group_id[c] = chunk_group[s.first + c] - s.group0;
+      h.hash[c] = hashes[s.first + c];
     }
     s.last_len = entries[s.first + n - 1].original_size;
     uint64_t total_in = expect - base;
@@ -883,6 +896,11 @@ void decompress(const std::string& in_path, const std::string& out_path) {
   if (header.chunk_count > 0 && std::fread(sizes.data(), sizeof(uint32_t), sizes.size(), in) != sizes.size()) {
     die("truncated chunk table");
   }
+  if ((uint64_t)header.chunk_count * sizeof(uint32_t) > file_size(in)) die("truncated chunk checksums");
+  std::vector<uint32_t> hashes(header.chunk_count);
+  if (header.chunk_count > 0 && std::fread(hashes.data(), sizeof(uint32_t), hashes.size(), in) != hashes.size()) {
+    die("truncated chunk checksums");
+  }
   std::vector<ChunkEntry> entries(header.chunk_count);
   if (!chunk_entries(sizes.data(), header.chunk_count, header.chunk_size, header.original_size, entries.data())) {
     die("corrupt chunk table: sizes don't match the header");
@@ -933,6 +951,9 @@ void decompress(const std::string& in_path, const std::string& out_path) {
   // Decoded into each group's quantised counts, back to back.
   uint64_t c_off = 0, q_off = 0;
   for (const TableGroup& g : groups) {
+    // The group's coded bytes carry their own checksum: a corruption there
+    // would otherwise expand into plausible but wrong tables.
+    if (chunk_hash(coded.data() + c_off, g.table_bytes) != g.checksum) die("corrupt table section: bad checksum");
     if (!decode_table_counts(coded.data() + c_off, g.table_bytes, tables.data() + q_off, group_quant_bytes(g))) {
       die("corrupt table section");
     }
@@ -952,6 +973,7 @@ void decompress(const std::string& in_path, const std::string& out_path) {
     dz.slot_stride = worst_case_size(header.chunk_size);
     dz.payload_start = payload_start;
     dz.entries.swap(entries);
+    dz.hashes.swap(hashes);
     dz.groups.swap(groups);
     dz.tables.swap(tables);
 

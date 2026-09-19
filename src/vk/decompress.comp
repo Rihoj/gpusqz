@@ -255,8 +255,13 @@ void main() {
   g_out = c * pc.chunk_size;
   uint orig = out_lens[c];
 
-  bool ok = false;
-  if (len >= 1) {
+  // A corrupted byte that still decodes would otherwise produce wrong
+  // output silently, so the payload is checked before it is used.
+  uint lh = kHashInit;
+  for (uint i = lane; i < len; i += 32) lh = hash_fold(lh, uint(inb[slot + i]));
+  bool ok = hash_combine(lh, len) == in_hash[c];
+  if (ok && len >= 1) {
+    ok = false;
     uint flag = uint(inb[slot]);
     if (flag == kFlagRaw) {
       ok = len == 1 + orig;

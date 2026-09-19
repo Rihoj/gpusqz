@@ -49,6 +49,23 @@ __device__ __forceinline__ bool rans_eligible(const SeqRec* seqs, uint32_t n_seq
 // Compress: parse + histogram, build the batch's tables, encode.
 // ---------------------------------------------------------------------------
 
+// format.h's chunk_hash over one chunk's bytes: lane l folds bytes l, l+32,
+// ..., then every lane folds all 32 lane hashes in lane order, so all lanes
+// end with the same value.
+__device__ __forceinline__ uint32_t warp_chunk_hash(const uint8_t* p, uint32_t n) {
+  int lane = threadIdx.x & 31;
+  uint32_t h = kHashInit;
+  for (uint32_t i = (uint32_t)lane; i < n; i += 32) h = hash_fold(h, p[i]);
+  uint32_t out = kHashInit;
+#pragma unroll 1
+  for (int l = 0; l < 32; ++l) {
+    uint32_t v = __shfl_sync(kFullMask, h, l);
+#pragma unroll
+    for (int b = 0; b < 4; ++b) out = hash_fold(out, (v >> (8 * b)) & 0xFFu);
+  }
+  return out ^ n;
+}
+
 // One warp per chunk. Chunks of at most 1 byte are stored raw right here.
 // Others are parsed into scratch (n_seq/n_lit record how much) and, if they
 // could be rANS-coded, counted into the batch histogram.
@@ -56,7 +73,7 @@ __global__ void GPUSQZ_LAUNCH_BOUNDS
 parse_hist_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, const uint32_t* in_lens,
                   uint8_t* out, uint32_t out_slot_stride, uint32_t* out_start, uint32_t* out_sizes,
                   uint8_t* scratch, uint32_t* htab, uint32_t hash_bits, uint32_t* n_seq_arr, uint32_t* n_lit_arr,
-                  uint32_t* batch_cnt, uint32_t group_chunks) {
+                  uint32_t* batch_cnt, uint32_t group_chunks, uint32_t* out_hash) {
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   uint32_t c = blockIdx.x * kWarpsPerBlock + warp;
   if (c >= chunk_count) return;
@@ -67,10 +84,13 @@ parse_hist_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count, 
 
   if (in_len <= 1) {
     for (uint32_t k = lane; k < in_len; k += 32) slot[1 + k] = chunk_in[k];
+    if (lane == 0) slot[0] = (uint8_t)ChunkFlag::Raw;
+    __syncwarp(); // the bytes just written are what the hash covers
+    uint32_t hash = warp_chunk_hash(slot, 1 + in_len);
     if (lane == 0) {
-      slot[0] = (uint8_t)ChunkFlag::Raw;
       out_start[c] = 0;
       out_sizes[c] = 1 + in_len;
+      out_hash[c] = hash;
       n_seq_arr[c] = 0;
       n_lit_arr[c] = 0;
     }
@@ -197,7 +217,7 @@ rans_encode_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count,
                    uint8_t* out, uint32_t out_slot_stride, uint32_t* out_start, uint32_t* out_sizes,
                    uint8_t* scratch, const uint32_t* n_seq_arr, const uint32_t* n_lit_arr,
                    const uint32_t* lit_shift_all, const uint16_t* freq_all, const uint16_t* cum_all,
-                   uint32_t group_chunks) {
+                   uint32_t group_chunks, uint32_t* out_hash) {
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   uint32_t c = blockIdx.x * kWarpsPerBlock + warp;
   if (c >= chunk_count) return;
@@ -248,9 +268,12 @@ rans_encode_kernel(const uint8_t* in, uint32_t chunk_size, uint32_t chunk_count,
     size = 1 + in_len;
     if (lane == 0) slot[0] = (uint8_t)ChunkFlag::Raw;
   }
+  __syncwarp(); // every lane's writes into the slot precede the hash
+  uint32_t hash = warp_chunk_hash(slot + start, size);
   if (lane == 0) {
     out_start[c] = start;
     out_sizes[c] = size;
+    out_hash[c] = hash;
   }
 }
 
@@ -267,7 +290,7 @@ __global__ void GPUSQZ_LAUNCH_BOUNDS
 decompress_kernel(const uint8_t* in, const uint32_t* in_offsets, uint32_t chunk_count, const uint32_t* in_lens,
                   uint8_t* out, uint32_t chunk_size, const uint32_t* out_lens, uint8_t* scratch,
                   uint8_t* group_tables, const uint64_t* group_off, const uint32_t* group_shift,
-                  const uint32_t* group_id, uint32_t* err) {
+                  const uint32_t* group_id, const uint32_t* hash, uint32_t* err) {
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   uint32_t c = blockIdx.x * kWarpsPerBlock + warp;
   if (c >= chunk_count) return;
@@ -277,8 +300,11 @@ decompress_kernel(const uint8_t* in, const uint32_t* in_offsets, uint32_t chunk_
   uint8_t* chunk_out = out + (size_t)c * chunk_size;
   uint32_t orig = out_lens[c];
 
-  bool ok = false;
-  if (len >= 1) {
+  // A corrupted byte that still decodes would otherwise produce wrong
+  // output silently, so the payload is checked before it is used.
+  bool ok = warp_chunk_hash(slot, len) == hash[c];
+  if (ok && len >= 1) {
+    ok = false;
     ChunkFlag flag = (ChunkFlag)slot[0];
     if (flag == ChunkFlag::Raw) {
       ok = len == 1 + orig;
@@ -334,24 +360,24 @@ void launch_compress(const uint8_t* d_in, uint32_t chunk_size, uint32_t chunk_co
   parse_hist_kernel<<<blocks, kBlockThreads, 0, stream>>>(d_in, chunk_size, chunk_count, d_in_lens, d_out,
                                                           out_slot_stride, d_out_start, d_out_sizes, d_scratch,
                                                           d_htab, hash_bits, d_rans.n_seq, d_rans.n_lit, d_rans.cnt,
-                                                          group_chunks);
+                                                          group_chunks, d_rans.hash);
   build_table_kernel<<<groups, kTableThreads, 0, stream>>>(d_rans.cnt, forced_lit_shift, d_rans.lit_shift, d_rans.q,
                                                            d_rans.freq, d_rans.cum);
   rans_encode_kernel<<<blocks, kBlockThreads, 0, stream>>>(d_in, chunk_size, chunk_count, d_in_lens, d_out,
                                                            out_slot_stride, d_out_start, d_out_sizes, d_scratch,
                                                            d_rans.n_seq, d_rans.n_lit, d_rans.lit_shift, d_rans.freq,
-                                                           d_rans.cum, group_chunks);
+                                                           d_rans.cum, group_chunks, d_rans.hash);
 }
 
 void launch_decompress(const uint8_t* d_in, const uint32_t* d_in_offsets, uint32_t chunk_count,
                         const uint32_t* d_in_lens, uint8_t* d_out, uint32_t chunk_size,
                         const uint32_t* d_out_lens, uint8_t* d_scratch, uint8_t* d_group_tables,
                         const uint64_t* d_group_off, const uint32_t* d_group_shift, const uint32_t* d_group_id,
-                        uint32_t* d_err, cudaStream_t stream) {
+                        const uint32_t* d_hash, uint32_t* d_err, cudaStream_t stream) {
   uint32_t blocks = (chunk_count + kWarpsPerBlock - 1) / kWarpsPerBlock;
   decompress_kernel<<<blocks, kBlockThreads, 0, stream>>>(d_in, d_in_offsets, chunk_count, d_in_lens, d_out,
                                                           chunk_size, d_out_lens, d_scratch, d_group_tables,
-                                                          d_group_off, d_group_shift, d_group_id, d_err);
+                                                          d_group_off, d_group_shift, d_group_id, d_hash, d_err);
 }
 
 size_t rans_group_table_bytes(uint32_t lit_shift) { return group_table_bytes(lit_ctx_count(lit_shift)); }
